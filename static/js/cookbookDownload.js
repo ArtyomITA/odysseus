@@ -4,7 +4,7 @@
 // panel rendering, command building
 // ============================================
 
-import uiModule from './ui.js';
+import uiModule from './ui.js?v=20260908weekhoverfix1';
 import { _diagnose, _showDiagnosis, _clearDiagnosis } from './cookbook-diagnosis.js';
 
 // Shared state/functions injected by init()
@@ -12,8 +12,10 @@ let _envState;
 let _sshCmd;
 let _getPort;
 let _getPlatform;
+let _serverByVal;
 let _isWindows;
 let _buildEnvPrefix;
+let _psQuote;
 let _buildServeCmd;
 let _detectBackend;
 let _detectToolParser;
@@ -30,6 +32,13 @@ let _saveTasks;
 
 // Storage keys
 const SERVE_STATE_KEY = 'cookbook-serve-state';
+const _downloadStartsInFlight = new Set();
+
+function _fetchDownloadControlWithTimeout(input, init = {}, timeoutMs = 20000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return fetch(input, { ...init, signal: controller.signal }).finally(() => clearTimeout(timer));
+}
 
 // ── Panel field helpers ──
 
@@ -57,21 +66,87 @@ export function _setPanelCheckbox(panel, field, checked) {
 
 // ── Command builder: download ──
 
+function _firstGgufSource(model) {
+  const sources = Array.isArray(model?.gguf_sources) ? model.gguf_sources : [];
+  return sources.find(src => src && src.repo) || null;
+}
+
+function _looksLikeGgufRepo(model) {
+  const haystack = `${model?.quant_repo || ''} ${model?.repo_id || ''} ${model?.path || ''} ${model?.name || ''}`.toLowerCase();
+  return !!model?.is_gguf || haystack.includes('gguf') || haystack.includes('.gguf');
+}
+
+function _ggufDownloadSource(model, backend) {
+  if (backend !== 'llamacpp') return null;
+  const source = _firstGgufSource(model);
+  if (source) return source;
+  if (_looksLikeGgufRepo(model)) {
+    const repo = model?.quant_repo || model?.repo_id || model?.name;
+    if (repo) return { repo };
+  }
+  return null;
+}
+
+function _ggufIncludePattern(model, source) {
+  if (source?.file) return source.file;
+  if (model?.quant) return `*${model.quant}*`;
+  return '*.gguf';
+}
+
+function _ggufDisplayPartFromInclude(include) {
+  const clean = String(include || '').replace(/\*/g, '');
+  const parts = clean.split('/').filter(Boolean);
+  const file = parts[parts.length - 1] || clean;
+  const dir = parts.length > 1 ? parts[parts.length - 2] : '';
+  const quant = `${dir} ${file}`.match(/\b(?:UD-)?(?:IQ[1-8]_[A-Z0-9]+|Q[2-8]_K_[MLS]|Q[2-8]_[0-9A-Z]+|Q[2-8])\b/i);
+  if (quant) return quant[0].toUpperCase().replace(/^UD-/, '');
+  return file.replace(/\.gguf$/i, '').replace(/-\d{5}-of-\d{5}$/i, '');
+}
+
+function _downloadTaskName(shortName, payload) {
+  const include = payload?.include || '';
+  const part = include ? _ggufDisplayPartFromInclude(include) : '';
+  return part ? `${shortName} · ${part}` : shortName;
+}
+
+function _missingGgufMessage(model) {
+  const name = model?.name || 'this model';
+  if (/\bnvfp4\b/i.test(name)) {
+    return `${name} is an NVIDIA NVFP4 checkpoint, not a GGUF download. Pick the base model row with an Unsloth GGUF source, or paste the GGUF repo directly.`;
+  }
+  return `No GGUF source is configured for ${name}. Pick a model with a GGUF source, or paste the GGUF repo in Download.`;
+}
+
+function _bashQuote(value) {
+  return "'" + String(value ?? '').replace(/'/g, "'\\''") + "'";
+}
+
+function _missingGgufCommand(model) {
+  const msg = _missingGgufMessage(model);
+  if (_isWindows()) {
+    return `Write-Error ${JSON.stringify(msg)}; exit 1`;
+  }
+  return `printf '%s\\n' ${_bashQuote(msg)} >&2; exit 1`;
+}
+
 export function _buildDownloadCmd(model, backend) {
   let cmd = '';
   if (backend === 'ollama') {
     cmd = `ollama pull ${model.name.split('/').pop().toLowerCase()}`;
   } else {
-    const repo = (backend === 'llamacpp' && model.gguf_sources && model.gguf_sources.length)
-      ? model.gguf_sources[0].repo : model.name;
-    const includeArg = (backend === 'llamacpp' && model.gguf_sources && model.gguf_sources.length)
-      ? `, allow_patterns=["*${model.quant || ''}*"]` : '';
-    // Reflect the server's download target in the preview (matches the real
-    // download path built server-side). '' = default HF cache.
-    const _dlDir = (_envState.servers.find(s => s.host === (_envState.remoteHost || '')) || {}).downloadDir || '';
-    const _localDirArg = _dlDir ? `, local_dir=os.path.expanduser('${_dlDir.replace(/\/$/, '')}/${repo.split('/').pop()}')` : '';
-    const _py = _isWindows() ? 'python' : 'python3';
-    cmd = `${_py} -u -c "
+    const ggufSource = _ggufDownloadSource(model, backend);
+    if (backend === 'llamacpp' && !ggufSource) {
+      cmd = _missingGgufCommand(model);
+    } else {
+      const repo = ggufSource?.repo || model.name;
+      const includePattern = backend === 'llamacpp' ? _ggufIncludePattern(model, ggufSource) : null;
+      const includeArg = includePattern ? `, allow_patterns=["${includePattern.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"]` : '';
+      // Reflect the server's download target in the preview (matches the real
+      // download path built server-side). '' = default HF cache.
+      const _dlDir = (_serverByVal?.(_envState.remoteServerKey || _envState.remoteHost || '') || {}).downloadDir || '';
+      const _localDirArg = _dlDir ? `, local_dir=os.path.expanduser('${_dlDir.replace(/\/$/, '')}/${repo.split('/').pop()}')` : '';
+      const _py = _isWindows() ? 'python' : 'python3';
+      cmd = `${_py} -u -c "
 import sys, time, os
 os.environ['HF_HUB_DISABLE_PROGRESS_BARS']='0'
 os.environ['TQDM_DISABLE']='0'
@@ -125,6 +200,7 @@ try:
 except Exception as e:
  print(f'ERROR {e}',file=sys.stderr,flush=True);sys.exit(1)
 "`;
+    }
   }
   const prefix = _buildEnvPrefix();
   let full = prefix ? prefix + ' ' + cmd : cmd;
@@ -190,11 +266,7 @@ export function _wirePanelEvents(panel, model, backend) {
   const dlBtn = panel.querySelector('.hwfit-dl-btn');
   if (dlBtn) {
     dlBtn.addEventListener('click', () => {
-      if (backend === 'ollama') {
-        _runPanelCmd(panel, _buildDownloadCmd(model, backend), { timeout: 0 });
-      } else {
-        _runModelDownload(panel, model, backend);
-      }
+      _runModelDownload(panel, model, backend)
     });
   }
 
@@ -214,7 +286,7 @@ export function _wirePanelEvents(panel, model, backend) {
       const outputText = panel.querySelector('.cookbook-output-pre')?.textContent || '';
       const tmuxMatch = outputText.match(/Started tmux session: (cookbook-[a-f0-9]+)/);
       if (tmuxMatch) {
-        fetch('/api/shell/exec', {
+        _fetchDownloadControlWithTimeout('/api/shell/exec', {
           method: 'POST',
           credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json' },
@@ -402,10 +474,15 @@ export async function _runPanelCmd(panel, cmd, opts = {}) {
 // ── Model download (dedicated endpoint, tmux-backed) ──
 
 export async function _runModelDownload(panel, model, backend, hostOverride) {
-  const repo = (backend === 'llamacpp' && model.gguf_sources && model.gguf_sources.length)
-    ? model.gguf_sources[0].repo : (model.quant_repo || model.name);
-  const include = (backend === 'llamacpp' && model.gguf_sources && model.gguf_sources.length)
-    ? `*${model.quant || ''}*` : null;
+  const ggufSource = _ggufDownloadSource(model, backend);
+  if (backend === 'llamacpp' && !ggufSource) {
+    uiModule.showToast(_missingGgufMessage(model));
+    return;
+  }
+  const repo = backend === 'ollama'
+    ? (model.ollama || model.ollama_name || model.name)
+    : (ggufSource?.repo || model.quant_repo || model.name);
+  const include = backend === 'llamacpp' ? _ggufIncludePattern(model, ggufSource) : null;
 
   _syncEnvFromPanel(panel);
 
@@ -415,41 +492,61 @@ export async function _runModelDownload(panel, model, backend, hostOverride) {
   // they disagree on the active host. The servers LIST is consistent, so we look
   // up the matching server to get its env / path / platform / port.
   let host;
+  let selectedServer = null;
+  let selectedServerKey = '';
   if (hostOverride !== undefined) {
     host = hostOverride || '';
+    selectedServer = host ? (_serverByVal?.(host) || (_envState.servers || []).find(s => s.host === host) || null) : null;
+    selectedServerKey = selectedServer ? (typeof window.cookbookModule?._serverKey === 'function' ? window.cookbookModule._serverKey(selectedServer) : '') : '';
   } else {
     // No explicit host passed: resolve from the visible server dropdown rather
     // than _envState.remoteHost (unreliable — multiple state copies disagree).
     const ssEl = document.getElementById('hwfit-server-select') || document.getElementById('hwfit-dl-server');
-    // Dropdown values are host strings now ('local' for local); resolve by host
-    // (numeric fallback for any stale value).
+    // Dropdown values are profile keys now ('local' for local); stale host
+    // strings and numeric indices still resolve for backwards compatibility.
     const _ssv = ssEl ? ssEl.value : null;
-    const _dsrv = (_ssv && _ssv !== 'local') ? (_envState.servers.find(s => s.host === _ssv) || _envState.servers[parseInt(_ssv)]) : null;
+    const _dsrv = (_ssv && _ssv !== 'local') ? (_serverByVal?.(_ssv) || _envState.servers[parseInt(_ssv)]) : null;
     if (_dsrv) {
       host = _dsrv.host;
+      selectedServer = _dsrv;
+      selectedServerKey = _ssv || '';
     } else if (ssEl && ssEl.value === 'local') {
       host = '';
     } else {
       host = _envState.remoteHost || '';
+      selectedServer = host ? ((_envState.servers || []).find(s => s.host === host) || _serverByVal?.(host) || null) : null;
     }
   }
-  const srv = _envState.servers.find(s => s.host === host) || {};
-  const env = host ? (srv.env || 'none') : (_envState.env || 'none');
+  const srv = selectedServer || _serverByVal?.(host) || {};
+  let env = host ? (srv.env || 'none') : (_envState.env || 'none');
   const envPath = host ? (srv.envPath || '') : (_envState.envPath || '');
+  if ((!env || env === 'none') && envPath) {
+    env = /(?:^|\/)(?:\.?venv|env)(?:\/|$)|\/bin\/activate$/i.test(envPath) ? 'venv' : env;
+  }
   const platform = host ? (srv.platform || '') : (_envState.platform || '');
   const isWin = host ? (platform === 'windows') : _isWindows();
 
-  const payload = { repo_id: repo };
+  const payload = { repo_id: repo, backend };
   if (include) payload.include = include;
+  // Large downloads are where hf_transfer most often dies near the end. Use the
+  // plain HuggingFace downloader up front for big model files; it is slower, but
+  // resumes cached partials more reliably.
+  if ((model.required_gb || 0) >= 10 || backend === 'llamacpp') payload.disable_hf_transfer = true;
   if (_envState.hfToken) payload.hf_token = _envState.hfToken;
-  if (host) { payload.remote_host = host; const _sp = _getPort(host); if (_sp) payload.ssh_port = _sp; }
+  if (host) {
+    payload.remote_host = host;
+    if (selectedServerKey && selectedServerKey !== 'local') payload.remote_server_key = selectedServerKey;
+    if (srv.name) payload.remote_server_name = srv.name;
+    const _sp = srv.port || _getPort(host);
+    if (_sp) payload.ssh_port = _sp;
+  }
   if (platform) payload.platform = platform;
   // If this server has a directory flagged as the download target, send it so
   // the backend downloads into <dir>/<model> instead of the default HF cache.
   if (srv.downloadDir) payload.local_dir = srv.downloadDir;
   if (isWin) {
     if (env === 'venv' && envPath) {
-      payload.env_prefix = '& ' + (envPath.endsWith('\\Scripts\\Activate.ps1') ? envPath : envPath + '\\Scripts\\Activate.ps1');
+      payload.env_prefix = '& ' + _psQuote(envPath.endsWith('\\Scripts\\Activate.ps1') ? envPath : envPath + '\\Scripts\\Activate.ps1');
     } else if (env === 'conda' && envPath) {
       payload.env_prefix = 'conda activate ' + envPath;
     }
@@ -462,41 +559,105 @@ export async function _runModelDownload(panel, model, backend, hostOverride) {
   }
 
   const shortName = (model.name || repo).split('/').pop();
+  const taskName = _downloadTaskName(shortName, payload);
   const targetHost = host || 'local';
 
   const tasks = _loadTasks();
+  const sameDownload = (t) => {
+    if (!t || t.type !== 'download') return false;
+    const tRepo = t?.payload?.repo_id || t?.repo_id || t?.repo || t?.name || '';
+    const tHost = t?.remoteHost || t?.payload?.remote_host || 'local';
+    return String(tRepo) === String(payload.repo_id) && String(tHost || 'local') === String(targetHost);
+  };
+  const duplicate = tasks.find(t => sameDownload(t) && (t.status === 'running' || t.status === 'queued'));
+  if (duplicate) {
+    _renderRunningTab();
+    uiModule.showToast(`${shortName} is already ${duplicate.status === 'queued' ? 'queued' : 'downloading'}`);
+    return;
+  }
+  // Also catch zombie "done" tasks — the cookbook may have lost track of a
+  // download (server restart, stale state) while its tmux session is still
+  // alive on the host. Probe it; if alive, flip back to running + treat as
+  // duplicate so we don't kick off a second concurrent download writing to
+  // the same target dir.
+  const zombieCandidate = tasks.find(t => sameDownload(t)
+    && ['done', 'error', 'crashed', 'stopped'].includes(t.status)
+    && t.sessionId && !String(t.sessionId).startsWith('queue-'));
+  if (zombieCandidate) {
+    try {
+      const _zh = zombieCandidate.remoteHost || '';
+      const _zPort = (_serverByVal?.(zombieCandidate.remoteServerKey || zombieCandidate.payload?.remote_server_key || _zh)
+        || (_envState.servers || []).find(s => s.host === _zh) || {}).port;
+      const _sshPf = _zh ? `ssh ${_zPort && _zPort !== '22' ? `-p ${_zPort} ` : ''}${_zh} '` : '';
+      const _sshSf = _zh ? `'` : '';
+      const _probePrefix = _zh ? 'PATH="$HOME/.local/bin:$HOME/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"; ' : '';
+      const _probeCmd = `${_sshPf}${_probePrefix}tmux has-session -t ${zombieCandidate.sessionId} 2>/dev/null${_sshSf}`;
+      const _r = await _fetchDownloadControlWithTimeout('/api/shell/exec', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ command: _probeCmd, timeout: 5 }),
+      });
+      const _d = await _r.json();
+      if (_d.exit_code === 0) {
+        // tmux still alive → not actually done. Revive + tell the user.
+        const _fresh = _loadTasks();
+        const _ft = _fresh.find(t => t.sessionId === zombieCandidate.sessionId);
+        if (_ft) {
+          _ft.status = 'running';
+          _ft._selfHealed = true;
+          _saveTasks(_fresh);
+        }
+        _renderRunningTab();
+        uiModule.showToast(`${shortName} is still downloading (was marked finished after a restart — revived)`);
+        return;
+      }
+    } catch { /* probe failed — fall through and let the user launch */ }
+  }
   const activeOnHost = tasks.find(t => t.type === 'download' && (t.status === 'running' || t.status === 'queued') && (t.remoteHost || 'local') === targetHost);
 
   if (activeOnHost) {
     const queueId = `queue-${Date.now().toString(36)}`;
     const allTasks = _loadTasks();
-    allTasks.push({ id: queueId, sessionId: queueId, name: shortName, type: 'download', status: 'queued', output: '', ts: Date.now(), payload, remoteHost: host });
+    allTasks.push({ id: queueId, sessionId: queueId, name: taskName, type: 'download', status: 'queued', output: '', ts: Date.now(), payload, remoteHost: host, remoteServerKey: payload.remote_server_key || '', remoteServerName: payload.remote_server_name || '', sshPort: payload.ssh_port || '', platform: payload.platform || '' });
     _saveTasks(allTasks);
     _renderRunningTab();
     uiModule.showToast(`Queued ${shortName} — waiting for current download`);
     return;
   }
 
+  // The task list is persisted only after the POST returns. Guard the gap so
+  // rapid clicks (or two touch events) cannot start duplicate downloads before
+  // either request has registered its task.
+  const startKey = `${targetHost}\n${payload.repo_id}`;
+  if (_downloadStartsInFlight.has(startKey)) {
+    uiModule.showToast(`${shortName} download is already starting`);
+    return;
+  }
+  _downloadStartsInFlight.add(startKey);
   try {
-    const res = await fetch('/api/model/download', {
+    const res = await _fetchDownloadControlWithTimeout('/api/model/download', {
       method: 'POST',
       credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
     if (!res.ok) {
-      uiModule.showToast('Download failed: HTTP ' + res.status);
+      // Errors carry actionable text (e.g. "tmux is required …"); keep them up
+      // long enough to read, matching the serve path's duration (issue #1355).
+      uiModule.showToast('Download failed: HTTP ' + res.status, 9000);
       return;
     }
     const data = await res.json();
     if (!data.ok) {
-      uiModule.showToast('Download failed: ' + (data.error || ''));
+      uiModule.showToast('Download failed: ' + (data.error || ''), 9000);
       return;
     }
-    _addTask(data.session_id, shortName, 'download', payload);
-    uiModule.showToast(`Downloading ${shortName}...`);
+    _addTask(data.session_id, taskName, 'download', payload);
+    uiModule.showToast(`Downloading ${taskName}...`);
   } catch (e) {
-    uiModule.showToast('Download failed: ' + e.message);
+    uiModule.showToast('Download failed: ' + e.message, 9000);
+  } finally {
+    _downloadStartsInFlight.delete(startKey);
   }
 }
 
@@ -507,8 +668,10 @@ export function initDownload(shared) {
   _sshCmd = shared._sshCmd;
   _getPort = shared._getPort;
   _getPlatform = shared._getPlatform;
+  _serverByVal = shared._serverByVal;
   _isWindows = shared._isWindows;
   _buildEnvPrefix = shared._buildEnvPrefix;
+  _psQuote = shared._psQuote;
   _buildServeCmd = shared._buildServeCmd;
   _detectBackend = shared._detectBackend;
   _detectToolParser = shared._detectToolParser;

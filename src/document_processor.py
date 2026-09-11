@@ -5,6 +5,8 @@ import os
 import logging
 import mimetypes
 import base64
+import shutil
+import subprocess
 import tempfile
 from typing import List, Dict, Any
 
@@ -12,13 +14,18 @@ from src.llm_core import llm_call
 
 logger = logging.getLogger(__name__)
 
+MAX_INLINE_ATTACHMENT_CHARS = 24000
+MIN_INLINE_ATTACHMENT_SLICE = 500
+
 
 def _is_text_file(path: str) -> bool:
     """Check if file has text extension."""
-    return any(
-        path.lower().endswith(ext)
-        for ext in (".txt", ".py", ".html", ".htm", ".md", ".json", ".csv", ".log", ".js")
-    )
+    return os.path.splitext(path.lower())[1] in {
+        ".bash", ".c", ".cpp", ".css", ".csv", ".go", ".h", ".htm",
+        ".html", ".java", ".js", ".json", ".jsx", ".log", ".md",
+        ".markdown", ".nix", ".php", ".py", ".rb", ".rs", ".sh",
+        ".sql", ".ts", ".tsx", ".txt", ".xml", ".yaml", ".yml",
+    }
 
 
 def _process_text_file(path: str) -> str:
@@ -26,7 +33,8 @@ def _process_text_file(path: str) -> str:
     language_map = {
         ".py": "python", ".js": "javascript", ".html": "html", ".css": "css",
         ".json": "json", ".md": "markdown", ".txt": "text", ".csv": "csv",
-        ".log": "log", ".sh": "bash", ".yml": "yaml", ".yaml": "yaml",
+        ".log": "log", ".sh": "bash", ".bash": "bash", ".nix": "nix",
+        ".yml": "yaml", ".yaml": "yaml",
         ".xml": "xml", ".sql": "sql", ".cpp": "cpp", ".c": "c",
         ".java": "java", ".go": "go", ".rs": "rust", ".php": "php",
         ".rb": "ruby", ".ts": "typescript", ".jsx": "javascript", ".tsx": "typescript",
@@ -88,8 +96,8 @@ def _process_text_file(path: str) -> str:
     header += f"[Type: {language}, Lines: {line_count}, Size: {size_str} bytes]"
 
     code_extensions = {
-        ".py", ".js", ".html", ".css", ".json", ".md", ".sh", ".yml", ".yaml",
-        ".xml", ".sql", ".cpp", ".c", ".java", ".go", ".rs", ".php", ".rb",
+        ".py", ".js", ".html", ".css", ".json", ".md", ".sh", ".bash", ".nix",
+        ".yml", ".yaml", ".xml", ".sql", ".cpp", ".c", ".java", ".go", ".rs", ".php", ".rb",
         ".ts", ".jsx", ".tsx",
     }
     if ext in code_extensions:
@@ -105,7 +113,12 @@ def _process_text_file(path: str) -> str:
         return result
 
 
-def _process_pdf(path: str) -> str:
+def _process_pdf(
+    path: str,
+    owner: str | None = None,
+    *,
+    analyze_embedded_images: bool = True,
+) -> str:
     """Process PDF file with text extraction (pypdf). Uses VL model for image-heavy pages."""
     try:
         from pypdf import PdfReader
@@ -122,14 +135,14 @@ def _process_pdf(path: str) -> str:
                 images = list(page.images)
             except Exception:
                 images = []
-            if images and len(page_text) < 50:
+            if analyze_embedded_images and images and len(page_text) < 50:
                 for img_index, img in enumerate(images[:3]):  # cap at 3 images per page
                     try:
                         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
                             temp_img_path = tmp.name
                         try:
                             img.image.save(temp_img_path, "PNG")  # pypdf -> PIL image
-                            ocr_text = analyze_image_with_vl(temp_img_path)
+                            ocr_text = analyze_image_with_vl(temp_img_path, owner=owner)
                             if ocr_text and "unavailable" not in ocr_text.lower():
                                 pdf_text += f"\n\n[Page {page_num + 1} image {img_index + 1} text]: {ocr_text}"
                         finally:
@@ -152,6 +165,228 @@ def _process_pdf(path: str) -> str:
         return f"\n\n[PDF processing failed: {str(e)}]"
 
 
+def _truncate_inline(text: str, limit: int = 15000) -> tuple[str, str]:
+    """Cap inline document text so a huge file can't blow the model's context."""
+    text = (text or "").strip()
+    if len(text) > limit:
+        return text[:limit], "\n[…truncated for inline context.]"
+    return text, ""
+
+
+def _fit_inline_attachment_text(
+    text: str,
+    remaining: int,
+    display_name: str,
+) -> tuple[str, int]:
+    """Fit extracted attachment text into the shared inline attachment budget.
+
+    Individual processors already cap single files, but multi-file batches can
+    still add N capped bodies to one user turn. Keep the first files readable,
+    keep later files visible by name, and mark exactly where inline content was
+    reduced so the model does not silently miss attachments.
+    """
+    text = text or ""
+    if len(text) <= remaining:
+        return text, remaining - len(text)
+
+    name = os.path.basename(display_name or "attachment")
+    if remaining < MIN_INLINE_ATTACHMENT_SLICE:
+        return (
+            f"\n\n[Attachment omitted from inline context: {name}. "
+            f"The {MAX_INLINE_ATTACHMENT_CHARS:,}-character shared inline "
+            "attachment budget was already used by earlier attachments. Ask "
+            "to inspect this file specifically if more detail is needed.]",
+            0,
+        )
+    marker = (
+        f"\n\n[Attachment content truncated: {name}. "
+        f"Only {remaining:,} characters of this attachment fit within "
+        f"the {MAX_INLINE_ATTACHMENT_CHARS:,}-character shared inline "
+        "attachment budget. Ask to inspect this file specifically if more "
+        "detail is needed.]"
+    )
+    return text[:remaining] + marker, 0
+
+
+def _process_office_document(
+    path: str,
+    display_name: str,
+    session_id: str | None = None,
+    auto_opened_docs: list[Dict[str, Any]] | None = None,
+    owner: str | None = None,
+) -> str:
+    """Extract an Office/EPUB document to Markdown via the optional markitdown dep.
+
+    Falls back to a friendly banner when markitdown is unavailable or finds no
+    text, so a missing optional dependency never breaks the chat path. When a
+    session_id is provided AND the extraction succeeded, the FULL text is also
+    saved as a Document so the agent can page through it via
+    `manage_documents action=read offset=…` after the inline copy is capped.
+    """
+    from src.markitdown_runtime import (
+        is_markitdown_format,
+        convert_to_markdown,
+        load_markitdown,
+    )
+
+    if not is_markitdown_format(path):
+        return "\n\n[Attached document file]"
+
+    markdown = convert_to_markdown(path)
+    if markdown and markdown.strip():
+        title = os.path.splitext(os.path.basename(path))[0]
+        body, marker = _truncate_inline(markdown)
+
+        # Persist the full extracted text as a Document. The agent's existing
+        # manage_documents tool can then read past the inline cap with offset.
+        doc_id = None
+        if session_id:
+            try:
+                from src.office_doc import create_office_document
+                doc_id = create_office_document(
+                    session_id=session_id,
+                    upload_id=os.path.basename(path),
+                    title=title,
+                    body_text=markdown,
+                )
+                if doc_id and auto_opened_docs is not None:
+                    from src.database import SessionLocal, Document
+                    _db = SessionLocal()
+                    try:
+                        _d = _db.query(Document).filter(Document.id == doc_id).first()
+                        if _d:
+                            auto_opened_docs.append({
+                                "doc_id": _d.id,
+                                "title": _d.title,
+                                "language": _d.language,
+                                "content": _d.current_content,
+                                "version": _d.version_count,
+                            })
+                    finally:
+                        _db.close()
+            except Exception as e:
+                logger.warning("Office auto-doc creation failed for %s: %s", path, e)
+
+        # Upgrade the truncation marker with a hint pointing at the full doc so
+        # the agent knows it can read the rest.
+        if doc_id and marker:
+            marker = (
+                f"\n[…truncated for inline context — full {len(markdown):,} chars "
+                f"saved as document `{doc_id}`. Use `manage_documents` with "
+                f"action=read, document_id={doc_id}, offset=<N> to page through.]"
+            )
+
+        return f"\n\n[Document content — {title}]:\n{body}{marker}"
+
+    # No content: tell the user whether to install the optional dep or whether
+    # the document simply had no extractable text.
+    try:
+        load_markitdown()
+        return f"\n\n[Attached document: {display_name} — no extractable text found.]"
+    except RuntimeError as exc:
+        return f"\n\n[Attached document: {display_name} — {exc}]"
+
+
+def _process_legacy_word_document(path: str, display_name: str) -> str:
+    """Extract readable text from an old binary Word ``.doc`` file."""
+    commands: list[tuple[str, list[str]]] = []
+    if shutil.which("antiword"):
+        commands.append(("antiword", ["antiword", path]))
+    if shutil.which("catdoc"):
+        commands.append(("catdoc", ["catdoc", path]))
+    if shutil.which("strings"):
+        commands.extend((
+            ("strings", ["strings", "-n", "4", path]),
+            ("strings (UTF-16LE)", ["strings", "-e", "l", "-n", "4", path]),
+        ))
+
+    collected: list[str] = []
+    seen: set[str] = set()
+    used: list[str] = []
+    for label, command in commands:
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=20,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning("Legacy Word extraction via %s failed for %s: %s", label, path, exc)
+            continue
+        text = (result.stdout or "").strip()
+        if not text:
+            continue
+        used.append(label)
+        for line in text.splitlines():
+            line = line.strip()
+            if line and line not in seen:
+                seen.add(line)
+                collected.append(line)
+        if label in {"antiword", "catdoc"} and collected:
+            break
+
+    title = os.path.splitext(os.path.basename(display_name or path))[0]
+    body, marker = _truncate_inline("\n".join(collected))
+    if body:
+        method = used[0] if used else "best-effort extraction"
+        return (
+            f"\n\n[Legacy Word content — {title}; formatting omitted; "
+            f"extracted with {method}]:\n{body}{marker}"
+        )
+    return (
+        f"\n\n[Attached legacy Word document: {display_name} — no readable text "
+        "could be extracted. Install antiword or LibreOffice for fuller support.]"
+    )
+
+
+def extract_local_document(
+    path: str,
+    *,
+    display_name: str | None = None,
+    owner: str | None = None,
+    analyze_embedded_images: bool = False,
+) -> str:
+    """Extract a local document into bounded model-readable text.
+
+    This side-effect-free entry point is shared by non-UI runtimes. It avoids
+    creating session documents and defaults to text-only PDF extraction so a
+    background task bridge cannot make an unexpected vision-model call.
+    """
+
+    name = display_name or os.path.basename(path)
+    mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+    if path.lower().endswith(".doc") or name.lower().endswith(".doc"):
+        return _process_legacy_word_document(path, name)
+    if mime == "application/pdf" or path.lower().endswith(".pdf"):
+        return _process_pdf(
+            path,
+            owner=owner,
+            analyze_embedded_images=analyze_embedded_images,
+        )
+    if mime.startswith("text/") or _is_text_file(path):
+        return _process_text_file(path)
+    return _process_office_document(path, name, owner=owner)
+
+
+# Marker that _process_pdf prepends to extracted text.
+_PDF_CONTENT_MARKER = "\n\n[PDF content]:"
+
+
+def strip_pdf_content_marker(text: str) -> str:
+    """Remove the leading ``[PDF content]:`` wrapper that ``_process_pdf`` adds.
+
+    Uses ``str.removeprefix`` rather than ``str.lstrip(chars)``: ``lstrip``
+    treats its argument as a *set of characters*, so ``lstrip("\\n[PDF content]:")``
+    keeps chewing into the page text that follows the marker. For example
+    ``"\\n\\n[PDF content]:\\n\\n[Page 1 text]:\\nto the board"`` would lose the
+    leading "to" because 't' and 'o' are in the marker's character set.
+    """
+    return (text or "").removeprefix(_PDF_CONTENT_MARKER).strip()
+
+
 def _load_vl_settings() -> dict:
     """Load admin settings from disk."""
     try:
@@ -161,7 +396,7 @@ def _load_vl_settings() -> dict:
         return {}
 
 
-def _resolve_vl_model(configured: str) -> tuple:
+def _resolve_vl_model(configured: str, owner: str | None = None) -> tuple:
     """Resolve the vision model to (url, model_id, headers).
 
     Uses admin-configured model if set, otherwise tries auto-detection
@@ -170,7 +405,7 @@ def _resolve_vl_model(configured: str) -> tuple:
     from src.ai_interaction import _resolve_model
 
     if configured:
-        return _resolve_model(configured)
+        return _resolve_model(configured, owner=owner)
 
     # Auto-detect: try known vision-capable models in priority order
     candidates = [
@@ -181,14 +416,14 @@ def _resolve_vl_model(configured: str) -> tuple:
     ]
     for candidate in candidates:
         try:
-            return _resolve_model(candidate)
+            return _resolve_model(candidate, owner=owner)
         except (ValueError, Exception):
             continue
 
     raise ValueError("No vision model available")
 
 
-def analyze_image_with_vl_result(image_path: str) -> dict:
+def analyze_image_with_vl_result(image_path: str, owner: str | None = None) -> dict:
     """Analyze an image and return both text and the model that produced it."""
     logger.info(f"Analyzing image with VL model: {image_path}")
     try:
@@ -198,7 +433,7 @@ def analyze_image_with_vl_result(image_path: str) -> dict:
         vl_model = settings.get("vision_model", "")
 
         try:
-            url, model_id, headers = _resolve_vl_model(vl_model)
+            url, model_id, headers = _resolve_vl_model(vl_model, owner=owner)
         except ValueError:
             return {"text": "[No vision model configured — set one in Settings → Vision]", "model": vl_model or ""}
 
@@ -223,14 +458,14 @@ def analyze_image_with_vl_result(image_path: str) -> dict:
         # — same shape as task/chat but its own list (`vision_model_fallbacks`).
         try:
             from src.endpoint_resolver import resolve_vision_fallback_candidates
-            _vl_candidates = [(url, model_id, headers)] + resolve_vision_fallback_candidates()
+            _vl_candidates = [(url, model_id, headers)] + resolve_vision_fallback_candidates(owner=owner)
         except Exception:
             _vl_candidates = [(url, model_id, headers)]
 
         last_err = None
         for i, (_url, _model, _headers) in enumerate([c for c in _vl_candidates if c and c[0] and c[1]]):
             try:
-                description = llm_call(_url, _model, vl_messages, headers=_headers, timeout=30)
+                description = llm_call(_url, _model, vl_messages, headers=_headers, timeout=120)
                 logger.info("VL analysis complete with model %s", _model)
                 return {"text": description, "model": _model}
             except Exception as e:
@@ -245,9 +480,9 @@ def analyze_image_with_vl_result(image_path: str) -> dict:
         return {"text": "[VL model unavailable - image not analyzed]", "model": ""}
 
 
-def analyze_image_with_vl(image_path: str) -> str:
+def analyze_image_with_vl(image_path: str, owner: str | None = None) -> str:
     """Analyze an image using the admin-configured Vision-Language model."""
-    return analyze_image_with_vl_result(image_path).get("text", "")
+    return analyze_image_with_vl_result(image_path, owner=owner).get("text", "")
 
 
 def build_user_content(
@@ -257,6 +492,8 @@ def build_user_content(
     upload_handler,
     session_id: str | None = None,
     auto_opened_docs: list[Dict[str, Any]] | None = None,
+    owner: str | None = None,
+    resolved_uploads: dict[str, Dict[str, Any]] | None = None,
 ) -> str | List[Dict[str, Any]]:
     """Build user content with attachments (text, images, audio, documents).
 
@@ -267,38 +504,39 @@ def build_user_content(
     frontend can switch to the new doc immediately.
     """
     content = [{"type": "text", "text": text}]
+    inline_attachment_remaining = MAX_INLINE_ATTACHMENT_CHARS
 
-    for fid in attachment_ids:
-        if not upload_handler.validate_upload_id(fid):
-            logger.warning(f"Invalid attachment ID format: {fid}")
+    for fid in attachment_ids or []:
+        upload_info = (resolved_uploads or {}).get(fid)
+        if upload_info is None and hasattr(upload_handler, "resolve_upload"):
+            upload_info = upload_handler.resolve_upload(fid, owner=owner)
+        if upload_info is None:
+            logger.warning(f"Attachment {fid} not found or not authorized")
             continue
 
-        path = os.path.join(upload_dir, fid)
-        if not (upload_handler.inside_base_dir(path) and os.path.exists(path)):
-            found = False
-            for root, dirs, files in os.walk(upload_dir):
-                if fid in files and not fid.endswith(".json"):
-                    path = os.path.join(root, fid)
-                    if upload_handler.inside_base_dir(path):
-                        found = True
-                        logger.info(f"Found attachment {fid} at {path}")
-                        break
-            if not found:
-                logger.warning(f"Attachment {fid} not found in upload directories")
-                continue
-
-        if not upload_handler.inside_base_dir(path):
+        path = upload_info.get("path")
+        if not path or not os.path.exists(path):
+            logger.warning(f"Attachment {fid} path is missing")
+            continue
+        if hasattr(upload_handler, "_inside_upload_dir") and not upload_handler._inside_upload_dir(path):
+            logger.warning(f"Attachment {fid} path is outside upload directory: {path}")
+            continue
+        if not hasattr(upload_handler, "_inside_upload_dir") and not upload_handler.inside_base_dir(path):
             logger.warning(f"Attachment {fid} path is outside base directory: {path}")
             continue
 
         _, ext = os.path.splitext(path.lower())
-        mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        mime = upload_info.get("mime") or mimetypes.guess_type(path)[0] or "application/octet-stream"
+        display_name = upload_info.get("name") or upload_info.get("original_name") or path
 
-        if upload_handler.is_image_file(path, mime):
+        if upload_handler.is_image_file(display_name, mime):
             try:
                 with open(path, "rb") as image_file:
                     encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
-                image_format = ext[1:]
+                # Extensionless uploads (e.g. a pasted screenshot) have no ext,
+                # so fall back to the resolved MIME subtype rather than emitting
+                # an invalid "data:image/;base64," with an empty subtype.
+                image_format = ext[1:] or (mime.split("/", 1)[1] if mime.startswith("image/") else "png")
                 content.append({
                     "type": "image_url",
                     "image_url": {"url": f"data:image/{image_format};base64,{encoded_string}"},
@@ -310,11 +548,11 @@ def build_user_content(
                 else:
                     content.insert(0, {"type": "text", "text": "[Image attached but could not be processed]"})
 
-        elif upload_handler.is_audio_file(path, mime):
+        elif upload_handler.is_audio_file(display_name, mime):
             try:
                 with open(path, "rb") as audio_file:
                     encoded_string = base64.b64encode(audio_file.read()).decode("utf-8")
-                audio_format = ext[1:]
+                audio_format = ext[1:] or (mime.split("/", 1)[1] if mime.startswith("audio/") else "mpeg")
                 content.append({
                     "type": "audio",
                     "audio": {"url": f"data:audio/{audio_format};base64,{encoded_string}"},
@@ -326,7 +564,7 @@ def build_user_content(
                 else:
                     content.insert(0, {"type": "text", "text": "[Audio attached but could not be processed]"})
 
-        elif upload_handler.is_document_file(path, mime):
+        elif upload_handler.is_document_file(display_name, mime):
             if mime == "application/pdf":
                 extracted_text = None
                 if session_id:
@@ -337,13 +575,11 @@ def build_user_content(
                             create_form_markdown_document,
                             create_plain_pdf_document,
                         )
-                        title = os.path.splitext(os.path.basename(path))[0]
+                        title = os.path.splitext(os.path.basename(display_name))[0]
                         # Pull the PDF prose once — used as either intro_text
                         # (form path) or the doc body (plain path).
                         try:
-                            pdf_body_text = _process_pdf(path).lstrip(
-                                "\n[PDF content]:"
-                            ).strip()
+                            pdf_body_text = strip_pdf_content_marker(_process_pdf(path, owner=owner))
                         except Exception:
                             pdf_body_text = None
 
@@ -426,12 +662,25 @@ def build_user_content(
                     except Exception as e:
                         logger.warning(f"PDF auto-doc creation failed for {path}: {e}")
                 if extracted_text is None:
-                    extracted_text = _process_pdf(path)
+                    extracted_text = _process_pdf(path, owner=owner)
+            elif path.lower().endswith(".doc") or display_name.lower().endswith(".doc"):
+                extracted_text = _process_legacy_word_document(path, display_name)
             elif mime.startswith("text/") or _is_text_file(path):
                 extracted_text = _process_text_file(path)
             else:
-                extracted_text = "\n\n[Attached document file]"
+                extracted_text = _process_office_document(
+                    path,
+                    display_name,
+                    session_id=session_id,
+                    auto_opened_docs=auto_opened_docs,
+                    owner=owner,
+                )
 
+            extracted_text, inline_attachment_remaining = _fit_inline_attachment_text(
+                extracted_text,
+                inline_attachment_remaining,
+                display_name,
+            )
             if content and content[0]["type"] == "text":
                 content[0]["text"] += extracted_text
             else:

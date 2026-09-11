@@ -6,23 +6,42 @@
 // ES6 module — IIFE removed
 
 import Storage from './storage.js';
-import uiModule from './ui.js';
+import uiModule from './ui.js?v=20260908weekhoverfix1';
 import sessionModule from './sessions.js';
-import chatRenderer from './chatRenderer.js';
-import chatStream from './chatStream.js';
+import chatRenderer, { renderToolIcon } from './chatRenderer.js?v=20260910streamlinks2';
+import chatStream from './chatStream.js?v=20260909cardlayout1';
 import { addAITTSButton } from './tts-ai.js';
 import markdownModule from './markdown.js';
 import spinnerModule from './spinner.js';
-import presetsModule from './presets.js';
-import fileHandlerModule from './fileHandler.js';
+import presetsModule from './presets.js?v=20260908personaname1';
+import fileHandlerModule from './fileHandler.js?v=20260909mobileattachmentedit1';
 import searchModule from './search.js';
-import documentModule from './document.js';
-import * as emailInbox from './emailInbox.js';
-import codeRunnerModule from './codeRunner.js';
-import slashCommands, { initSlashCommands, isCommand, handleSlashCommand, handleSetupInput, handleSetupWizard, typewriterInto } from './slashCommands.js';
-import createResearchSynapse from './researchSynapse.js';
+import documentModule from './document.js?v=20260911removealignrightshortcut1';
+import * as emailInbox from './emailInbox.js?v=20260903emailsend2';
+import codeRunnerModule from './codeRunner.js?v=20260831richtexttools91';
+import slashCommands, { initSlashCommands, isCommand, handleSlashCommand, handleSetupInput, handleSetupWizard, typewriterInto } from './slashCommands.js?v=20260902tuiharness1';
+import createResearchSynapse from './researchSynapse.js?v=20260910roundlabels2';
+import { createStreamRenderer } from './streamingRenderer.js';
+import { createTurnRendering, startsContinuationRound } from './turnRendering.js?v=20260910round1stable1';
+import { wireArrowUpRecall, getUserMessagesFromChatHistory } from './composerArrowUpRecall.js?v=20260714promptrecall';
+import {
+  createIncrementalDisplayProjector,
+  createLiveThinkingThrottle,
+  createThinkingAnalysisGate,
+  stripLiveThinkingTags,
+} from './liveThinkingThrottle.js';
+import {
+  applyModelMetricsState,
+  applyModelRouteEventState,
+  inheritModelRouteState,
+} from './chatModelProvenance.js';
+import { createTerminalStreamError, isRecoverableStreamError } from './chatStreamErrors.js';
+import { loadPanel } from './panels.js?v=20260909movepicklayer1';
+import { invalidateSettings } from './appConfig.js';
+
   const RESEARCH_TIMEOUT_MS = 360000;
   const DEFAULT_TIMEOUT_MS = 120000;
+  const RUN_ID_ABORT_GRACE_MS = 2000; // timeout waits this long for a run-id header before hard-aborting
   const RESEARCH_SVG = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>';
 
   let API_BASE = '';
@@ -40,7 +59,770 @@ import createResearchSynapse from './researchSynapse.js';
   let _sendInFlight = false;   // covers the window from click → streaming start
   let _displayOverride = null; // Override visible user bubble text (hides injected prompts)
   let _hideUserBubble = false; // Skip user bubble entirely (e.g. continue after stop)
+  let _contextHeaderSeq = 0;
+  let _contextHeaderData = null;
+  let _contextHeaderBound = false;
+  let _contextHeaderAnchorEl = null;
+  let _pendingToolApproval = null;
+  let _lastPrivateBrowserUrl = '';
+  function _isPrivateBrowserTool(tool) {
+    const name = String(tool || '').toLowerCase();
+    return name === 'private_browser'
+      || name.includes('private_browser')
+      || name.includes('builtin_browser')
+      || name.startsWith('browser_')
+      || name.includes('__browser_');
+  }
+
+  function _privateBrowserActionLabel(command) {
+    const raw = String(command || '').trim();
+    if (!raw) return 'running';
+    try {
+      const parsed = JSON.parse(raw);
+      const action = String(parsed && parsed.action || '').trim();
+      if (action) {
+        const target = parsed.url || parsed.selector || parsed.target || parsed.key || '';
+        return target ? `${action}: ${String(target).slice(0, 90)}` : action;
+      }
+    } catch (_) {}
+    return raw.slice(0, 110);
+  }
+
+  function _privateBrowserUrlFromCommand(command) {
+    const raw = String(command || '').trim();
+    if (!raw) return '';
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed.url === 'string' && parsed.url) return parsed.url;
+      const commands = Array.isArray(parsed && parsed.commands) ? parsed.commands : [];
+      for (const item of commands) {
+        if (Array.isArray(item) && String(item[0] || '').toLowerCase() === 'open' && item[1]) return String(item[1]);
+        if (item && typeof item === 'object' && String(item.action || '').toLowerCase() === 'open' && item.url) return String(item.url);
+      }
+    } catch (_) {}
+    return '';
+  }
+
+  function _mountPrivateBrowserSpinner(emptyEl) {
+    const slot = emptyEl?.querySelector?.('.private-browser-preview-spinner');
+    if (!slot || slot.dataset.whirlpoolMounted === '1') return;
+    slot.dataset.whirlpoolMounted = '1';
+    try {
+      const wp = spinnerModule.createWhirlpool(13);
+      wp.element.style.cssText = 'width:13px;height:13px;margin:0;';
+      slot.replaceChildren(wp.element);
+      slot._spinner = wp;
+    } catch (_) {}
+  }
+
+  function _mountPrivateBrowserSpinners(root) {
+    (root || document).querySelectorAll?.('.private-browser-preview-empty')?.forEach(_mountPrivateBrowserSpinner);
+  }
+
+  function _privateBrowserPreviewHtml(command, screenshot, fallbackUrl = '') {
+    const screenshotSrc = chatRenderer.safeToolScreenshotSrc(screenshot);
+    const url = _privateBrowserUrlFromCommand(command) || String(fallbackUrl || _lastPrivateBrowserUrl || '');
+    const urlAttr = url ? ` data-browser-url="${uiModule.esc(url)}" title="Open ${uiModule.esc(url)}"` : '';
+    const imgHtml = screenshotSrc
+      ? `<img class="private-browser-preview-img" src="${uiModule.esc(screenshotSrc)}" alt="Private browser screenshot" />`
+      : '<div class="private-browser-preview-empty"><span>Browsing…</span><span class="private-browser-preview-spinner" aria-hidden="true"></span></div><img class="private-browser-preview-img" alt="Private browser screenshot" />';
+    const html = `<div class="private-browser-preview"${urlAttr}><div class="private-browser-preview-header"><span class="private-browser-preview-title">Private Browser</span><span class="private-browser-preview-status">${uiModule.esc(_privateBrowserActionLabel(command))}</span><button type="button" class="private-browser-preview-fold" title="Fold browser preview" aria-label="Fold browser preview">×</button></div><div class="private-browser-preview-frame">${imgHtml}</div></div>`;
+    setTimeout(() => _mountPrivateBrowserSpinners(document), 0);
+    return html;
+  }
+
+  function _ensurePrivateBrowserPreview(contentEl) {
+    const host = contentEl || (typeof currentToolBubble !== 'undefined' && currentToolBubble
+      ? currentToolBubble.querySelector('.agent-thread-content')
+      : null);
+    if (!host) return null;
+    let root = host.querySelector('.private-browser-preview');
+    if (root) {
+      return {
+        root,
+        status: root.querySelector('.private-browser-preview-status'),
+        empty: root.querySelector('.private-browser-preview-empty'),
+        img: root.querySelector('.private-browser-preview-img'),
+      };
+    }
+    root = document.createElement('div');
+    root.className = 'private-browser-preview';
+    root.innerHTML = `
+      <div class="private-browser-preview-header">
+        <span class="private-browser-preview-title">Private Browser</span>
+        <span class="private-browser-preview-status"></span>
+        <button type="button" class="private-browser-preview-fold" title="Fold browser preview" aria-label="Fold browser preview">×</button>
+      </div>
+      <div class="private-browser-preview-frame">
+        <div class="private-browser-preview-empty"><span>Browsing…</span><span class="private-browser-preview-spinner" aria-hidden="true"></span></div>
+        <img class="private-browser-preview-img" alt="Private browser screenshot" />
+      </div>
+    `;
+    host.appendChild(root);
+    _mountPrivateBrowserSpinners(root);
+    return {
+      root,
+      status: root.querySelector('.private-browser-preview-status'),
+      empty: root.querySelector('.private-browser-preview-empty'),
+      img: root.querySelector('.private-browser-preview-img'),
+    };
+  }
+
+  function _showPrivateBrowserPreview(command, contentEl) {
+    const preview = _ensurePrivateBrowserPreview(contentEl);
+    if (!preview || !preview.root) return;
+    if (preview.status) preview.status.textContent = _privateBrowserActionLabel(command);
+    const url = _privateBrowserUrlFromCommand(command);
+    if (url) {
+      _lastPrivateBrowserUrl = url;
+      preview.root.dataset.browserUrl = url;
+      preview.root.title = `Open ${url}`;
+    } else if (_lastPrivateBrowserUrl) {
+      preview.root.dataset.browserUrl = _lastPrivateBrowserUrl;
+      preview.root.title = `Open ${_lastPrivateBrowserUrl}`;
+    }
+    if (preview.empty) preview.empty.hidden = !!(preview.img && preview.img.getAttribute('src'));
+    _mountPrivateBrowserSpinner(preview.empty);
+  }
+
+  function _updatePrivateBrowserPreview(json, contentEl) {
+    if (!json || !_isPrivateBrowserTool(json.tool)) return;
+    const preview = _ensurePrivateBrowserPreview(contentEl);
+    if (!preview || !preview.root) return;
+    if (preview.status) preview.status.textContent = _privateBrowserActionLabel(json.command || '');
+    const url = _privateBrowserUrlFromCommand(json.command || '');
+    if (url) {
+      _lastPrivateBrowserUrl = url;
+      preview.root.dataset.browserUrl = url;
+      preview.root.title = `Open ${url}`;
+    } else if (_lastPrivateBrowserUrl) {
+      preview.root.dataset.browserUrl = _lastPrivateBrowserUrl;
+      preview.root.title = `Open ${_lastPrivateBrowserUrl}`;
+    }
+    const screenshotSrc = chatRenderer.safeToolScreenshotSrc(json.screenshot);
+    if (!screenshotSrc) {
+      return;
+    }
+    if (preview.img) {
+      preview.img.src = screenshotSrc;
+      preview.img.hidden = false;
+    }
+    if (preview.empty) preview.empty.hidden = true;
+  }
+
+  function _submitToolApprovalWhenIdle(approvalId) {
+    if (
+      !_pendingToolApproval
+      || _pendingToolApproval.approval_id !== approvalId
+    ) return;
+    if (isStreaming || _sendInFlight) {
+      setTimeout(() => _submitToolApprovalWhenIdle(approvalId), 120);
+      return;
+    }
+    const input = document.getElementById('message');
+    if (input) {
+      _pendingToolApproval.draft = input.value || '';
+    }
+    const sendButton = document.querySelector('.send-btn');
+    if (sendButton) sendButton.click();
+  }
+
+  document.addEventListener('odysseus:tool-approval', (event) => {
+    const detail = event && event.detail ? event.detail : {};
+    const decision = String(detail.decision || '').toLowerCase();
+    if (!detail.approval_id || !['approve', 'approve_task', 'deny'].includes(decision)) return;
+    _pendingToolApproval = {
+      approval_id: String(detail.approval_id),
+      decision,
+      document_id: String(detail.document_id || ''),
+    };
+    _submitToolApprovalWhenIdle(_pendingToolApproval.approval_id);
+  });
+
+  function _fmtContextNumber(n) {
+    const v = Number(n || 0);
+    return v ? v.toLocaleString() : '?';
+  }
+
+  function _contextColorClass(pct) {
+    const n = Number(pct || 0);
+    if (n >= 85) return 'danger';
+    if (n >= 70) return 'warn';
+    return '';
+  }
+
+  function _contextRingColor(pct) {
+    const n = Number(pct || 0);
+    if (n >= 85) return 'var(--red, #e06c75)';
+    if (n >= 70) return '#ff9900';
+    return 'var(--green, #98c379)';
+  }
+
+  function _contextRingMarkup(pct, { includeLabel = true, labelId = '' } = {}) {
+    const value = Math.max(0, Math.min(100, Number(pct || 0)));
+    const r = 6;
+    const stroke = 1.5;
+    const circ = 2 * Math.PI * r;
+    const fill = circ * (value / 100);
+    const label = value.toFixed(value >= 10 ? 0 : 1);
+    const idAttr = labelId ? ` id="${labelId}"` : '';
+    return `<svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true">
+        <circle cx="7" cy="7" r="${r}" fill="none" stroke="var(--border, #333)" stroke-width="${stroke}" opacity="0.3"/>
+        <circle cx="7" cy="7" r="${r}" fill="none" stroke="var(--ctx-stroke)" stroke-width="${stroke}"
+          stroke-dasharray="${fill} ${circ - fill}" stroke-dashoffset="${circ * 0.25}"
+          stroke-linecap="round" transform="rotate(-90 7 7)"/>
+      </svg>${includeLabel ? `<span class="ctx-ring-pct"${idAttr}>${label}%</span>` : ''}`;
+  }
+
+  function _renderContextHeaderRing(pill, pct) {
+    const value = Math.max(0, Math.min(100, Number(pct || 0)));
+    pill.style.setProperty('--ctx-color', _contextRingColor(value));
+    pill.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>';
+  }
+
+  function _clampAutoCompactThreshold(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return 85;
+    return Math.max(50, Math.min(95, Math.round(n)));
+  }
+
+  function _liveSessionModule() {
+    return (window.sessionModule && window.sessionModule.getCurrentSessionId)
+      ? window.sessionModule
+      : sessionModule;
+  }
+
+  async function _resolveCurrentSessionId({ adopt = false } = {}) {
+    const sm = _liveSessionModule();
+    const current = sm && sm.getCurrentSessionId && sm.getCurrentSessionId();
+    if (current) return current;
+    const activeRowId = document.querySelector('.list-item.active-session[data-session-id], .session-item.active[data-session-id]')?.dataset?.sessionId || '';
+    const hashId = _hashSessionCandidate();
+    const lastSelectedId = String(window.__odysseusLastSelectedSessionId || '').trim();
+    const targetId = activeRowId || hashId || lastSelectedId;
+    if (!targetId) return '';
+    if (!adopt) return targetId;
+    try {
+      window.__odysseusComposerUserEdited = true;
+      if (sm && sm.selectSession) {
+        await sm.selectSession(targetId, { keepSidebar: true, showLoading: false });
+      } else if (sm && sm.setCurrentSessionId) {
+        sm.setCurrentSessionId(targetId);
+      } else if (sessionModule && sessionModule.selectSession) {
+        await sessionModule.selectSession(targetId, { keepSidebar: true, showLoading: false });
+      }
+    } catch (_) {}
+    return (sm && sm.getCurrentSessionId && sm.getCurrentSessionId()) || targetId;
+  }
+
+  function _closeContextHeaderPopup() {
+    document.querySelectorAll('.chat-context-popup').forEach(el => el.remove());
+    const pill = document.getElementById('chat-context-pill');
+    if (pill) pill.classList.remove('open');
+    const meta = document.getElementById('current-meta');
+    if (meta) meta.classList.remove('open');
+    _contextHeaderAnchorEl = null;
+  }
+
+  function _positionContextHeaderPopup(popup, anchorEl) {
+    const anchor = anchorEl || document.getElementById('chat-context-pill') || document.getElementById('current-meta');
+    if (!anchor) return;
+    const rect = anchor.getBoundingClientRect();
+    popup.style.top = `${Math.round(rect.bottom + 8)}px`;
+    popup.style.left = `${Math.round(rect.left + (rect.width / 2) - 119)}px`;
+    document.body.appendChild(popup);
+    const pRect = popup.getBoundingClientRect();
+    if (pRect.left < 8) popup.style.left = '8px';
+    if (pRect.right > window.innerWidth - 8) popup.style.left = `${Math.max(8, window.innerWidth - pRect.width - 8)}px`;
+    if (pRect.bottom > window.innerHeight - 8) popup.style.top = `${Math.max(8, rect.top - pRect.height - 8)}px`;
+  }
+
+  function _showContextHeaderPopup(anchorEl = null) {
+    const pill = document.getElementById('chat-context-pill');
+    if (!pill || pill.hidden || !_contextHeaderData) return;
+    const wasOpen = pill.classList.contains('open');
+    const sameAnchor = anchorEl && _contextHeaderAnchorEl === anchorEl;
+    if (wasOpen && (!anchorEl || sameAnchor)) return;
+    _closeContextHeaderPopup();
+    _contextHeaderAnchorEl = anchorEl || pill;
+
+    const d = _contextHeaderData;
+    const pct = Number(d.context_percent || 0);
+    const colorClass = _contextColorClass(pct);
+    const modelShort = String(d.model || 'Unknown').split('/').pop();
+    const popup = document.createElement('div');
+    popup.className = `chat-context-popup ${colorClass}`.trim();
+
+    const title = document.createElement('div');
+    title.className = 'chat-context-popup-title';
+    title.textContent = 'Chat Context';
+    popup.appendChild(title);
+
+    const bar = document.createElement('div');
+    bar.className = 'chat-context-popup-bar';
+    const fill = document.createElement('div');
+    fill.className = 'chat-context-popup-fill';
+    fill.style.width = `${Math.min(100, Math.max(0, pct))}%`;
+    bar.appendChild(fill);
+    popup.appendChild(bar);
+
+    const rows = [
+      ['Used', `${_fmtContextNumber(d.used_tokens)} / ${_fmtContextNumber(d.context_length)}`],
+      ['Usage', `${pct}%`],
+      ['Window model', modelShort],
+      ['Messages', `${Number(d.messages || 0).toLocaleString()}`],
+    ];
+	    rows.forEach(([label, value]) => {
+	      const row = document.createElement('div');
+	      row.className = 'chat-context-popup-row';
+      const a = document.createElement('span');
+      a.textContent = label;
+      const b = document.createElement('span');
+      b.textContent = value;
+      row.appendChild(a);
+      row.appendChild(b);
+	      popup.appendChild(row);
+	    });
+
+	    const memoryOn = d.memory_extraction_enabled !== false;
+	    const memoryRow = document.createElement('div');
+	    memoryRow.className = 'chat-context-toggle-row';
+	    const memoryCopy = document.createElement('div');
+	    memoryCopy.className = 'chat-context-toggle-copy';
+	    const memoryLabel = document.createElement('span');
+	    memoryLabel.textContent = 'Memory extraction';
+	    const memoryState = document.createElement('span');
+	    memoryState.className = 'chat-context-toggle-state';
+	    memoryState.textContent = memoryOn ? 'On' : 'Off';
+	    memoryCopy.appendChild(memoryLabel);
+	    memoryCopy.appendChild(memoryState);
+	    const memoryToggle = document.createElement('button');
+	    memoryToggle.type = 'button';
+	    memoryToggle.className = `chat-context-toggle${memoryOn ? ' active' : ''}`;
+	    memoryToggle.setAttribute('role', 'switch');
+	    memoryToggle.setAttribute('aria-label', 'Memory extraction for this chat');
+	    memoryToggle.setAttribute('aria-checked', memoryOn ? 'true' : 'false');
+	    memoryToggle.addEventListener('click', async (e) => {
+	      e.preventDefault();
+	      e.stopPropagation();
+	      await _setChatMemoryExtraction(!memoryToggle.classList.contains('active'), memoryToggle, memoryState);
+	    });
+	    memoryRow.appendChild(memoryCopy);
+	    memoryRow.appendChild(memoryToggle);
+	    popup.appendChild(memoryRow);
+
+    const skillsOn = d.skill_injection_enabled !== false;
+    const skillsRow = document.createElement('div');
+    skillsRow.className = 'chat-context-toggle-row';
+    const skillsCopy = document.createElement('div');
+    skillsCopy.className = 'chat-context-toggle-copy';
+    const skillsLabel = document.createElement('span');
+    skillsLabel.textContent = 'Skill injection';
+    const skillsState = document.createElement('span');
+    skillsState.className = 'chat-context-toggle-state';
+    skillsState.textContent = skillsOn ? 'On' : 'Off';
+    skillsCopy.appendChild(skillsLabel);
+    skillsCopy.appendChild(skillsState);
+    const skillsToggle = document.createElement('button');
+    skillsToggle.type = 'button';
+    skillsToggle.className = `chat-context-toggle${skillsOn ? ' active' : ''}`;
+    skillsToggle.setAttribute('role', 'switch');
+    skillsToggle.setAttribute('aria-label', 'Skill injection for this chat');
+    skillsToggle.setAttribute('aria-checked', skillsOn ? 'true' : 'false');
+    skillsToggle.addEventListener('click', async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      await _setChatSkillInjection(!skillsToggle.classList.contains('active'), skillsToggle, skillsState);
+    });
+    skillsRow.appendChild(skillsCopy);
+    skillsRow.appendChild(skillsToggle);
+    popup.appendChild(skillsRow);
+
+    const thinkingOn = d.thinking_mode === 'on';
+    const thinkingRow = document.createElement('div');
+    thinkingRow.className = 'chat-context-toggle-row';
+    thinkingRow.innerHTML = `<div class="chat-context-toggle-copy"><span>Thinking</span><span class="chat-context-toggle-state">${thinkingOn ? 'On' : 'Off'}</span></div>`;
+    const thinkingToggle = document.createElement('button');
+    thinkingToggle.type = 'button';
+    thinkingToggle.className = `chat-context-toggle${thinkingOn ? ' active' : ''}`;
+    thinkingToggle.setAttribute('role', 'switch');
+    thinkingToggle.setAttribute('aria-checked', thinkingOn ? 'true' : 'false');
+    thinkingToggle.addEventListener('click', async () => {
+      const next = !thinkingToggle.classList.contains('active');
+      if (await _saveChatGenerationSettings({ thinking_mode: next ? 'on' : 'off' })) {
+        thinkingToggle.classList.toggle('active', next);
+        thinkingToggle.setAttribute('aria-checked', next ? 'true' : 'false');
+        thinkingRow.querySelector('.chat-context-toggle-state').textContent = next ? 'On' : 'Off';
+        uiModule.showToast(`Thinking ${next ? 'on' : 'off'} for this chat`);
+      }
+    });
+    thinkingRow.appendChild(thinkingToggle);
+    popup.appendChild(thinkingRow);
+
+    const addGenerationSlider = (label, value, min, max, step, formatter, key) => {
+      const row = document.createElement('div');
+      row.className = 'chat-context-threshold-row';
+      row.innerHTML = `<div class="chat-context-threshold-top"><span>${label}</span><span>${formatter(value)}</span></div>`;
+      const input = document.createElement('input');
+      Object.assign(input, { type: 'range', min: String(min), max: String(max), step: String(step), value: String(value), className: 'chat-context-threshold-slider preset-range' });
+      input.addEventListener('input', () => { row.querySelector('.chat-context-threshold-top span:last-child').textContent = formatter(Number(input.value)); });
+      input.addEventListener('change', () => _saveChatGenerationSettings({ [key]: key === 'max_tokens_override' && Number(input.value) > 8192 ? null : Number(input.value) }));
+      row.appendChild(input); popup.appendChild(row);
+    };
+    addGenerationSlider('Temperature', d.temperature_override ?? 1, 0, 2, 0.1, v => Number(v).toFixed(1), 'temperature_override');
+    addGenerationSlider('Max tokens', d.max_tokens_override ?? 8448, 256, 8448, 256, v => Number(v) > 8192 ? 'No limit' : Number(v).toLocaleString(), 'max_tokens_override');
+
+	    const threshold = _clampAutoCompactThreshold(d.auto_compact_threshold || 85);
+    const thresholdRow = document.createElement('div');
+    thresholdRow.className = 'chat-context-threshold-row';
+    const thresholdTop = document.createElement('div');
+    thresholdTop.className = 'chat-context-threshold-top';
+    const thresholdLabel = document.createElement('span');
+    thresholdLabel.textContent = 'Auto compact';
+    const thresholdValue = document.createElement('span');
+    thresholdValue.textContent = `${threshold}%`;
+    thresholdTop.appendChild(thresholdLabel);
+    thresholdTop.appendChild(thresholdValue);
+    const thresholdSlider = document.createElement('input');
+    thresholdSlider.type = 'range';
+    thresholdSlider.min = '50';
+    thresholdSlider.max = '95';
+    thresholdSlider.step = '5';
+    thresholdSlider.value = String(threshold);
+    thresholdSlider.className = 'chat-context-threshold-slider preset-range';
+    thresholdSlider.addEventListener('input', () => {
+      thresholdValue.textContent = `${_clampAutoCompactThreshold(thresholdSlider.value)}%`;
+    });
+    thresholdSlider.addEventListener('change', async () => {
+      const next = _clampAutoCompactThreshold(thresholdSlider.value);
+      thresholdSlider.disabled = true;
+      try {
+        let res;
+        try {
+          res = await fetch('/api/auth/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin',
+            body: JSON.stringify({ auto_compact_threshold_percent: next }),
+          });
+        } finally {
+          invalidateSettings();
+        }
+        if (!res.ok) throw new Error(await res.text());
+        _contextHeaderData = { ..._contextHeaderData, auto_compact_threshold: next };
+        uiModule.showToast(`Auto compact at ${next}%`);
+        await refreshChatContextHeader('threshold');
+      } catch (err) {
+        uiModule.showError(`Could not save auto compact threshold: ${err.message || err}`);
+        thresholdSlider.value = String(threshold);
+        thresholdValue.textContent = `${threshold}%`;
+      } finally {
+        thresholdSlider.disabled = false;
+      }
+    });
+    thresholdRow.appendChild(thresholdTop);
+    thresholdRow.appendChild(thresholdSlider);
+    popup.appendChild(thresholdRow);
+
+    if (d.can_compact) {
+      const compactBtn = document.createElement('button');
+      compactBtn.type = 'button';
+      compactBtn.className = 'chat-context-compact-btn';
+      compactBtn.innerHTML = '<svg width="13" height="13" viewBox="0 0 14 14" aria-hidden="true" style="position:relative;left:-2px"><circle cx="7" cy="7" r="5.5" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.35"></circle><circle cx="7" cy="7" r="5.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="20 35" stroke-linecap="round" transform="rotate(-90 7 7)"></circle></svg><span>Compact</span>';
+      compactBtn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        compactBtn.disabled = true;
+        compactBtn.replaceChildren();
+        try {
+          const wp = spinnerModule.createWhirlpool(13);
+          wp.element.style.margin = '0 5px 0 0';
+          wp.element.style.transform = 'translateY(-2px)';
+          compactBtn.appendChild(wp.element);
+        } catch (_) {}
+        compactBtn.appendChild(document.createTextNode('Compacting'));
+        const ok = await compactCurrentChatContext();
+        if (!ok) {
+          compactBtn.disabled = false;
+          compactBtn.textContent = 'Compact failed';
+        }
+      });
+      popup.appendChild(compactBtn);
+    }
+
+    pill.classList.add('open');
+    _contextHeaderAnchorEl?.classList?.add('open');
+    _positionContextHeaderPopup(popup, _contextHeaderAnchorEl);
+    setTimeout(() => {
+      const closeOnEscape = (ev) => {
+        if (ev.key !== 'Escape') return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        document.removeEventListener('keydown', closeOnEscape, true);
+        _closeContextHeaderPopup();
+      };
+      document.addEventListener('keydown', closeOnEscape, true);
+      const close = (ev) => {
+        if (popup.contains(ev.target) || pill.contains(ev.target) || _contextHeaderAnchorEl?.contains?.(ev.target)) return;
+        document.removeEventListener('pointerdown', close, true);
+        document.removeEventListener('keydown', closeOnEscape, true);
+        _closeContextHeaderPopup();
+      };
+      document.addEventListener('pointerdown', close, true);
+    }, 0);
+  }
+
+	  function _bindContextHeaderPill() {
+	    if (_contextHeaderBound) return;
+	    _contextHeaderBound = true;
+    const pill = document.getElementById('chat-context-pill');
+    if (!pill) return;
+    pill.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      _showContextHeaderPopup(pill);
+    });
+	  }
+
+	  async function _setChatMemoryExtraction(enabled, toggleBtn, stateText) {
+	    const sid = await _resolveCurrentSessionId({ adopt: true });
+	    if (!sid) {
+	      uiModule.showToast('Open a chat first');
+	      return false;
+	    }
+	    const next = !!enabled;
+	    if (toggleBtn) toggleBtn.disabled = true;
+	    try {
+	      const res = await fetch(`/api/session/${encodeURIComponent(sid)}/memory-extraction`, {
+	        method: 'POST',
+	        headers: { 'Content-Type': 'application/json' },
+	        credentials: 'same-origin',
+	        body: JSON.stringify({ enabled: next }),
+	      });
+	      if (!res.ok) throw new Error(await res.text());
+	      _contextHeaderData = {
+	        ...(_contextHeaderData || {}),
+	        memory_extraction_enabled: next,
+	      };
+	      if (toggleBtn) {
+	        toggleBtn.classList.toggle('active', next);
+	        toggleBtn.setAttribute('aria-checked', next ? 'true' : 'false');
+      }
+      if (stateText) stateText.textContent = next ? 'On' : 'Off';
+      uiModule.showToast(next ? 'Memory extraction on for this chat' : 'Memory extraction off for this chat');
+      // The popup already contains the updated state. Refreshing the whole
+      // context header here removes and recreates the popup while the user is
+      // interacting with it, which makes the dropdown appear to close.
+      return true;
+	    } catch (err) {
+	      uiModule.showError(`Could not save memory extraction: ${err.message || err}`);
+	      return false;
+	    } finally {
+	      if (toggleBtn) toggleBtn.disabled = false;
+	    }
+	  }
+
+  async function _setChatSkillInjection(enabled, toggleBtn, stateText) {
+	    const sid = await _resolveCurrentSessionId({ adopt: true });
+	    if (!sid) {
+	      uiModule.showToast('Open a chat first');
+	      return false;
+	    }
+	    const next = !!enabled;
+	    if (toggleBtn) toggleBtn.disabled = true;
+	    try {
+	      const res = await fetch(`/api/session/${encodeURIComponent(sid)}/skill-injection`, {
+	        method: 'POST',
+	        headers: { 'Content-Type': 'application/json' },
+	        credentials: 'same-origin',
+	        body: JSON.stringify({ enabled: next }),
+	      });
+	      if (!res.ok) throw new Error(await res.text());
+
+	      _contextHeaderData = {
+	        ...(_contextHeaderData || {}),
+	        skill_injection_enabled: next,
+	      };
+      if (toggleBtn) {
+	        toggleBtn.classList.toggle('active', next);
+	        toggleBtn.setAttribute('aria-checked', next ? 'true' : 'false');
+      }
+      if (stateText) stateText.textContent = next ? 'On' : 'Off';
+      uiModule.showToast(next ? 'Skill injection on for this chat' : 'Skill injection off for this chat');
+      return true;
+    } catch (err) {
+      uiModule.showError(`Could not save skill injection: ${err.message || err}`);
+      return false;
+    } finally {
+      if (toggleBtn) toggleBtn.disabled = false;
+    }
+  }
+
+  async function _saveChatGenerationSettings(change) {
+    const sid = await _resolveCurrentSessionId({ adopt: true });
+    if (!sid) return false;
+    const next = { thinking_mode: _contextHeaderData?.thinking_mode || '', temperature_override: _contextHeaderData?.temperature_override ?? null, max_tokens_override: _contextHeaderData?.max_tokens_override ?? null, ...change };
+    try {
+      const res = await fetch(`/api/session/${encodeURIComponent(sid)}/generation-settings`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', body: JSON.stringify(next) });
+      if (!res.ok) throw new Error(await res.text());
+      _contextHeaderData = { ..._contextHeaderData, ...await res.json() };
+      return true;
+    } catch (err) { uiModule.showError(`Could not save chat settings: ${err.message || err}`); return false; }
+  }
+
+	  export async function compactCurrentChatContext() {
+    const sm = _liveSessionModule();
+    const sid = await _resolveCurrentSessionId({ adopt: true });
+    if (!sid) {
+      uiModule.showToast('Open a chat first');
+      return false;
+    }
+    try {
+      const res = await fetch(`/api/session/${encodeURIComponent(sid)}/compact`, { method: 'POST' });
+      if (!res.ok) throw new Error(await res.text());
+      uiModule.showToast('Context compacted');
+      _closeContextHeaderPopup();
+      if (sm && sm.selectSession) await sm.selectSession(sid, { keepSidebar: true, showLoading: false });
+      refreshChatContextHeader('compact');
+      return true;
+    } catch (err) {
+      uiModule.showError(`Compact failed: ${err.message || err}`);
+      return false;
+    }
+  }
+  try { window.compactCurrentChatContext = compactCurrentChatContext; } catch (_) {}
+
+  export async function refreshChatContextHeader(reason = '') {
+    _bindContextHeaderPill();
+    const pill = document.getElementById('chat-context-pill');
+    if (!pill) return;
+    const sm = _liveSessionModule();
+    const sid = await _resolveCurrentSessionId({ adopt: false });
+    const seq = ++_contextHeaderSeq;
+    if (!sid) {
+      _contextHeaderData = null;
+      pill.hidden = true;
+      _closeContextHeaderPopup();
+      return;
+    }
+    pill.hidden = false;
+    pill.classList.add('loading');
+    try {
+      const res = await fetch(`/api/session/${encodeURIComponent(sid)}/context`, { credentials: 'same-origin' });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      if (seq !== _contextHeaderSeq) return;
+      const latestSm = _liveSessionModule();
+      if (!latestSm.getCurrentSessionId || latestSm.getCurrentSessionId() !== sid) return;
+      _contextHeaderData = data;
+      const pct = Number(data.context_percent || 0);
+      _renderContextHeaderRing(pill, pct);
+      pill.title = 'Chat settings';
+      pill.classList.remove('warn', 'danger');
+      const colorClass = _contextColorClass(pct);
+      if (colorClass) pill.classList.add(colorClass);
+      pill.classList.remove('loading');
+      if (pill.classList.contains('open')) {
+        const anchor = _contextHeaderAnchorEl;
+        _closeContextHeaderPopup();
+        _showContextHeaderPopup(anchor);
+      }
+    } catch (err) {
+      if (seq !== _contextHeaderSeq) return;
+      _contextHeaderData = null;
+      pill.hidden = true;
+      pill.classList.remove('loading', 'warn', 'danger');
+      _closeContextHeaderPopup();
+      console.warn('context header refresh failed:', reason, err);
+    }
+  }
+  try { window.refreshChatContextHeader = refreshChatContextHeader; } catch (_) {}
+
+  function _setForegroundChatBusy(active) {
+    try {
+      window.__odysseusChatBusy = !!active;
+      window.__odysseusChatBusyUntil = active ? Date.now() + 120000 : Date.now() + 1200;
+      window.dispatchEvent(new CustomEvent('odysseus:chat-busy-change', { detail: { active: !!active } }));
+    } catch (_) {}
+  }
   let _pendingContinue = null; // Stores the stopped AI element to merge with new response
+  function _createChatSendPerf() {
+    const started = (performance && performance.now) ? performance.now() : Date.now();
+    let last = started;
+    let reported = false;
+    const stages = [];
+    const now = () => (performance && performance.now) ? performance.now() : Date.now();
+    return {
+      mark(name) {
+        const t = now();
+        stages.push({ name, delta_ms: Math.round(t - last), at_ms: Math.round(t - started) });
+        last = t;
+      },
+      report(extra) {
+        if (reported) return;
+        const total = Math.round(now() - started);
+        const slowStage = stages.some(s => (s.delta_ms || 0) >= 1500);
+        if (total < 1500 && !slowStage) return;
+        reported = true;
+        const payload = JSON.stringify({
+          type: 'chat_send',
+          total_ms: total,
+          stages,
+          extra: extra || '',
+          session: sessionModule && sessionModule.getCurrentSessionId ? sessionModule.getCurrentSessionId() : '',
+        });
+        try {
+          if (navigator.sendBeacon) {
+            navigator.sendBeacon(`${API_BASE}/api/client-perf`, new Blob([payload], { type: 'application/json' }));
+            return;
+          }
+        } catch (_) {}
+        try {
+          fetch(`${API_BASE}/api/client-perf`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: payload,
+            keepalive: true,
+            credentials: 'same-origin',
+          }).catch(() => {});
+        } catch (_) {}
+      }
+    };
+  }
+
+  function _hashSessionCandidate() {
+    try {
+      const hashId = String(window.location.hash || '').replace(/^#/, '').trim();
+      if (!hashId) return '';
+      if (/^(document|note|image|email|event|task|skill|research)-/.test(hashId) || /^open=notes&note=/.test(hashId)) return '';
+      return hashId;
+    } catch (_) {
+      return '';
+    }
+  }
+
+  async function _adoptOpenedSessionBeforeAutoCreate() {
+    if (!sessionModule || !sessionModule.getCurrentSessionId || sessionModule.getCurrentSessionId()) return true;
+    // Don't adopt a stale session when the user explicitly started a New Chat
+    // (pending state set) — the send path must materialize the pending session.
+    if (sessionModule.hasPendingChat && sessionModule.hasPendingChat()) return false;
+    const activeRowId = document.querySelector('.list-item.active-session[data-session-id], .session-item.active[data-session-id]')?.dataset?.sessionId || '';
+    const hashId = _hashSessionCandidate();
+    const lastSelectedId = String(window.__odysseusLastSelectedSessionId || '').trim();
+    const targetId = activeRowId || hashId || lastSelectedId;
+    if (!targetId) return false;
+    try {
+      window.__odysseusComposerUserEdited = true;
+      if (sessionModule.selectSession) {
+        await sessionModule.selectSession(targetId, { keepSidebar: true, showLoading: false });
+      } else if (sessionModule.setCurrentSessionId) {
+        sessionModule.setCurrentSessionId(targetId);
+      }
+      return !!(sessionModule.getCurrentSessionId && sessionModule.getCurrentSessionId());
+    } catch (_) {
+      return false;
+    }
+  }
+
   // ── Auto-recovery: when a turn's stream silently dies (connection drop) or
   // goes quiet while the connection is alive, re-engage the model with a
   // completion handshake instead of leaving it hung. Capped so it can't loop.
@@ -50,7 +832,64 @@ import createResearchSynapse from './researchSynapse.js';
 
   // shortModel and modelColor are now in chatRenderer.js
   var _shortModel = chatRenderer.shortModel;
+  var _modelRouteLabel = chatRenderer.modelRouteLabel;
+  var _sameModelName = chatRenderer.sameModelName;
   var _applyModelColor = chatRenderer.applyModelColor;
+  function _setRoleModelLabel(roleEl, requestedModel, actualModel, opts) {
+    if (!roleEl) return;
+    opts = opts || {};
+    const tsSpan = roleEl.querySelector('.role-timestamp');
+    const req = requestedModel || actualModel || '';
+    const actual = actualModel || requestedModel || '';
+    let label = _modelRouteLabel(
+      req,
+      actual,
+      opts.requestedEndpointLabel,
+      opts.actualEndpointLabel,
+      opts.requestedEndpointId,
+      opts.actualEndpointId,
+    );
+    if (opts.suffix) label += ' (' + opts.suffix + ')';
+    if (opts.characterName) label = opts.characterName;
+    roleEl.textContent = label + ' ';
+    _applyModelColor(roleEl, actual || req);
+    const endpointChanged = Boolean(
+      opts.requestedEndpointId
+      && opts.actualEndpointId
+      && opts.requestedEndpointId !== opts.actualEndpointId
+    );
+    if (req && actual && (!_sameModelName(req, actual) || endpointChanged)) {
+      roleEl.title = req + ' -> ' + actual
+        + (endpointChanged ? ' (' + opts.requestedEndpointLabel + ' -> ' + opts.actualEndpointLabel + ')' : '')
+        + (opts.reason ? ': ' + opts.reason : '');
+    } else if (!opts.reason) {
+      roleEl.removeAttribute('title');
+    }
+    if (tsSpan) roleEl.appendChild(tsSpan);
+  }
+
+  function _bestKnownStreamModel(routeSnapshot) {
+    try {
+      const current = sessionModule.getCurrentModel ? sessionModule.getCurrentModel() : '';
+      if (current) return current;
+    } catch (_) {}
+    try {
+      const pending = sessionModule.getPendingChat && sessionModule.getPendingChat();
+      if (pending && pending.modelId) return pending.modelId;
+    } catch (_) {}
+    try {
+      const lastPicked = window.__odysseusLastPickedRoute || null;
+      if (lastPicked && lastPicked.model && Date.now() - (lastPicked.picked_at || 0) < 10 * 60 * 1000) {
+        return lastPicked.model;
+      }
+    } catch (_) {}
+    if (routeSnapshot && routeSnapshot.model) return routeSnapshot.model;
+    try {
+      const dc = window.__odysseusDefaultChat || JSON.parse(localStorage.getItem('odysseus-default-chat-cache') || 'null');
+      if (dc && dc.model) return dc.model;
+    } catch (_) {}
+    return '';
+  }
   // Per-session research tracking (supports concurrent research across sessions)
   const _researchingStreamIds = new Set();
   let _researchTimerEl = null, _researchTimerInterval = null;
@@ -76,19 +915,224 @@ import createResearchSynapse from './researchSynapse.js';
     const body = msgEl.querySelector('.body');
     if (body) chatRenderer.appendReportButton(body, sessionId);
   }
+
+  function _stripDocumentFenceForChat(text, { final = false } = {}) {
+    let s = String(text || '').replace(/<?\|end\|>?/g, '');
+    const markerMatch = /```(?:create_document|documen(?:t)?)\s*\n/i.exec(s);
+    if (!markerMatch) return s;
+    const before = s.slice(0, markerMatch.index).trimEnd();
+    const fenceStart = markerMatch.index;
+    const openingEnd = s.indexOf('\n', fenceStart);
+    const closeIdx = openingEnd >= 0 ? s.indexOf('\n```', openingEnd + 1) : -1;
+    const after = closeIdx >= 0 ? s.slice(closeIdx + 4).trimStart() : '';
+    const visible = [before, after].filter(Boolean).join('\n\n').trim();
+    return final && !visible ? 'Done.' : visible;
+  }
+
+  function _stripIncompleteRawToolJsonForChat(text) {
+    const s = String(text || '');
+    const starts = ['[{"function"', '[\n{"function"', '{"function"'];
+    let idx = -1;
+    for (const marker of starts) idx = Math.max(idx, s.lastIndexOf(marker));
+    if (idx < 0) return s;
+    const tail = s.slice(idx);
+    // Complete raw OpenAI-style function blobs are removed by stripToolBlocks.
+    // While the stream is still mid-JSON, hide the tail so it never flashes in
+    // the chat bubble as prose.
+    if (!/"type"\s*:\s*"function"/.test(tail) || !/\}\s*\]?\s*(?:<\/?\|(?:assistant|assistan|user|system|tool)\|>?)?\s*$/i.test(tail)) {
+      return s.slice(0, idx);
+    }
+    return s;
+  }
+
+  function _streamDisplayText(text, opts = {}) {
+    return stripToolBlocks(_stripIncompleteRawToolJsonForChat(_stripDocumentFenceForChat(text, opts)));
+  }
+
+  function _showDocumentWritingStatus(contentEl) {
+    const msg = contentEl && contentEl.closest ? contentEl.closest('.msg') : null;
+    const chatBox = document.getElementById('chat-history');
+    if (!msg || !chatBox) {
+      if (contentEl) contentEl.textContent = 'Writing...';
+      return;
+    }
+    let thread = msg._docWritingThread;
+    if (!thread || !thread.isConnected) {
+      thread = document.createElement('div');
+      thread.className = 'agent-thread streaming has-bottom';
+      thread.dataset.docWriting = '1';
+      const prev = msg.previousElementSibling;
+      if (prev && (prev.classList.contains('msg') || prev.classList.contains('agent-thread'))) {
+        thread.classList.add('has-top');
+      }
+      const node = document.createElement('div');
+      node.className = 'agent-thread-node running';
+      node.innerHTML = '<div class="agent-thread-dot"></div><div class="agent-thread-header"><span class="agent-thread-icon">▶</span><span class="agent-thread-tool">Writing</span><span class="agent-thread-wave">▁▂▃</span></div><div class="agent-thread-content"></div>';
+      thread.appendChild(node);
+      chatBox.insertBefore(thread, msg);
+      msg._docWritingThread = thread;
+
+      const waveEl = node.querySelector('.agent-thread-wave');
+      if (waveEl) {
+        const waveFrames = ['▁▂▃', '▂▃▄', '▃▄▅', '▄▅▆', '▅▆▇', '▆▅▄', '▅▄▃', '▄▃▂'];
+        let waveIdx = 0;
+        node._waveInterval = setInterval(() => {
+          waveIdx = (waveIdx + 1) % waveFrames.length;
+          waveEl.textContent = waveFrames[waveIdx];
+        }, 100);
+      }
+      node._startTime = Date.now();
+      node._elapsedTicker = setInterval(() => {
+        const hdr = node.querySelector('.agent-thread-header');
+        if (!hdr) return;
+        let el = hdr.querySelector('.agent-thread-elapsed');
+        if (!el) {
+          el = document.createElement('span');
+          el.className = 'agent-thread-elapsed';
+          const icon = hdr.querySelector('.agent-thread-icon');
+          if (icon && icon.nextSibling) hdr.insertBefore(el, icon.nextSibling);
+          else hdr.appendChild(el);
+        }
+        const s = (Date.now() - node._startTime) / 1000;
+        el.textContent = s < 60 ? `${s.toFixed(2)}s` : `${Math.floor(s / 60)}m ${(s % 60).toFixed(2).padStart(5, '0')}s`;
+      }, 50);
+    }
+    msg.style.display = 'none';
+  }
+
+  function _finishDocumentWritingStatus(msg, ok = true) {
+    const thread = msg && msg._docWritingThread;
+    if (!thread || !thread.isConnected) return;
+    thread.classList.remove('streaming');
+    const node = thread.querySelector('.agent-thread-node');
+    if (!node) return;
+    if (node._waveInterval) { clearInterval(node._waveInterval); node._waveInterval = null; }
+    if (node._elapsedTicker) { clearInterval(node._elapsedTicker); node._elapsedTicker = null; }
+    node.classList.remove('running');
+    if (!ok) node.classList.add('error');
+    const icon = node.querySelector('.agent-thread-icon');
+    if (icon) icon.textContent = ok ? '✓' : '✗';
+    const wave = node.querySelector('.agent-thread-wave');
+    if (wave) wave.remove();
+    if (!node.querySelector('.agent-thread-status')) {
+      const status = document.createElement('span');
+      status.className = 'agent-thread-status';
+      status.textContent = ok ? 'done' : 'failed';
+      const header = node.querySelector('.agent-thread-header');
+      if (header) header.appendChild(status);
+    }
+  }
+
   let currentAccumulated = ''; // Track accumulated text across function scope
   let currentHolder = null; // Track current message holder
   let currentSpinner = null; // Track current spinner for stop cleanup
 
   // Background streaming support
   const _backgroundStreams = new Map(); // sessionId -> { status, accumulated, sourcesHtml, abortCtrl, query, metrics }
+  const _activeStreams = new Map();     // sessionId -> { abortCtrl, holder, query, startedAt, cancelViewWork, finalizeView }
+  const _resumingStreams = new Set();   // sessionId -> a resumeStream() reader is live (re-attach lock)
+  const _terminalSavedStreams = new Set(); // sessionId -> canonical terminal event seen by active reader
+  const _streamRunIds = new Map();      // sessionId -> opaque identity of the current send's detached run
+  const _streamGenerations = new Map(); // sessionId -> generation of the current (latest) send
+  const _sendStates = new Map();        // sessionId -> { generation, abortCtrl } of the current send, installed synchronously at send commit so Stop never has to borrow an older send's controller
+  const _pendingRunStops = new Map();   // 'sessionId:generation' -> abortCtrl|null; Stop queued for that send while it awaits headers. Keyed per send so concurrent sends' cancellation intents never displace each other.
   let _streamSessionId = null; // Session ID for the currently active reader loop
   let _lastReaderActivity = 0; // Timestamp of last reader.read() success — used to detect frozen streams
   let _webLockRelease = null;  // Function to release the Web Lock held during streaming
+  let _staleStreamProbeInFlight = false;
+  const STALE_LOCAL_STREAM_MS = 15000;
 
   /** Check if an SSE reader is still actively connected for a session. */
   function hasActiveStream(sessionId) {
-    return _streamSessionId === sessionId || _backgroundStreams.has(sessionId);
+    return _activeStreams.has(sessionId) || _streamSessionId === sessionId ||
+           _resumingStreams.has(sessionId);
+  }
+
+  function _getForegroundStreamState() {
+    try {
+      const sid = sessionModule && sessionModule.getCurrentSessionId && sessionModule.getCurrentSessionId();
+      return sid ? (_activeStreams.get(sid) || null) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function _syncForegroundStreamGlobals() {
+    const active = _getForegroundStreamState();
+    isStreaming = !!active;
+    currentAbort = active ? active.abortCtrl : null;
+    currentHolder = active ? active.holder : null;
+    try {
+      const working = !!active || _activeStreams.size > 0 || _backgroundStreams.size > 0 || !!_sendInFlight;
+      document.body.classList.toggle('chat-agent-working', working);
+      const scrollBtn = document.getElementById('scroll-bottom-btn');
+      if (scrollBtn) scrollBtn.classList.toggle('agent-working', working);
+      window.dispatchEvent(new CustomEvent('odysseus-agent-working-change', { detail: { working } }));
+    } catch (_) {}
+    _setForegroundChatBusy(!!active || !!_sendInFlight);
+    return active;
+  }
+
+  function _touchStreamActivity(sessionId) {
+    const now = Date.now();
+    _lastReaderActivity = now;
+    const active = sessionId ? _activeStreams.get(sessionId) : null;
+    if (active) active.lastActivity = now;
+    return now;
+  }
+
+  /** Stable cost identity for one logical metrics segment within a run. */
+  function _metricsCostRecordId(runId, event) {
+    if (!runId) return '';
+    return `${runId}:${event && event.teacher ? 'teacher' : 'primary'}`;
+  }
+
+  /** POST the exact Stop for one observed run identity. */
+  function _postExactStop(sessionId, runId) {
+    fetch(`/api/chat/stop/${encodeURIComponent(sessionId)}`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'X-Odysseus-Run-Id': runId },
+    }).catch(() => {});
+  }
+
+  /** Stop only the exact detached run whose identity this browser observed. */
+  function _stopExactRun(sessionId, abortCtrl = null) {
+    if (!sessionId) return false;
+    const runId = _streamRunIds.get(sessionId);
+    if (!runId) {
+      // Queue against the CURRENT send's generation: its POST is the only
+      // identity channel that can name the run, so the Stop fires from that
+      // send's own header arrival even if a replacement starts meanwhile.
+      const generation = _streamGenerations.get(sessionId) || 0;
+      const pendingKey = sessionId + ':' + generation;
+      if (abortCtrl || !_pendingRunStops.has(pendingKey)) {
+        _pendingRunStops.set(pendingKey, abortCtrl);
+      }
+      return false;
+    }
+    _postExactStop(sessionId, runId);
+    return true;
+  }
+
+  function _rememberStreamRunId(sessionId, runId, generation) {
+    if (!sessionId || !runId) return;
+    // A superseded send must not record its run id as the session's current
+    // identity, but it must still flush its own queued Stop: this is the only
+    // channel that can cancel that run when the replacement dies before its
+    // own POST reaches the server.
+    if (_streamGenerations.get(sessionId) === generation) {
+      _streamRunIds.set(sessionId, runId);
+    }
+    const pendingKey = sessionId + ':' + generation;
+    if (!_pendingRunStops.has(pendingKey)) return;
+    const pendingAbort = _pendingRunStops.get(pendingKey);
+    _pendingRunStops.delete(pendingKey);
+    _postExactStop(sessionId, runId);
+    if (pendingAbort && !pendingAbort.signal.aborted) {
+      pendingAbort._reason = 'user-stop';
+      pendingAbort.abort();
+    }
   }
 
   // Sources box builder and toggleSources are now in chatRenderer.js
@@ -101,6 +1145,42 @@ import createResearchSynapse from './researchSynapse.js';
   var _buildImageBubble = chatRenderer.buildImageBubble;
   var getModelCost = chatRenderer.getModelCost;
   var getImageCost = chatRenderer.getImageCost;
+
+  function _appendGeneratedImageBubble(data, sessionId = null) {
+    const imageUrl = data?.image_url || data?.url || '';
+    if (!imageUrl) return false;
+    const targetSessionId = sessionId || data?.session_id || data?.sessionId || '';
+    if (
+      targetSessionId
+      && sessionModule?.getCurrentSessionId
+      && sessionModule.getCurrentSessionId() !== targetSessionId
+    ) {
+      return false;
+    }
+    const chatBox = document.getElementById('chat-history');
+    if (!chatBox) return false;
+    const imageKey = String(data.image_id || imageUrl);
+    const exists = Array.from(chatBox.querySelectorAll('.generated-image-wrap')).some(el => (
+      el.dataset.imageKey === imageKey ||
+      el.dataset.imageUrl === imageUrl ||
+      el.querySelector('img.generated-image')?.getAttribute('src') === imageUrl
+    ));
+    if (exists) return false;
+    const bubble = _buildImageBubble(
+      imageUrl,
+      data.image_prompt,
+      data.image_model,
+      data.image_size,
+      data.image_quality,
+      data.image_id
+    );
+    bubble.dataset.imageKey = imageKey;
+    bubble.dataset.imageUrl = imageUrl;
+    chatBox.appendChild(bubble);
+    uiModule.scrollHistory();
+    window.dispatchEvent(new CustomEvent('gallery-refresh'));
+    return true;
+  }
 
   // stripToolBlocks and roleTimestamp now in chatRenderer.js
   var stripToolBlocks = chatRenderer.stripToolBlocks;
@@ -153,9 +1233,29 @@ import createResearchSynapse from './researchSynapse.js';
    */
   export function init(apiBase) {
     API_BASE = apiBase;
-    initSlashCommands({ apiBase, isStreaming: () => isStreaming });
+    initSlashCommands({ apiBase, isStreaming: () => !!_getForegroundStreamState() });
     // Initialize email inbox
     emailInbox.init(documentModule);
+    // Wire the slash-command autocomplete popup on the chat composer. The
+    // dispatcher already handles the typed command — this just surfaces the
+    // registry as a discoverable menu when the user starts a message with /.
+    import('./slashAutocomplete.js').then(mod => {
+      const ta = document.getElementById('message');
+      if (ta && mod.initSlashAutocomplete) mod.initSlashAutocomplete(ta);
+    }).catch(() => {});
+
+    // ArrowUp on the composer recalls previous user prompts from this chat.
+    const _wireArrowUpRecall = (composer) =>
+      wireArrowUpRecall(composer, () => getUserMessagesFromChatHistory(), {
+        autoResize: uiModule?.autoResize,
+      });
+
+    const composer = document.getElementById('message');
+    if (!_wireArrowUpRecall(composer)) {
+      // Init can run before #message exists (templated UI); short retries only.
+      try { requestAnimationFrame(() => _wireArrowUpRecall(document.getElementById('message'))); } catch (_) {}
+      setTimeout(() => _wireArrowUpRecall(document.getElementById('message')), 250);
+    }
   }
 
   // addMessage, createMsgFooter, displayMetrics, hideWelcomeScreen, showWelcomeScreen
@@ -186,7 +1286,12 @@ import createResearchSynapse from './researchSynapse.js';
       // arrow out for the stop icon — otherwise the swap happens mid-flight
       // and the user sees nothing fly out.
       setTimeout(() => {
-        submitBtn.innerHTML = _stopSvg;
+        if (submitBtn.dataset.mode !== 'streaming') return;
+        const msgInput = uiModule.el('message');
+        const hasQueuedText = !!(msgInput && msgInput.value && msgInput.value.trim());
+        submitBtn.innerHTML = hasQueuedText && icons ? icons.send : _stopSvg;
+        submitBtn.dataset.phase = hasQueuedText ? 'queue' : 'processing';
+        submitBtn.title = hasQueuedText ? 'Queue message' : 'Stop generation';
         submitBtn.classList.remove('anim-launch');
         void submitBtn.offsetWidth;
         submitBtn.classList.add('anim-land');
@@ -196,12 +1301,14 @@ import createResearchSynapse from './researchSynapse.js';
       submitBtn.dataset.mode = 'streaming';
       submitBtn.dataset.phase = 'processing';
       isStreaming = true;
+      _setForegroundChatBusy(true);
       _startStallWatchdog();
     } else if (state === 'idle') {
       submitBtn.dataset.mode = '';
       delete submitBtn.dataset.phase;
       submitBtn.classList.remove('recording');
       isStreaming = false;
+      _setForegroundChatBusy(false);
       _stopStallWatchdog();
       // Defer to global updater which handles mic/newchat/send modes
       if (window._updateSendBtnIcon) {
@@ -221,6 +1328,326 @@ import createResearchSynapse from './researchSynapse.js';
 
   // API key pattern for the guard in handleChatSubmit
   const API_KEY_RE = /^(sk-[a-zA-Z0-9_\-]{20,}|gsk_[a-zA-Z0-9]{20,}|AIza[a-zA-Z0-9_\-]{30,}|xai-[a-zA-Z0-9]{20,})$/;
+  const PLAN_STORAGE_KEY = 'odysseus-active-plan';
+
+  const _queuedAgentRequests = [];
+  const QUEUED_AGENT_REQUESTS_KEY = 'odysseus-queued-agent-requests-v1';
+  let _queuedDrainTimer = null;
+  let _queuedPromoteTimer = null;
+  let _queuedRequestSeq = 0;
+  let _queuedBubbleHost = null;
+  let _pendingApprovedPlan = '';
+
+  function _queuedSessionId() {
+    try { return sessionModule?.getCurrentSessionId?.() || ''; } catch (_) { return ''; }
+  }
+
+  function _readPersistedQueuedRequests() {
+    try {
+      const value = JSON.parse(localStorage.getItem(QUEUED_AGENT_REQUESTS_KEY) || '{}');
+      return value && typeof value === 'object' ? value : {};
+    } catch (_) { return {}; }
+  }
+
+  function _persistQueuedRequests() {
+    const all = _readPersistedQueuedRequests();
+    const touched = new Set(_queuedAgentRequests.map(item => String(item.sessionId || '')).filter(Boolean));
+    const currentSid = _queuedSessionId();
+    if (currentSid) touched.add(currentSid);
+    for (const sid of touched) {
+      const rows = _queuedAgentRequests
+        .filter(item => item.sessionId === sid)
+        .map(({ id, message, createdAt }) => ({ id, message, createdAt }));
+      if (rows.length) all[sid] = rows;
+      else delete all[sid];
+    }
+    try { localStorage.setItem(QUEUED_AGENT_REQUESTS_KEY, JSON.stringify(all)); } catch (_) {}
+  }
+
+  function _restoreQueuedRequestsForCurrentSession() {
+    const sid = _queuedSessionId();
+    if (!sid || _queuedAgentRequests.some(item => item.sessionId === sid)) return;
+    const saved = _readPersistedQueuedRequests()[sid];
+    if (!Array.isArray(saved) || !saved.length) return;
+    for (const raw of saved) {
+      const message = String(raw?.message || '').trim();
+      if (!message) continue;
+      const item = {
+        id: String(raw?.id || `q${++_queuedRequestSeq}`),
+        message,
+        createdAt: Number(raw?.createdAt || Date.now()),
+        sessionId: sid,
+        el: null,
+      };
+      item.el = _createQueuedBubble(item);
+      _queuedAgentRequests.push(item);
+    }
+    _persistQueuedRequests();
+  }
+
+  function _extractPlanText(text) {
+    const raw = String(text || '').trim();
+    if (!raw) return '';
+    const stripped = raw
+      .replace(/<think[\s\S]*?<\/think>/gi, '')
+      .replace(/<thought[\s\S]*?<\/thought>/gi, '')
+      .trim();
+    const lines = stripped.split('\n');
+    const firstChecklist = lines.findIndex(line => /^\s*(?:[-*]|\d+\.)\s+\[[ x-]\]\s+/i.test(line));
+    if (firstChecklist >= 0) return lines.slice(firstChecklist).join('\n').trim();
+    const firstPlanHeading = lines.findIndex(line => /^\s{0,3}#{1,4}\s+.*plan/i.test(line) || /^\s*(?:plan|proposed plan)\s*:?$/i.test(line));
+    if (firstPlanHeading >= 0) return lines.slice(firstPlanHeading).join('\n').trim();
+    return stripped;
+  }
+
+  function _getStoredPlan() {
+    try { return localStorage.getItem(PLAN_STORAGE_KEY) || ''; } catch (_) { return ''; }
+  }
+
+	  function _setStoredPlan(plan) {
+	    const text = _extractPlanText(plan);
+	    if (!text) return;
+	    try { localStorage.setItem(PLAN_STORAGE_KEY, text); } catch (_) {}
+	  }
+
+	  function _clearStoredPlan() {
+	    try { localStorage.removeItem(PLAN_STORAGE_KEY); } catch (_) {}
+	  }
+
+	  function _attachPlanActions(target, plan) {
+	    if (!target || !String(plan || '').trim() || target.querySelector('.plan-inline-actions')) return;
+	    const actions = document.createElement('div');
+	    actions.className = 'plan-inline-actions';
+	    actions.innerHTML = `
+	      <button type="button" class="plan-inline-execute">
+	        <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true"><polygon points="7 4 20 12 7 20 7 4"></polygon></svg>
+	        Execute
+	      </button>
+	      <button type="button" class="plan-inline-clear">Clear</button>`;
+	    actions.querySelector('.plan-inline-execute')?.addEventListener('click', () => {
+	      const approved = _getStoredPlan() || _extractPlanText(plan);
+	      if (!approved.trim()) return;
+	      _pendingApprovedPlan = approved;
+	      if (window.__odysseusSetPlanMode) window.__odysseusSetPlanMode(false);
+	      if (window.__odysseusSetChatMode) window.__odysseusSetChatMode('agent');
+	      _setComposerAndSend('Execute the approved plan.');
+	    });
+	    actions.querySelector('.plan-inline-clear')?.addEventListener('click', () => {
+	      _clearStoredPlan();
+	      actions.remove();
+	    });
+	    (target.querySelector('.body') || target).appendChild(actions);
+	  }
+
+  function _openPlanReview() {
+    const plan = _getStoredPlan();
+    if (!plan) {
+      try { uiModule.showToast && uiModule.showToast('No active plan to review'); } catch (_) {}
+      return;
+    }
+    let panel = document.getElementById('plan-review-panel');
+    if (!panel) {
+      panel = document.createElement('section');
+      panel.id = 'plan-review-panel';
+      panel.className = 'plan-review-panel';
+      panel.setAttribute('role', 'dialog');
+      panel.setAttribute('aria-modal', 'false');
+      panel.setAttribute('aria-labelledby', 'plan-review-title');
+      panel.innerHTML = `
+        <div class="plan-review-panel-header">
+          <h3 id="plan-review-title">Plan review</h3>
+          <button type="button" class="plan-review-close" aria-label="Close plan review" title="Close">×</button>
+        </div>
+        <pre class="plan-review-content"></pre>
+        <div class="plan-review-actions">
+          <button type="button" class="plan-review-execute">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><polygon points="7 4 20 12 7 20 7 4"></polygon></svg>
+            Execute plan
+          </button>
+          <button type="button" class="plan-review-clear">Clear</button>
+        </div>`;
+      panel.querySelector('.plan-review-close')?.addEventListener('click', () => panel.remove());
+      panel.querySelector('.plan-review-clear')?.addEventListener('click', () => {
+        _clearStoredPlan();
+        panel.remove();
+      });
+      panel.querySelector('.plan-review-execute')?.addEventListener('click', () => {
+        const approved = _getStoredPlan();
+        if (!approved.trim()) return;
+        _pendingApprovedPlan = approved;
+        panel.remove();
+        if (window.__odysseusSetPlanMode) window.__odysseusSetPlanMode(false);
+        if (window.__odysseusSetChatMode) window.__odysseusSetChatMode('agent');
+        _setComposerAndSend('Execute the approved plan.');
+      });
+      document.body.appendChild(panel);
+    }
+    const content = panel.querySelector('.plan-review-content');
+    if (content) content.innerHTML = _escapeQueueText(plan);
+    panel.hidden = false;
+    panel.classList.add('is-open');
+  }
+
+  // chatRenderer handles the #plan link without importing this module back.
+  window.__odysseusOpenPlanReview = _openPlanReview;
+
+  function _escapeQueueText(s) {
+    return String(s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  function _ensureQueuedBubbleHost() {
+    const chatBox = document.getElementById('chat-history');
+    if (!chatBox) return null;
+    if (_queuedBubbleHost && _queuedBubbleHost.isConnected) return _queuedBubbleHost;
+    let host = document.getElementById('chat-queued-bubble-host');
+    if (!host) {
+      host = document.createElement('div');
+      host.id = 'chat-queued-bubble-host';
+      host.className = 'chat-queued-bubble-host';
+    }
+    chatBox.appendChild(host);
+    _queuedBubbleHost = host;
+    return host;
+  }
+
+  function _createQueuedBubble(item) {
+    const host = _ensureQueuedBubbleHost();
+    if (!host) return null;
+    const wrap = document.createElement('div');
+    wrap.className = 'msg msg-user msg-user-queued';
+    wrap.dataset.queueId = item.id;
+    wrap.title = 'Queued - click to send now and stop the current response';
+    wrap.innerHTML = `<div class="role">You <span class="queued-pill"><svg width="8" height="8" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><polygon points="6 4 20 12 6 20 6 4"></polygon></svg>Queued</span></div><div class="body">${_escapeQueueText(item.message)}</div>`;
+    wrap.addEventListener('click', (ev) => {
+      if (ev.target && ev.target.closest && ev.target.closest('button, a, textarea, input')) return;
+      _promoteQueuedRequest(item.id);
+    });
+    host.appendChild(wrap);
+    uiModule.scrollHistory();
+    return wrap;
+  }
+
+  function _removeQueuedRequest(id) {
+    const idx = _queuedAgentRequests.findIndex(item => item.id === id);
+    if (idx < 0) return null;
+    const [item] = _queuedAgentRequests.splice(idx, 1);
+    if (item && item.el && item.el.parentNode) item.el.remove();
+    _persistQueuedRequests();
+    return item;
+  }
+
+  function _consumeQueuedRequestStack() {
+    const sid = _queuedSessionId();
+    const items = _queuedAgentRequests.filter(item => item.sessionId === sid);
+    if (!items.length) return null;
+    for (let i = _queuedAgentRequests.length - 1; i >= 0; i -= 1) {
+      if (_queuedAgentRequests[i].sessionId === sid) _queuedAgentRequests.splice(i, 1);
+    }
+    items.forEach(item => {
+      if (item && item.el && item.el.parentNode) item.el.remove();
+    });
+    if (_queuedBubbleHost && !_queuedBubbleHost.children.length) {
+      _queuedBubbleHost.remove();
+      _queuedBubbleHost = null;
+    }
+    _persistQueuedRequests();
+    return {
+      id: items.map(item => item.id).join(','),
+      message: items.map(item => String(item.message || '').trim()).filter(Boolean).join('\n\n'),
+      createdAt: items[0]?.createdAt || Date.now(),
+    };
+  }
+
+  function _setComposerAndSend(message) {
+    const input = uiModule.el('message');
+    if (!input) return false;
+    input.value = message;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    if (uiModule.autoResize) uiModule.autoResize(input);
+    setTimeout(() => {
+      handleChatSubmit({ preventDefault() {} }).catch(err => {
+        console.error('queued send failed', err);
+        try { uiModule.showError && uiModule.showError('Queued send failed: ' + (err?.message || err)); } catch (_) {}
+      });
+    }, 0);
+    return true;
+  }
+
+  function _sendQueuedWhenIdle(item) {
+    if (!item) return;
+    const trySend = () => {
+      if (isStreaming || _sendInFlight) {
+        _queuedPromoteTimer = setTimeout(trySend, 220);
+        return;
+      }
+      _queuedPromoteTimer = null;
+      _setComposerAndSend(item.message);
+    };
+    if (_queuedPromoteTimer) clearTimeout(_queuedPromoteTimer);
+    _queuedPromoteTimer = setTimeout(trySend, 320);
+  }
+
+  function _promoteQueuedRequest(id) {
+    if (!_queuedAgentRequests.some(item => item.id === id)) return;
+    const item = _consumeQueuedRequestStack();
+    if (!item || !item.message) return;
+    if (!isStreaming && !_sendInFlight) {
+      _setComposerAndSend(item.message);
+      return;
+    }
+    try { uiModule.showToast && uiModule.showToast('Sending queued request now'); } catch (_) {}
+    const input = uiModule.el('message');
+    const submitBtn = document.querySelector('.send-btn');
+    if (input) {
+      input.value = '';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    if (submitBtn) submitBtn.click();
+    _sendQueuedWhenIdle(item);
+  }
+
+  function _queueAgentRequest(message) {
+    const msg = String(message || '').trim();
+    if (!msg) return false;
+    const item = { id: `q${++_queuedRequestSeq}`, message: msg, createdAt: Date.now(), sessionId: _queuedSessionId(), el: null };
+    item.el = _createQueuedBubble(item);
+    _queuedAgentRequests.push(item);
+    _persistQueuedRequests();
+    try { uiModule.showToast && uiModule.showToast(_queuedAgentRequests.length === 1 ? 'Queued for after this response' : `${_queuedAgentRequests.length} requests queued`); } catch (_) {}
+    return true;
+  }
+
+  export function queueStreamingComposerRequest() {
+    if (!isStreaming) return false;
+    const queuedInput = uiModule.el('message');
+    const queuedText = (queuedInput && queuedInput.value || '').trim();
+    if (!queuedText) return false;
+    if (fileHandlerModule.getPendingCount && fileHandlerModule.getPendingCount()) {
+      try { uiModule.showError && uiModule.showError('Finish the current response before queueing messages with attachments.'); } catch (_) {}
+      return true;
+    }
+    if (_queueAgentRequest(queuedText)) {
+      queuedInput.value = '';
+      queuedInput.dispatchEvent(new Event('input', { bubbles: true }));
+      if (uiModule.autoResize) uiModule.autoResize(queuedInput);
+      try { window._updateSendBtnIcon && window._updateSendBtnIcon(); } catch (_) {}
+    }
+    return true;
+  }
+
+  function _drainQueuedAgentRequests() {
+    _restoreQueuedRequestsForCurrentSession();
+    const sid = _queuedSessionId();
+    if (isStreaming || _sendInFlight || !_queuedAgentRequests.some(item => item.sessionId === sid)) return;
+    if (_queuedDrainTimer) return;
+    _queuedDrainTimer = setTimeout(() => {
+      _queuedDrainTimer = null;
+      if (isStreaming || _sendInFlight || !_queuedAgentRequests.some(item => item.sessionId === _queuedSessionId())) return;
+      const next = _consumeQueuedRequestStack();
+      if (!next || !next.message) return;
+      _setComposerAndSend(next.message);
+    }, 180);
+  }
 
 
   /**
@@ -245,8 +1672,18 @@ import createResearchSynapse from './researchSynapse.js';
       return;
     }
 
-    // If currently streaming, stop it
+    // If currently streaming, keyboard Enter can queue a non-empty composer.
+    // Clicking the stop icon should still stop normally, even if text exists.
     if (isStreaming) {
+      const queueRequestedAt = Number(window.__odysseusQueueStreamingSubmit || 0);
+      const shouldQueueStreamingSubmit = queueRequestedAt && Date.now() - queueRequestedAt < 1200;
+      window.__odysseusQueueStreamingSubmit = 0;
+      if (shouldQueueStreamingSubmit && queueStreamingComposerRequest()) {
+        return;
+      }
+      if (fileHandlerModule.isUploading && fileHandlerModule.isUploading()) {
+        fileHandlerModule.cancelUpload && fileHandlerModule.cancelUpload();
+      }
       // Cancel server-side research if in progress
       const _cancelSid = sessionModule.getCurrentSessionId();
       if (_cancelSid && _researchingStreamIds.has(_cancelSid)) {
@@ -295,23 +1732,28 @@ import createResearchSynapse from './researchSynapse.js';
         const messageInput = uiModule.el('message');
         if (messageInput) messageInput.disabled = false;
         currentAccumulated = '';
+        _drainQueuedAgentRequests();
         return;
       }
       // Render whatever was accumulated so far
       if (currentHolder && currentAccumulated) {
-        // Store accumulated in a closure variable before it gets cleared
-        const stoppedContent = currentAccumulated;
-        
-        // Store raw content in dataset for consistency with other messages
-        currentHolder.dataset.raw = stoppedContent;
-        
-        currentHolder.querySelector('.body').innerHTML = markdownModule.processWithThinking(
-          markdownModule.squashOutsideCode(stoppedContent)
-        );
+        const _activeStopStream = _getForegroundStreamState();
+        const _terminalView = _activeStopStream?.finalizeView?.() || null;
+        const _stoppedViewHolder = _terminalView?.holder || currentHolder;
+        const _viewPreparedByStream = !!_terminalView;
+        // The stream finalizer may close a synthetic reasoning tag. Capture the
+        // durable raw value only after that canonical terminal preparation.
+        const stoppedContent = _terminalView?.raw || currentAccumulated;
+        _stoppedViewHolder.dataset.raw = stoppedContent;
+        if (!_viewPreparedByStream) {
+          _stoppedViewHolder.querySelector('.body').innerHTML = markdownModule.processWithThinking(
+            markdownModule.squashOutsideCode(stoppedContent)
+          );
+        }
         
         // Highlight code blocks
         if (window.hljs) {
-          currentHolder.querySelectorAll('pre code').forEach((block) => {
+          _stoppedViewHolder.querySelectorAll('pre code').forEach((block) => {
             window.hljs.highlightElement(block);
           });
         }
@@ -323,33 +1765,32 @@ import createResearchSynapse from './researchSynapse.js';
         stoppedLabel.textContent = '[Message interrupted]';
         stoppedIndicator.appendChild(stoppedLabel);
         const continueBtn = document.createElement('button');
-        continueBtn.className = 'continue-btn';
-        continueBtn.title = 'Continue';
-        continueBtn.textContent = '\u25B8';
-        const _stoppedHolder = currentHolder; // capture before it gets cleared
+        continueBtn.className = 'continue-btn resume-btn';
+        continueBtn.title = 'Resume response';
+        continueBtn.innerHTML = '<span class="resume-btn-label">Resume</span><svg class="resume-btn-icon" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="m8 5 10 7-10 7z"></path></svg>';
+        const _stoppedHolder = _stoppedViewHolder; // capture before globals are cleared
         continueBtn.addEventListener('click', () => {
           stoppedIndicator.remove();
           _hideUserBubble = true;
           _pendingContinue = _stoppedHolder;
-          const cutoff = stoppedContent;
           const msgInput = uiModule.el('message');
           if (msgInput) {
-            msgInput.value = 'Your previous response was interrupted. It ended with:\n\n' + cutoff.slice(-500) + '\n\nDo NOT repeat what you already said. Continue exactly from where you were cut off.';
+            msgInput.value = 'Continue from where you left off.';
             const sb = document.querySelector('.send-btn');
             if (sb) sb.click();
           }
         });
         stoppedIndicator.appendChild(continueBtn);
-        currentHolder.querySelector('.body').appendChild(stoppedIndicator);
+        _stoppedViewHolder.querySelector('.body').appendChild(stoppedIndicator);
 
         // Tell server to mark this message as stopped
         const _sid = sessionModule.getCurrentSessionId();
         if (_sid) fetch(`${API_BASE}/api/session/${_sid}/mark-stopped`, { method: 'POST' }).catch(e => console.warn('mark-stopped failed:', e));
 
         // Add footer with copy/regen if not already present
-        if (!currentHolder.querySelector('.msg-footer')) {
-          currentHolder.dataset.raw = stoppedContent;
-          currentHolder.appendChild(createMsgFooter(currentHolder));
+        if (!_stoppedViewHolder.querySelector('.msg-footer')) {
+          _stoppedViewHolder.dataset.raw = stoppedContent;
+          _stoppedViewHolder.appendChild(createMsgFooter(_stoppedViewHolder));
         }
 
         uiModule.scrollHistory();
@@ -371,7 +1812,11 @@ import createResearchSynapse from './researchSynapse.js';
 
     // --- Send-path entry: block re-clicks between submit and stream start ---
     if (_sendInFlight) return;
+    const _sendPerf = _createChatSendPerf();
+    const _ttftStartedAt = performance.now();
     _sendInFlight = true;
+    const approvalForSend = _pendingToolApproval;
+    _setForegroundChatBusy(true);
     // Instant visual feedback so the user sees their click was accepted
     // even before the streaming button state kicks in below.
     const _earlyMessageInput = uiModule.el('message');
@@ -379,12 +1824,13 @@ import createResearchSynapse from './researchSynapse.js';
     if (submitBtn) submitBtn.classList.add('send-pending');
     const _releaseSendFlag = () => {
       _sendInFlight = false;
+      _syncForegroundStreamGlobals();
       if (_earlyMessageInput) _earlyMessageInput.disabled = false;
       if (submitBtn) submitBtn.classList.remove('send-pending');
     };
 
     // --- Setup mode: intercept next message (but let slash commands through) ---
-    {
+    if (!approvalForSend) {
       const el = uiModule.el;
       const rawMsg = (el('message').value || '').trim();
       const currentSetupMode = slashCommands.getSetupMode();
@@ -408,13 +1854,13 @@ import createResearchSynapse from './researchSynapse.js';
     }
 
     const el = uiModule.el;
-    const msg = el('message').value;
+    const msg = approvalForSend ? '' : el('message').value;
     // Allow empty text when a regen carries over the original message's
     // attachment ids — a photo-only message still has something to send.
-    if (!msg.trim() && !fileHandlerModule.getPendingCount() && !(_pendingRegenAttachments && _pendingRegenAttachments.length)) { _releaseSendFlag(); return; }
+    if (!msg.trim() && !approvalForSend && !fileHandlerModule.getPendingCount() && !(_pendingRegenAttachments && _pendingRegenAttachments.length)) { _releaseSendFlag(); return; }
 
     // --- Slash commands: execute directly without AI (no session needed) ---
-    if (isCommand(msg.trim())) {
+    if (!approvalForSend && isCommand(msg.trim())) {
       const handled = await handleSlashCommand(msg.trim());
       if (handled) {
         el('message').value = '';
@@ -425,9 +1871,51 @@ import createResearchSynapse from './researchSynapse.js';
       }
     }
 
+    const incognitoChkForSend = el('incognito-toggle');
+    const isIncognitoForSend = !!(incognitoChkForSend && incognitoChkForSend.checked);
+
+    if (!isIncognitoForSend) {
+      await _adoptOpenedSessionBeforeAutoCreate();
+    }
+
+    const selectedRouteForSend = (() => {
+      try {
+        const lastPicked = window.__odysseusLastPickedRoute || null;
+        if (lastPicked && lastPicked.model
+          && (lastPicked.session_id || null) === (sessionModule.getCurrentSessionId?.() || null)
+          && Date.now() - (lastPicked.picked_at || 0) < 10 * 60 * 1000) {
+          return {
+            model: lastPicked.model || '',
+            endpoint_url: lastPicked.endpoint_url || '',
+            endpoint_id: lastPicked.endpoint_id || '',
+            source: 'last-picked',
+          };
+        }
+        const pending = sessionModule.getPendingChat && sessionModule.getPendingChat();
+        if (pending && pending.modelId) {
+          return {
+            model: pending.modelId || '',
+            endpoint_url: pending.url || '',
+            endpoint_id: pending.endpointId || '',
+            source: pending.source || '',
+          };
+        }
+        return {
+          model: sessionModule.getCurrentModel ? (sessionModule.getCurrentModel() || '') : '',
+          endpoint_url: sessionModule.getCurrentEndpointUrl ? (sessionModule.getCurrentEndpointUrl() || '') : '',
+          endpoint_id: '',
+          source: '',
+        };
+      } catch (_) {
+        return { model: '', endpoint_url: '', endpoint_id: '', source: '' };
+      }
+    })();
+
     // Materialize pending session (deferred from model click) on first message
     if (sessionModule.hasPendingChat && sessionModule.hasPendingChat()) {
+      _sendPerf.mark('pending_session_begin');
       const ok = await sessionModule.materializePendingSession();
+      _sendPerf.mark('pending_session_done');
       if (!ok || !sessionModule.getCurrentSessionId()) { _releaseSendFlag(); return; }
     }
 
@@ -435,36 +1923,65 @@ import createResearchSynapse from './researchSynapse.js';
       // Auto-create a session using default chat config. Always fetch fresh
       // so that a recent Settings change takes effect without a page reload.
       try {
-        let dc = null;
+        const pending = sessionModule.getPendingChat && sessionModule.getPendingChat();
+        if (pending && pending.url && pending.modelId) {
+          const ok = await sessionModule.materializePendingSession();
+          if (!ok || !sessionModule.getCurrentSessionId()) { _releaseSendFlag(); return; }
+        }
+      } catch (_) {}
+    }
+
+    if (!sessionModule.getCurrentSessionId()) {
+      // Auto-create a session using default chat config. Always fetch fresh
+      // so that a recent Settings change takes effect without a page reload.
+      try {
+        let dc = (typeof window !== 'undefined' && window.__odysseusDefaultChat) || null;
+        if (!dc || !dc.endpoint_url || !dc.model) {
+          try {
+            dc = JSON.parse(localStorage.getItem('odysseus-default-chat-cache') || 'null');
+          } catch (_) {}
+        }
         try {
-          const dcRes = await fetch('/api/default-chat');
-          dc = await dcRes.json();
-          if (dc && dc.endpoint_url && dc.model) {
-            try { window.__odysseusDefaultChat = dc; } catch (_) {}
+          if (!dc || !dc.endpoint_url || !dc.model) {
+            _sendPerf.mark('default_chat_fetch_begin');
+            const dcRes = await fetch('/api/default-chat');
+            dc = await dcRes.json();
+            _sendPerf.mark('default_chat_fetch_done');
+            if (dc && dc.endpoint_url && dc.model) {
+              try {
+                window.__odysseusDefaultChat = dc;
+                localStorage.setItem('odysseus-default-chat-cache', JSON.stringify(dc));
+              } catch (_) {}
+            }
           }
         } catch (_) {
           dc = (typeof window !== 'undefined' && window.__odysseusDefaultChat) || null;
         }
         if (dc.endpoint_url && dc.model) {
-          await sessionModule.createDirectChat(dc.endpoint_url, dc.model, dc.endpoint_id);
+          _sendPerf.mark('direct_chat_create_begin');
+          await sessionModule.createDirectChat(dc.endpoint_url, dc.model, dc.endpoint_id, { source: 'default' });
+          _sendPerf.mark('direct_chat_create_done');
           const ok = await sessionModule.materializePendingSession();
+          _sendPerf.mark('direct_chat_materialize_done');
           if (!ok || !sessionModule.getCurrentSessionId()) { _releaseSendFlag(); return; }
         } else {
+          el('message').value = '';
+          if (uiModule.autoResize) uiModule.autoResize(el('message'));
           addMessage('assistant',
             'No chat session active. You can:\n\n' +
-            '- Pick a model from the sidebar to start a chat\n' +
-            '- Run `/setup` to configure an endpoint\n' +
-            '- Run `/new` to create a session manually\n' +
+            '- Open the model picker in the chat box and pick a model\n' +
+            '- Use the `+` button in the model picker to add a model endpoint\n' +
             '- Use `/help` to see all available commands');
           _releaseSendFlag();
           return;
         }
       } catch (e) {
+        el('message').value = '';
+        if (uiModule.autoResize) uiModule.autoResize(el('message'));
         addMessage('assistant',
           'No chat session active. You can:\n\n' +
-          '- Pick a model from the sidebar to start a chat\n' +
-          '- Run `/setup` to configure an endpoint\n' +
-          '- Run `/new` to create a session manually\n' +
+          '- Open the model picker in the chat box and pick a model\n' +
+          '- Use the `+` button in the model picker to add a model endpoint\n' +
           '- Use `/help` to see all available commands');
         _releaseSendFlag();
         return;
@@ -472,7 +1989,7 @@ import createResearchSynapse from './researchSynapse.js';
     }
 
     // --- API key guard: warn if message looks like an API key ---
-    if (API_KEY_RE.test(msg.trim())) {
+    if (!approvalForSend && API_KEY_RE.test(msg.trim())) {
       if (!await window.styledConfirm('This looks like an API key. Sending it to the AI could expose it.\n\nDid you mean to use /setup instead?', { confirmText: 'Send anyway', danger: true })) {
         _releaseSendFlag();
         return;
@@ -489,13 +2006,42 @@ import createResearchSynapse from './researchSynapse.js';
     if (messageInput) messageInput.disabled = false;
     updateSubmitButton('streaming', submitBtn);
     if (submitBtn) submitBtn.classList.remove('send-pending');
+    // Per-send generation, reserved SYNCHRONOUSLY before the send gate clears
+    // and before the first await: from this instant the superseded send may
+    // not clean session state, register, or POST (each checked at its own
+    // await boundaries). Session-keyed state (run id, queued Stop, cleanup
+    // rights) belongs to the latest generation only. A queued Stop from the
+    // superseded send is deliberately left in place, tagged with ITS
+    // generation: that send's still-alive POST is the only identity channel
+    // able to name its run, so the Stop fires from its own header arrival
+    // (see _rememberStreamRunId) even if this replacement dies before fetch.
+    const streamSessionId = sessionModule.getCurrentSessionId();
+    const streamGeneration = (_streamGenerations.get(streamSessionId) || 0) + 1;
+    _streamGenerations.set(streamSessionId, streamGeneration);
+    const _sendState = { generation: streamGeneration, abortCtrl: null };
+    _sendStates.set(streamSessionId, _sendState);
+    // The previous send's run identity dies with its ownership: a Stop after
+    // this instant must queue for THIS send, not fire against the old run.
+    // (The old send's own queued Stop still works — its flush carries the run
+    // id from its header, and its stale generation cannot repopulate this map.)
+    _streamRunIds.delete(streamSessionId);
+    _streamSessionId = streamSessionId;
     _sendInFlight = false;
 
-    // Capture session ID for background stream detection
-    const streamSessionId = sessionModule.getCurrentSessionId();
-    _streamSessionId = streamSessionId;
+    try {
+      const pendingSwitch = window.__odysseusModelSwitchPromise;
+      if (pendingSwitch && typeof pendingSwitch.then === 'function') {
+        await pendingSwitch;
+      }
+    } catch (_) {}
+    // Superseded while awaiting the model switch: the replacement owns the
+    // session now, and everything below (state resets, registration, POST)
+    // is its business alone.
+    if (_streamGenerations.get(streamSessionId) !== streamGeneration) return;
+
+    _terminalSavedStreams.delete(streamSessionId);
     const streamQuery = msg;
-    _lastReaderActivity = Date.now();
+    _touchStreamActivity(streamSessionId);
 
     // Acquire Web Lock to hint browser not to discard this tab while streaming
     if (navigator.locks) {
@@ -507,13 +2053,74 @@ import createResearchSynapse from './researchSynapse.js';
 
     // Declare accumulated outside try block so it's accessible in catch
     let accumulated = '';
+    // Are we currently inside an unclosed <think> block? Toggled per think/answer
+    // cycle so a multi-round agent response (one reasoning phase PER round) wraps each
+    // round's reasoning in its own <think>…</think> instead of leaking rounds 2+ as text.
+    let _thinkOpen = false;
     let holder = null;
     let finalMeta = null;
-    let finalModelName = null;
+    let _canonicalTerminalSaved = false;
     let spinner = null;
     let timedOut = false;
     let processingProbeTimer = null;
     let processingProbeAbort = null;
+    let _renderStream = () => {};
+    let _finalizeRoundRender = () => {};
+    let _settleTurnRendering = () => {};
+    let _finalizeInterruptedView = () => null;
+    let _cancelThinkingTimer = () => {};
+    let _removeThinkingSpinner = () => {};
+    let _flushLiveThinking = () => '';
+    let _cancelLiveThinkingWork = () => {};
+    // Declared out here, not inside the try: in an ES module a function declared
+    // in the try block is scoped to that block, so `catch` (a sibling scope)
+    // cannot see it. Calling one from catch throws ReferenceError and kills the
+    // rest of the error path — the stream never finalizes and the partial
+    // message is lost. Assigned below, alongside the two helpers above.
+    let _closeOpenThinkingMarkup = () => {};
+    let _endThinkingOnTerminalPath = () => {};
+    let timeoutId = null;
+    let responseTimeoutCleared = false;
+    let clearResponseTimeout = () => {};
+    let firstTokenWaitTimers = [];
+    let _ttftDisplayTimer = null;
+    let _clientTtftSeconds = null;
+    const _ttftLabel = (elapsed) => {
+      if (elapsed >= 120) return `Still waiting for first token · ${elapsed.toFixed(1)}s`;
+      if (elapsed >= 60) return `Model pre-filling context · ${elapsed.toFixed(1)}s`;
+      if (elapsed >= 20) return `Waiting for first token · ${elapsed.toFixed(1)}s`;
+      return `Processing request · ${elapsed.toFixed(1)}s`;
+    };
+    const _startTtftDisplay = () => {
+      if (_ttftDisplayTimer) clearInterval(_ttftDisplayTimer);
+      const update = () => {
+        if (!spinner || !spinner.element || _clientTtftSeconds != null) return;
+        spinner.updateMessage(_ttftLabel((performance.now() - _ttftStartedAt) / 1000));
+      };
+      update();
+      _ttftDisplayTimer = setInterval(update, 100);
+    };
+    const _stopTtftDisplay = () => {
+      if (_ttftDisplayTimer) clearInterval(_ttftDisplayTimer);
+      _ttftDisplayTimer = null;
+    };
+    const clearFirstTokenWaitTimers = () => {
+      firstTokenWaitTimers.forEach(t => { try { clearTimeout(t); } catch (_) {} });
+      firstTokenWaitTimers = [];
+    };
+    const scheduleFirstTokenWaitMessages = () => {
+      clearFirstTokenWaitTimers();
+      const steps = [
+        [20000, 'Still waiting for first token'],
+        [60000, 'Large local model is pre-filling context'],
+        [120000, 'Still working - no tokens yet from the model'],
+      ];
+      firstTokenWaitTimers = steps.map(([ms, text]) => setTimeout(() => {
+        if (!accumulated && spinner && spinner.element && !(abortCtrl && abortCtrl.signal.aborted)) {
+          spinner.updateMessage(text);
+        }
+      }, ms));
+    };
     const clearProcessingProbe = () => {
       if (processingProbeTimer) {
         clearTimeout(processingProbeTimer);
@@ -529,6 +2136,8 @@ import createResearchSynapse from './researchSynapse.js';
     currentAccumulated = '';
     currentHolder = null;
     
+    let abortCtrl = null;
+    let streamingTTS = false;
     try {
       // Re-enable auto-scroll when user sends a message
       uiModule.setAutoScroll(true);
@@ -537,7 +2146,9 @@ import createResearchSynapse from './researchSynapse.js';
       if (sessionModule.clearStreamComplete) sessionModule.clearStreamComplete(sessionModule.getCurrentSessionId());
 
       // Check for document selection context before consuming display override
-      const docSel = documentModule && documentModule.getSelectionContext();
+      const docSel = !approvalForSend && documentModule
+        ? documentModule.getSelectionContext()
+        : null;
       if (docSel) {
         const sels = Array.isArray(docSel) ? docSel : [docSel];
         const lineRefs = sels.map(s =>
@@ -548,7 +2159,7 @@ import createResearchSynapse from './researchSynapse.js';
 
       const userDisplay = _displayOverride || msg;
       _displayOverride = null;
-      const skipBubble = _hideUserBubble;
+      const skipBubble = _hideUserBubble || !!approvalForSend;
       _hideUserBubble = false;
       // Auto-recovery counter: carries across a turn's auto-continues, but resets
       // when the user genuinely sends a new message (so each task gets a fresh cap).
@@ -557,7 +2168,9 @@ import createResearchSynapse from './researchSynapse.js';
       // stuck flag can't silently eat the next turn's recovery budget.
       if (!skipBubble) { _autoNudges = 0; _autoContinuePending = false; }
       else if (_autoContinuePending) { _autoContinuePending = false; }
-      const _pendingAttachInfo = fileHandlerModule.getPendingCount() ? fileHandlerModule.getPendingInfo() : null;
+      const _pendingAttachInfo = !approvalForSend && fileHandlerModule.getPendingCount()
+        ? fileHandlerModule.getPendingInfo()
+        : null;
       // Pre-read importable file contents before upload clears pending files
       const IMPORTABLE_EXT = /\.(txt|py|js|ts|html|htm|css|md|json|csv|yml|yaml|sh|sql|rs|go|java|c|cpp|h|rb|php|xml|jsx|tsx|log|toml|ini|conf|env|vue|svelte|scss|sass|less)$/i;
       const _importableFiles = [];
@@ -572,9 +2185,14 @@ import createResearchSynapse from './researchSynapse.js';
       }
       let _userMsgEl = null;
       if (!skipBubble) {
-        _userMsgEl = addMessage('user', userDisplay, null, _pendingAttachInfo ? { attachments: _pendingAttachInfo } : null);
+        const _toggleStateForBubble = Storage.loadToggleState();
+        const _bubbleMode = (_toggleStateForBubble.mode || 'chat') === 'agent' ? 'agent' : 'chat';
+        const _bubbleMeta = _pendingAttachInfo ? { attachments: _pendingAttachInfo } : {};
+        _bubbleMeta.interaction_mode = _bubbleMode;
+        _userMsgEl = addMessage('user', userDisplay, null, _bubbleMeta);
       }
-      messageInput.value = '';
+      _sendPerf.mark('user_bubble_visible');
+      messageInput.value = approvalForSend ? (approvalForSend.draft || '') : '';
       messageInput.style.height = '';
       messageInput.dispatchEvent(new Event('input'));
       // Mobile: dismiss the on-screen keyboard after sending. iOS in
@@ -608,10 +2226,24 @@ import createResearchSynapse from './researchSynapse.js';
       }
 
       let ids = [];
-      try {
-        ids = await fileHandlerModule.uploadPending();
-      } catch(e) {
-        console.error('upload failed', e);
+      if (!approvalForSend) {
+        try {
+          _sendPerf.mark('upload_begin');
+          ids = await fileHandlerModule.uploadPending({ sessionId: sessionModule.getCurrentSessionId() });
+          _sendPerf.mark('upload_done');
+        } catch(e) {
+          console.error('upload failed', e);
+          _sendPerf.mark('upload_failed');
+        }
+      }
+      if (_pendingAttachInfo && !ids.length && !(_pendingRegenAttachments && _pendingRegenAttachments.length)) {
+        if (_userMsgEl && _userMsgEl.parentNode) _userMsgEl.remove();
+        if (fileHandlerModule.wasLastUploadCancelled && !fileHandlerModule.wasLastUploadCancelled()) {
+          uiModule.showError && uiModule.showError('Upload failed. Attachment kept so you can retry.');
+        }
+        updateSubmitButton('idle', submitBtn);
+        _releaseSendFlag();
+        return;
       }
 
       // Carry over the original message's file-ids on a regenerate so the new
@@ -619,10 +2251,10 @@ import createResearchSynapse from './researchSynapse.js';
       // edited OCR text via the server-side .vision cache). Always CONSUME the
       // slot — even when empty / errored — so the regen ids can't bleed into
       // an unrelated next message if uploadPending() above had thrown.
-      if (_pendingRegenAttachments && _pendingRegenAttachments.length) {
+      if (!approvalForSend && _pendingRegenAttachments && _pendingRegenAttachments.length) {
         ids = ids.concat(_pendingRegenAttachments);
       }
-      _pendingRegenAttachments = null;
+      if (!approvalForSend) _pendingRegenAttachments = null;
 
       // The optimistic user bubble was rendered before the upload assigned ids,
       // so image previews couldn't show (the renderer needs att.id). Now that
@@ -683,17 +2315,47 @@ import createResearchSynapse from './researchSynapse.js';
         const dismissBtn = document.createElement('button');
         dismissBtn.textContent = '\u00d7';
         dismissBtn.className = 'import-prompt-dismiss';
+        dismissBtn.setAttribute('aria-label', 'Dismiss');
+        dismissBtn.title = 'Dismiss';
         dismissBtn.addEventListener('click', () => banner.remove());
         banner.appendChild(dismissBtn);
-        const chatBar = document.getElementById('chat-bar');
+        const chatBar = document.querySelector('.chat-input-bar');
         if (chatBar) chatBar.parentNode.insertBefore(banner, chatBar);
         // Auto-dismiss after 15 seconds
         setTimeout(() => { if (banner.parentNode) banner.remove(); }, 15000);
       }
 
       // Auto-save document editor content before sending so the AI sees latest text
-      if (documentModule && documentModule.isPanelOpen() && documentModule.getCurrentDocId()) {
-        try { await documentModule.saveDocument(); } catch(e) { console.warn('doc auto-save failed', e); }
+      const activeEmailComposerCtx = documentModule && typeof documentModule.getActiveEmailComposerContext === 'function'
+        ? documentModule.getActiveEmailComposerContext()
+        : null;
+      let activeDocIdForSend = documentModule && typeof documentModule.getChatDocumentId === 'function'
+        ? documentModule.getChatDocumentId()
+        : null;
+      if (activeEmailComposerCtx?.docId) {
+        activeDocIdForSend = activeEmailComposerCtx.docId;
+      }
+      const shouldSaveActiveDoc = !approvalForSend || (
+        approvalForSend.document_id
+        && approvalForSend.document_id === activeDocIdForSend
+      );
+      let documentSaved = true;
+      if (documentModule && activeDocIdForSend && shouldSaveActiveDoc) {
+        try {
+          _sendPerf.mark('doc_save_begin');
+          documentSaved = await documentModule.saveDocument({
+            silent: false,
+          });
+          _sendPerf.mark('doc_save_done');
+        } catch(e) {
+          documentSaved = false;
+          console.warn('doc auto-save failed', e);
+          _sendPerf.mark('doc_save_failed');
+        }
+      }
+      if (approvalForSend && documentSaved === false) {
+        _releaseSendFlag();
+        return;
       }
 
       // Inject document selection context if present
@@ -720,77 +2382,205 @@ import createResearchSynapse from './researchSynapse.js';
       if (_inject.suffix) _finalMsgWithInject = _finalMsgWithInject + ' ' + _inject.suffix;
 
       const fd = new FormData();
-      fd.append('message', _finalMsgWithInject);
+      fd.append('message', approvalForSend ? '' : _finalMsgWithInject);
       fd.append('session', streamSessionId);
-      if (ids.length) fd.append('attachments', JSON.stringify(ids));
-      // Auto-save & send active doc ID so the backend sees latest content
-      if (documentModule && documentModule.isPanelOpen() && documentModule.getCurrentDocId()) {
-        try { await documentModule.saveDocument({ silent: true }); } catch (_e) { /* best-effort */ }
-        fd.append('active_doc_id', documentModule.getCurrentDocId());
-      }
-      // Web toggle: pre-search in Chat mode, tool permission in Agent mode
-      const toggleState = Storage.loadToggleState();
-      let isAgentMode = (toggleState.mode || 'chat') === 'agent';
-      // Auto-escalate to agent mode when a document is open — the user expects
-      // the AI to see the document and have tools to edit it
-      if (!isAgentMode && documentModule && documentModule.isPanelOpen() && documentModule.getCurrentDocId()) {
-        isAgentMode = true;
-      }
-      fd.append('mode', isAgentMode ? 'agent' : 'chat');
-      if (el('web-toggle').checked) {
-        if (isAgentMode) {
-          fd.append('allow_web_search', 'true');
-        } else {
-          fd.append('use_web', 'true');
+      if (approvalForSend) {
+        fd.append('tool_approval_id', approvalForSend.approval_id);
+        fd.append('tool_approval_decision', approvalForSend.decision);
+        if (_pendingToolApproval && _pendingToolApproval.approval_id === approvalForSend.approval_id) {
+          _pendingToolApproval = null;
         }
       }
-      if (el('research-toggle').checked) {
-        fd.append('use_research', 'true');
-        // Research always runs in chat mode — override agent if set
-        fd.set('mode', 'chat');
+      if (selectedRouteForSend.model) fd.append('selected_model', selectedRouteForSend.model);
+      if (selectedRouteForSend.endpoint_url) fd.append('selected_endpoint_url', selectedRouteForSend.endpoint_url);
+      if (selectedRouteForSend.endpoint_id) fd.append('selected_endpoint_id', selectedRouteForSend.endpoint_id);
+      if (ids.length) fd.append('attachments', JSON.stringify(ids));
+      // Auto-save & send active doc ID so the backend sees latest content
+      if (documentModule && activeDocIdForSend && shouldSaveActiveDoc) {
+        if (!approvalForSend) {
+          try {
+            _sendPerf.mark('doc_silent_save_begin');
+            await documentModule.saveDocument({ silent: true });
+            _sendPerf.mark('doc_silent_save_done');
+          } catch (_e) {
+            _sendPerf.mark('doc_silent_save_failed');
+          }
+        }
+        fd.append('active_doc_id', activeDocIdForSend);
       }
-      if (el('bash-toggle').checked) {
-        fd.append('allow_bash', 'true');
+      // Active email context — when an email reader is open, pass its
+      // uid/folder/account so "reply", "summarize", "what does this say"
+      // resolve to the email the user is actually looking at instead of
+      // making the agent invent a new markdown draft with fake headers.
+      try {
+        const getEmailCtx = window.__odysseusGetActiveEmailContext;
+        const emCtx = typeof getEmailCtx === 'function' ? getEmailCtx() : null;
+        if (activeEmailComposerCtx && activeEmailComposerCtx.sourceUid) {
+          fd.append('active_email_uid', String(activeEmailComposerCtx.sourceUid));
+          fd.append('active_email_folder', String(activeEmailComposerCtx.sourceFolder || 'INBOX'));
+        } else if (emCtx && emCtx.uid) {
+          fd.append('active_email_uid', String(emCtx.uid));
+          fd.append('active_email_folder', String(emCtx.folder || 'INBOX'));
+          if (emCtx.account) fd.append('active_email_account', String(emCtx.account));
+        }
+      } catch (_e) { /* best-effort */ }
+      // Web toggle: pre-search in Chat mode only. Agent mode should not
+      // opportunistically hit SearXNG just because the chat search toggle is
+      // on; explicit web/current-info requests are handled by the backend
+	      // intent gate.
+	      const toggleState = Storage.loadToggleState();
+	      const isPlanMode = !!toggleState.plan_mode && !(el('research-toggle') && el('research-toggle').checked);
+	      let isAgentMode = (toggleState.mode || 'chat') === 'agent';
+	      const isIncognito = isIncognitoForSend;
+	      const _messageText = String(msg || '');
+	      const _explanatoryQuestion = /^\s*(?:how\s+(?:do|can)\s+i|can\s+you\s+explain|what\s+about|tell\s+me\s+how|show\s+me\s+how)\b/i.test(_messageText);
+	      const _directCodeFileTarget = /\b[A-Za-z0-9_./-]+\.(?:py|pyi|js|jsx|ts|tsx|mjs|cjs|vue|svelte|html|css|scss|sass|less|sql|rs|go|java|kt|kts|swift|rb|php|sh|bash|zsh|fish|c|h|cc|cpp|cxx|hpp|json|jsonl|yaml|yml|toml|xml|graphql|proto)\b/i.test(_messageText);
+	      const _directCodingIntent = !_explanatoryQuestion && (/\b(?:write|create|add|edit|modify|code|program|implement|build)\b[\s\S]{0,160}\b(?:code|function|class|script|module|component|snippet|program|app|feature|file|command[- ]line|repo(?:sitory)?|codebase|project|website|web\s+app|python|javascript|typescript|html|css|sql|rust|java|go)\b/i.test(_messageText) || (/\b(?:write|create|add|edit|modify|code|program|implement|build)\b/i.test(_messageText) && _directCodeFileTarget));
+	      // Shell access is request authority. Generic words such as "source",
+	      // "system", "app", "change", or "review" occur in ordinary web and
+	      // personal-tool questions. Workspace intent can select Agent mode,
+	      // but shell authority still comes from the visible Bash toggle.
+	      const _explicitWorkspaceTarget = _directCodeFileTarget || /\b(?:bash|shell|terminal|tmux|pytest|git|docker|container|codebase|repo(?:sitory)?|stacktrace|traceback)\b/i.test(_messageText);
+	      const workspaceAgentIntent = !isIncognito && !_explanatoryQuestion && (_directCodingIntent || _explicitWorkspaceTarget);
+	      if (isPlanMode || _pendingApprovedPlan) {
+	        isAgentMode = true;
+	      }
+	      if (!isAgentMode && workspaceAgentIntent) {
+	        isAgentMode = true;
+	      }
+	      // Auto-escalate to agent mode when a document is open — the user expects
+	      // the AI to see the document and have tools to edit it
+	      if (!isIncognito && !isAgentMode && documentModule && activeDocIdForSend) {
+	        isAgentMode = true;
+	      }
+	      fd.append('mode', isAgentMode ? 'agent' : 'chat');
+	      fd.append('plan_mode', isPlanMode ? 'true' : 'false');
+	      if (!isPlanMode && _pendingApprovedPlan) {
+	        fd.append('approved_plan', _pendingApprovedPlan.slice(0, 8192));
+	        _pendingApprovedPlan = '';
+	      }
+	      if (el('web-toggle').checked) {
+	        if (!isAgentMode) {
+	          fd.append('use_web', 'true');
+        }
       }
+      if (isAgentMode) {
+        fd.append('allow_web_search', el('web-toggle').checked ? 'true' : 'false');
+      }
+	      if (!approvalForSend && el('research-toggle').checked) {
+	        fd.append('use_research', 'true');
+	        // Research always runs in chat mode — override agent if set
+	        fd.set('mode', 'chat');
+	        fd.set('plan_mode', 'false');
+	      }
+      fd.append('allow_bash', el('bash-toggle').checked ? 'true' : 'false');
       const ragChk = el('rag-toggle');
       if (ragChk && !ragChk.checked) {
         fd.append('use_rag', 'false');
       }
-      const incognitoChk = el('incognito-toggle');
-      if (incognitoChk && incognitoChk.checked) {
+      if (isIncognito) {
         fd.append('incognito', 'true');
+      }
+      const _ws = (Storage.KEYS && Storage.get(Storage.KEYS.WORKSPACE, '')) || '';
+      if (_ws) {
+        fd.append('workspace', _ws);
       }
       if (presetsModule.getSelectedPreset()) {
         fd.append('preset_id', presetsModule.getSelectedPreset());
       }
 
 
-      const abortCtrl = new AbortController();
+      // Superseded during preflight (uploads, document saves): a newer send
+      // owns the session. Bailing here — before registration and before the
+      // POST — keeps this stale send from overwriting the replacement's
+      // stream entry or reaching the server last, where agent_runs.start
+      // would cancel the newer run in favor of this old one.
+      if (_streamGenerations.get(streamSessionId) !== streamGeneration) {
+        // The optimistic user bubble is already in the DOM looking sent, but
+        // this message never reaches the server. Say so instead of leaving a
+        // ghost that vanishes on refresh.
+        if (_userMsgEl && _userMsgEl.parentNode) {
+          const _notSentNote = document.createElement('div');
+          _notSentNote.style.cssText = 'color: var(--color-error); font-style: italic; font-size: 0.85em; padding: 2px 0;';
+          _notSentNote.textContent = '[Not sent — superseded by a newer message]';
+          _userMsgEl.appendChild(_notSentNote);
+        }
+        return;
+      }
+      abortCtrl = new AbortController();
       abortCtrl._reason = '';
+      _sendState.abortCtrl = abortCtrl;
       currentAbort = abortCtrl;
 
-      const _tState = Storage.loadToggleState();
-      const _isAgent = (_tState.mode || 'chat') === 'agent';
+	      const _tState = Storage.loadToggleState();
+	      const _isAgent = (_tState.mode || 'chat') === 'agent' || !!_tState.plan_mode || workspaceAgentIntent;
 
       // Timeout: 6 min for research and agent mode, 3 min otherwise
       const timeoutMs = el('research-toggle').checked || _isAgent ? RESEARCH_TIMEOUT_MS : DEFAULT_TIMEOUT_MS;
-      const timeoutId = setTimeout(() => {
+      timeoutId = setTimeout(() => {
         if (!abortCtrl.signal.aborted) {
           timedOut = true;
           abortCtrl._reason = 'timeout';
-          abortCtrl.abort();
+          if (_streamGenerations.get(streamSessionId) !== streamGeneration) {
+            // Superseded send: the session's run id and Stop queue belong to
+            // the replacement now. Just kill this hung POST.
+            abortCtrl.abort();
+            return;
+          }
+          let abortNow = true;
+          try {
+            abortNow = _streamRunIds.has(streamSessionId)
+              ? _stopExactRun(streamSessionId)
+              : _stopExactRun(streamSessionId, abortCtrl);
+          } catch (_) {}
+          if (abortNow) {
+            abortCtrl.abort();
+          } else {
+            // The Stop is queued on the run-id header, but a request this
+            // stalled may never send one. Hard-abort after a short grace so
+            // the timeout still guarantees cancellation.
+            setTimeout(() => {
+              if (!abortCtrl.signal.aborted) abortCtrl.abort();
+            }, RUN_ID_ABORT_GRACE_MS);
+          }
         }
       }, timeoutMs);
+      clearResponseTimeout = () => {
+        if (responseTimeoutCleared) return;
+        responseTimeoutCleared = true;
+        clearTimeout(timeoutId);
+      };
       
       const box = el('chat-history');
+      // Scope answer reconciliation to this turn without replacing its timeline.
+      let _streamTurnMarker = document.createComment('live-stream-turn');
+      box.appendChild(_streamTurnMarker);
       holder = document.createElement('div');
       holder.className = 'msg msg-ai streaming';
 
       // Track holder globally so stop button can access it
       currentHolder = holder;
+      _activeStreams.set(streamSessionId, {
+        abortCtrl,
+        holder,
+        query: streamQuery,
+        startedAt: Date.now(),
+        lastActivity: Date.now(),
+        // Resolve the mutable closure at call time: live-thinking helpers are
+        // installed after the stream entry is registered.
+        cancelViewWork: () => _cancelLiveThinkingWork(),
+        finalizeView: () => _finalizeInterruptedView(),
+      });
+      // Every run cooks in the sidebar, including the currently selected chat.
+      // Previously this was marked only after switching to another session,
+      // so the common tab-away case had no breathing provider logo.
+      if (sessionModule && sessionModule.markStreaming) {
+        sessionModule.markStreaming(streamSessionId);
+      }
+      _syncForegroundStreamGlobals();
       holder._researchQuery = msg; // Store query for notification text
       
-      const modelName = sessionModule.getCurrentModel() || null;
+      const modelName = _bestKnownStreamModel(selectedRouteForSend) || null;
 
       let loadingText = 'Initializing...';
 
@@ -806,11 +2596,13 @@ import createResearchSynapse from './researchSynapse.js';
         loadingText = 'Processing request...';
       }
 
-      var roleLabel = _shortModel(modelName);
+      var roleLabel = _modelRouteLabel(modelName, modelName);
       var _charNameInit = presetsModule.getCharacterName ? presetsModule.getCharacterName() : '';
       if (_charNameInit) roleLabel = _charNameInit;
       const roleTs = new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
-      holder.innerHTML = `<div class="role">${roleLabel} <span class="role-timestamp">${roleTs}</span></div><div class="body"></div>`;
+      holder.innerHTML = `<div class="role">${uiModule.esc(roleLabel)} <span class="role-timestamp">${roleTs}</span></div><div class="body"></div>`;
+      holder._requestedModel = modelName;
+      holder._actualModel = modelName;
       _applyModelColor(holder.querySelector('.role'), modelName);
       holder.style.position = 'relative';
       
@@ -829,57 +2621,7 @@ import createResearchSynapse from './researchSynapse.js';
         spinner.updateMessage('Researching');
         setTimeout(() => spinner.updateMessage('Analyzing sources'), 1500);
       } else {
-        spinner.updateMessage('Processing request');
-        const endpointUrlForProbe = sessionModule.getCurrentEndpointUrl ? sessionModule.getCurrentEndpointUrl() : null;
-        if (endpointUrlForProbe && modelName) {
-          processingProbeTimer = setTimeout(async () => {
-            processingProbeTimer = null;
-            if (accumulated || !spinner || !spinner.element || (currentAbort && currentAbort.signal.aborted)) return;
-            processingProbeAbort = new AbortController();
-            try {
-              spinner.updateMessage('Checking model endpoint');
-              const status = await _probeCurrentEndpointStatus(endpointUrlForProbe, processingProbeAbort.signal);
-              if (accumulated || !spinner || !spinner.element || (currentAbort && currentAbort.signal.aborted)) return;
-              if (!status) {
-                spinner.updateMessage('Still waiting for model');
-              } else if (status.alive) {
-                const latency = status.latency_ms ? ` (${status.latency_ms}ms)` : '';
-                spinner.updateMessage(`Endpoint online${latency}; waiting for first token`);
-              } else {
-                // Probe confirms the endpoint isn't responding. Don't
-                // sit on a hung fetch — give the user 5s to read the
-                // status, then auto-abort with reason='offline' so the
-                // catch handler shows a clean "switch model" message
-                // instead of leaving the spinner spinning forever.
-                if (status.error) console.warn('Model endpoint probe failed:', status.error);
-                let _countdown = 5;
-                spinner.updateMessage(`Endpoint offline — cancelling in ${_countdown}s`);
-                const _tick = setInterval(() => {
-                  _countdown--;
-                  if (!spinner || !spinner.element || (currentAbort && currentAbort.signal.aborted) || accumulated) {
-                    clearInterval(_tick);
-                    return;
-                  }
-                  if (_countdown > 0) {
-                    spinner.updateMessage(`Endpoint offline — cancelling in ${_countdown}s`);
-                  } else {
-                    clearInterval(_tick);
-                    if (currentAbort && !currentAbort.signal.aborted) {
-                      currentAbort._reason = 'offline';
-                      currentAbort.abort();
-                    }
-                  }
-                }, 1000);
-              }
-            } catch (e) {
-              if (e && e.name !== 'AbortError' && spinner && spinner.element && !accumulated) {
-                spinner.updateMessage('Still waiting for model');
-              }
-            } finally {
-              processingProbeAbort = null;
-            }
-          }, 10000);
-        }
+        _startTtftDisplay();
       }
       
       const researchBtn = el('research-toggle-btn');
@@ -906,16 +2648,22 @@ import createResearchSynapse from './researchSynapse.js';
       // the agent so natural-language times like "today at 9pm" are
       // interpreted in YOUR timezone, not the server's.
       const _tzOffsetMin = -new Date().getTimezoneOffset();
+      const _tzName = (() => {
+        try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ''; }
+        catch { return ''; }
+      })();
+      _sendPerf.mark('chat_stream_post_begin');
       const res = await fetch(`${API_BASE}/api/chat_stream`, {
         method: 'POST',
         body: fd,
-        headers: { 'X-Tz-Offset': String(_tzOffsetMin) },
+        headers: { 'X-Tz-Offset': String(_tzOffsetMin), 'X-Tz-Name': _tzName },
         signal: abortCtrl.signal
       });
-      
-      clearTimeout(timeoutId);
+      _sendPerf.mark('chat_stream_headers');
+      _sendPerf.report('headers_received');
       
       if (!res.ok) {
+        clearResponseTimeout();
         if (res.status === 404) {
           // Session was deleted (e.g. by AI) — reload and go to welcome
           holder.remove();
@@ -951,27 +2699,112 @@ import createResearchSynapse from './researchSynapse.js';
         enableResearchBtn();
         return;
       }
+      const streamRunId = res.headers.get('X-Odysseus-Run-Id') || '';
+      if (streamRunId) _rememberStreamRunId(streamSessionId, streamRunId, streamGeneration);
+
+      // Mark the chat log busy while streaming so screen readers wait for the
+      // settled response instead of announcing every token. Cleared in finally.
+      const _chatLog = document.getElementById('chat-history');
+      if (_chatLog) _chatLog.setAttribute('aria-busy', 'true');
 
       const reader = res.body.getReader();
+      _sendPerf.mark('reader_ready');
+      _sendPerf.report('reader_ready');
       const decoder = new TextDecoder();
       let buffer = '';
       let metrics = null;
       let isThinking = false;
       let thinkingStartTime = null;
       // Streaming TTS: synthesize sentence-by-sentence during streaming
-      const streamingTTS = !!(window.aiTTSManager && window.aiTTSManager.autoPlay && window.aiTTSManager.available);
+      streamingTTS = !!(window.aiTTSManager && window.aiTTSManager.autoPlay && window.aiTTSManager.available);
       if (streamingTTS) window.aiTTSManager.streamingStart();
       // Multi-bubble agent tracking
       let roundHolder = holder;       // Current AI text bubble (changes per round)
       let roundText = '';             // Text accumulated for current round
+      let roundReplyText = null;      // Reply-only text after a thinking transition
       let currentToolBubble = null;   // Current tool execution bubble
+      let lastToolThread = null;      // Visible tool timeline for tool-only turns
       let roundFinalized = false;     // Whether current round's text is finalized
+      let terminalFinalResponseRendered = false; // final_response already rendered the canonical bubble
+      let roundFinalization = null;   // Terminal owner/result for the current round
+      let lastContentRoundHolder = null; // Last non-empty round for an empty continuation Stop
       let _sourcesHtml = '';          // Sources box HTML to prepend to body
       let _sourcesExpanded = false;   // Track if user expanded sources during stream
       let _sourcesData = null;        // Raw sources data for rebuilding
       let _sourcesType = '';          // 'web' or 'research'
       let _findingsData = null;      // Raw findings data for collapsible box
+      const _generatedImagesForTurn = [];
+      function _rememberGeneratedImage(data) {
+        const imageUrl = data?.image_url || data?.url || '';
+        if (!imageUrl) return;
+        const imageKey = String(data.image_id || imageUrl);
+        if (_generatedImagesForTurn.some(x => String(x.image_id || x.image_url || x.url) === imageKey || x.image_url === imageUrl || x.url === imageUrl)) return;
+        _generatedImagesForTurn.push({ ...data, image_url: imageUrl, url: imageUrl });
+      }
       // _keepResearchOn removed — clarification state now persisted server-side via DB mode
+      function _metricsTargetForTurn() {
+        const visibleRound = (roundHolder && roundHolder.style.display !== 'none') ? roundHolder : null;
+        const visibleText = visibleRound ? (visibleRound.querySelector('.body')?.textContent || '').trim() : '';
+        if (lastToolThread && lastToolThread.isConnected && (!visibleRound || !visibleText || visibleText === 'Done.')) {
+          return lastToolThread;
+        }
+        return visibleRound || holder;
+      }
+      let _savedAssistantMessageId = '';
+      const _turnRendering = createTurnRendering({ root: box, start: _streamTurnMarker });
+      _settleTurnRendering = () => _turnRendering.settle();
+      function _terminalAnswerHtml(text, body) {
+        const expanded = _sourcesExpanded || !!body?.querySelector('.sources-content.expanded');
+        return (_sourcesData ? _buildSourcesBox(_sourcesData, _sourcesType, expanded) : '')
+          + markdownModule.processWithThinking(markdownModule.squashOutsideCode(markdownModule.normalizeThinkingMarkup(_streamDisplayText(text, { final: _docFenceOpened }))))
+          + (_findingsData ? chatRenderer.buildFindingsBox(_findingsData) : '');
+      }
+      function _renderTerminalAnswer(text, messageId = '', renderOwner, replacementScope) {
+        if (renderOwner && !_turnRendering.accepts({ type: 'final_response', render_owner: renderOwner, replacement_scope: replacementScope })) return false;
+        _ensureVisibleRoundForDelta();
+        const body = roundHolder?.querySelector('.body');
+        if (!body) return false;
+        const result = _turnRendering.render({
+          body, html: _terminalAnswerHtml(text, body), raw: text, messageId, render_owner: renderOwner, replacement_scope: replacementScope,
+        });
+        if (result.changed && window.hljs) body.querySelectorAll('pre code').forEach(block => window.hljs.highlightElement(block));
+        if (result.accepted) _turnRendering.settle();
+        return result.accepted;
+      }
+      async function _replaceLiveTurnWithSavedAssistantMessage(_attempt = 0) {
+        if (!streamSessionId || !_savedAssistantMessageId) return false;
+        const isCurrent = () => (
+          sessionModule.getCurrentSessionId() === streamSessionId
+          && _streamGenerations.get(streamSessionId) === streamGeneration
+          && _streamTurnMarker?.parentNode === box
+        );
+        if (!isCurrent()) return false;
+        try {
+          const res = await fetch(`${API_BASE}/api/history/${encodeURIComponent(streamSessionId)}?limit=12`, {
+            credentials: 'same-origin',
+          });
+          if (!res.ok || !isCurrent()) return false;
+          const data = await res.json();
+          if (!isCurrent()) return false;
+          const saved = (Array.isArray(data.history) ? data.history : []).find(msg => (
+            msg?.role === 'assistant'
+            && String(msg.metadata?._db_id || '') === _savedAssistantMessageId
+          ));
+          if (!saved && _attempt < 4) {
+            await new Promise(resolve => setTimeout(resolve, 100 * (_attempt + 1)));
+            return _replaceLiveTurnWithSavedAssistantMessage(_attempt + 1);
+          }
+          if (!saved || !String(saved.content || '').trim()) return false;
+          const scrollSnapshot = uiModule.captureHistoryScroll?.();
+          const rendered = _renderTerminalAnswer(saved.content, _savedAssistantMessageId, saved.metadata?.render_owner, saved.metadata?.replacement_scope);
+          uiModule.restoreHistoryScroll?.(scrollSnapshot);
+          if (rendered) _streamTurnMarker.remove();
+          return rendered;
+        } catch (err) {
+          console.warn('Failed to reconcile saved assistant answer:', err);
+          return false;
+        }
+      }
       // Insert sources box as a stable DOM node that won't be replaced during streaming.
       // Returns the content container to use for innerHTML updates.
       function _ensureStreamLayout(body) {
@@ -986,29 +2819,78 @@ import createResearchSynapse from './researchSynapse.js';
         }
         return contentDiv;
       }
+      function _ensureVisibleRoundForDelta() {
+        if (!roundHolder || roundHolder.style.display !== 'none') return;
+        if (sessionModule.getCurrentSessionId && sessionModule.getCurrentSessionId() !== streamSessionId) return;
+        const box = document.getElementById('chat-history');
+        if (!box) {
+          roundHolder.style.display = '';
+          return;
+        }
+        const newWrap = document.createElement('div');
+        newWrap.className = 'msg msg-ai msg-continuation streaming';
+        const newRole = document.createElement('div');
+        newRole.className = 'role';
+        const metaS = sessionModule.getSessions().find(s => s.id === streamSessionId);
+        inheritModelRouteState(holder, roundHolder, newWrap, metaS?.model || modelName);
+        const requested = newWrap._requestedModel;
+        const actual = newWrap._actualModel;
+        newRole.textContent = _modelRouteLabel(
+          requested,
+          actual,
+          newWrap._requestedEndpointLabel,
+          newWrap._actualEndpointLabel,
+          newWrap._requestedEndpointId,
+          newWrap._actualEndpointId,
+        ) || '';
+        _applyModelColor(newRole, actual);
+        newWrap.appendChild(newRole);
+        const newBody = document.createElement('div');
+        newBody.className = 'body';
+        newWrap.appendChild(newBody);
+        box.appendChild(newWrap);
+        if (lastToolThread && lastToolThread.isConnected) lastToolThread.classList.add('has-bottom');
+        roundHolder = newWrap;
+        roundText = '';
+        roundReplyText = null;
+        roundFinalized = false;
+        terminalFinalResponseRendered = false;
+        roundFinalization = null;
+        isThinking = false;
+        _thinkingMode = null;
+        _cancelThinkingGrace();
+        _thinkingAnalysisGate.reset();
+        _roundDisplayProjector.reset();
+        _replyDisplayProjector.reset();
+        _docFenceOpened = false;
+      }
       const esc = uiModule.esc;
       // Remove thinking spinner helper
-      function _removeThinkingSpinner() {
-        const el = document.querySelector('.agent-thinking-dots');
+      let _thinkingSpinnerEl = null;
+      _removeThinkingSpinner = () => {
+        const el = _thinkingSpinnerEl;
         if (el) {
           if (el._spinner) el._spinner.destroy();
           el.remove();
         }
-      }
+        _thinkingSpinnerEl = null;
+      };
 
       // Tool-aware thinking spinner
       let _lastToolName = '';
       const _searchIcon = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" style="vertical-align:-2px;margin-right:4px"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>';
       const _toolLabels = {
-        'web_search': _searchIcon + 'Searching',
+        'web_search': 'Searching',
         'bash': 'Running',
         'python': 'Running',
-        'create_document': 'Writing',
-        'update_document': 'Writing',
         'read_document': 'Reading',
         'edit_file': 'Editing',
         'read_file': 'Reading',
         'write_file': 'Writing',
+        'create_document': 'Writing',
+        'edit_document': 'Editing',
+        'update_document': 'Rewriting',
+        'suggest_document': 'Reviewing',
         'list_files': 'Browsing',
         'image_gen': 'Generating',
         'generate_image': 'Generating',
@@ -1019,7 +2901,193 @@ import createResearchSynapse from './researchSynapse.js';
         'deep_research': 'Researching',
         'list_models': 'Browsing',
         'ui_control': 'Adjusting',
+        'mcp__email__list_emails': 'Checking email',
+        'mcp__email__read_email': 'Reading email',
+        'mcp__email__search_emails': 'Searching email',
+        'list_emails': 'Checking email',
+        'read_email': 'Reading email',
+        'search_emails': 'Searching email',
       };
+      const _toolIcons = {
+        'web_search': _searchIcon,
+        'web_fetch': _searchIcon,
+      };
+
+      function _safeExternalToolUrl(raw) {
+        const value = String(raw || '').trim();
+        if (!value) return '';
+        try {
+          const parsed = new URL(value.includes('://') ? value : `https://${value}`);
+          if (parsed.protocol === 'http:' || parsed.protocol === 'https:') return parsed.href;
+        } catch (_) {}
+        return '';
+      }
+
+      function _webFetchUrlFromCommand(command) {
+        const raw = String(command || '').trim();
+        if (!raw) return '';
+        try {
+          const args = JSON.parse(raw);
+          return _safeExternalToolUrl(args && args.url);
+        } catch (_) {
+          return _safeExternalToolUrl(raw.split(/\s+/)[0]);
+        }
+      }
+
+      function _webSearchQueryFromCommand(command) {
+        const raw = String(command || '').trim();
+        if (!raw) return '';
+        try {
+          const args = JSON.parse(raw);
+          if (args && typeof args.query === 'string') return args.query.trim();
+          if (args && Array.isArray(args.queries) && args.queries.length) return String(args.queries[0] || '').trim();
+        } catch (_) {}
+        return raw;
+      }
+
+      function _searxngSearchUrl(query) {
+        const q = String(query || '').trim();
+        if (!q) return '';
+        try {
+          const url = new URL('/search/web', window.location.origin);
+          url.search = '';
+          url.hash = '';
+          url.searchParams.set('q', q);
+          return url.href;
+        } catch (_) {
+          return '';
+        }
+      }
+
+      function _toolHeaderLinkHtml(url, title = 'Open link') {
+        const href = _safeExternalToolUrl(url);
+        if (!href) return '';
+        return `<a class="agent-thread-header-link" href="${uiModule.esc(href)}" target="_blank" rel="noopener noreferrer" title="${uiModule.esc(title)}" aria-label="${uiModule.esc(title)}"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></a>`;
+      }
+
+      function _toolHeaderHashLinkHtml(hash, title = 'Open item', iconHtml = '', className = '') {
+        const href = String(hash || '').trim();
+        if (!/^#(?:event|note|email|document|task|research|skill)-[A-Za-z0-9_.:-]+$/.test(href)) return '';
+        const cls = `agent-thread-header-link${className ? ' ' + className : ''}`;
+        return `<a class="${uiModule.esc(cls)}" href="${uiModule.esc(href)}" title="${uiModule.esc(title)}" aria-label="${uiModule.esc(title)}">${iconHtml || '<span aria-hidden="true">↗</span>'}</a>`;
+      }
+
+      function _calendarEventUidFromToolData(command, data) {
+        const direct = String((data && data.uid) || '').trim();
+        if (direct) return direct;
+        const events = data && Array.isArray(data.events) ? data.events : [];
+        if (events.length === 1 && events[0] && events[0].uid) return String(events[0].uid).trim();
+        const text = `${command || ''}\n${(data && data.output) || ''}\n${(data && data.anchor) || ''}`;
+        const match = text.match(/#event-([A-Za-z0-9_.:-]+)/);
+        return match ? match[1] : '';
+      }
+
+      function _emailToolHash(args = {}, data = null) {
+        const uid = String((data && data.uid) || args.uid || '').trim();
+        if (!/^\d+$/.test(uid)) return '';
+        const folder = String((data && data.folder) || args.folder || 'INBOX').trim() || 'INBOX';
+        const account = String((data && (data.account_id || data.account)) || args.account_id || args.account || '').trim();
+        const clean = value => String(value || '').replace(/[^A-Za-z0-9_.@-]/g, '_');
+        return `#email-${[clean(folder), uid, clean(account)].filter(Boolean).join(':')}`;
+      }
+
+      function _toolDisplayInfo(tool, command, data = null) {
+        const rawTool = String(tool || '');
+        const lower = rawTool.toLowerCase();
+        let args = null;
+        try { args = JSON.parse(command || '{}'); } catch (_) {}
+        if (lower === 'web_search' || lower.endsWith('web_search') || lower.includes('__web_search')) {
+          const q = _webSearchQueryFromCommand(command);
+          return {
+            label: '',
+            commandHtml: q
+              ? `<span class="agent-thread-summary">${uiModule.esc(q)}</span>`
+              : '',
+          };
+        }
+        if (lower === 'web_fetch' || lower.endsWith('web_fetch') || lower.includes('__web_fetch')) {
+          const url = _webFetchUrlFromCommand(command);
+          return {
+            label: '',
+            headerActionHtml: _toolHeaderLinkHtml(url, 'Open fetched page'),
+            commandHtml: url
+              ? `<a class="agent-thread-summary agent-thread-summary-link" href="${uiModule.esc(url)}" target="_blank" rel="noopener noreferrer" title="Open ${uiModule.esc(url)}">${uiModule.esc(url)}</a>`
+              : '',
+          };
+        }
+        if (lower === 'manage_calendar' || lower.endsWith('manage_calendar')) {
+          const action = args && args.action ? String(args.action).toLowerCase() : '';
+          const summary = args && args.summary ? String(args.summary) : '';
+          const start = args && args.start ? String(args.start).slice(0, 10) : '';
+          const end = args && args.end ? String(args.end).slice(0, 10) : '';
+          const uid = _calendarEventUidFromToolData(command, data || {});
+          const actionLabel = action.includes('create') ? 'Create event'
+            : action.includes('update') ? 'Update event'
+            : action.includes('delete') ? 'Delete event'
+            : 'Check calendar';
+          const rangeSummary = start && end ? `${start} to ${end}` : '';
+          return {
+            label: actionLabel,
+            // The calendar glyph is rendered as the action link itself.
+            headerActionHtml: '',
+            commandHtml: summary
+              ? `<div class="agent-thread-summary">${uiModule.esc(summary)}</div>`
+              : rangeSummary
+                ? `<div class="agent-thread-summary">${uiModule.esc(rangeSummary)}</div>`
+                : '',
+          };
+        }
+        const emailTool = lower.includes('email');
+        if (emailTool && (lower.includes('read_email') || lower.endsWith('read_email'))) {
+          const uid = args && args.uid ? String(args.uid) : '';
+          const folder = args && args.folder ? String(args.folder) : 'INBOX';
+          const href = _emailToolHash(args || {}, data);
+          return {
+            label: uid ? `Read email UID ${uid}` : 'Read email',
+            headerActionHtml: href
+              ? _toolHeaderHashLinkHtml(href, 'Open this email')
+              : '',
+            commandHtml: uid
+              ? `<a class="agent-thread-summary agent-thread-summary-link" href="${uiModule.esc(href || `#email-${uid}`)}" title="Open this email">UID ${uiModule.esc(uid)} · ${uiModule.esc(folder)}</a>`
+              : '',
+          };
+        }
+        if (emailTool && (lower.includes('list_emails') || lower.endsWith('list_emails'))) {
+          const max = args && args.max_results ? String(args.max_results) : '';
+          const folder = args && args.folder ? String(args.folder) : 'INBOX';
+          const bits = [folder, max ? `${max} latest` : 'latest'].filter(Boolean).join(' · ');
+          return {
+            label: 'Check email',
+            commandHtml: `<div class="agent-thread-summary">${uiModule.esc(bits)}</div>`,
+          };
+        }
+        if (emailTool && (lower.includes('search_emails') || lower.endsWith('search_emails'))) {
+          const q = args && args.query ? String(args.query) : '';
+          return {
+            label: 'Search email',
+            commandHtml: q ? `<div class="agent-thread-summary">${uiModule.esc(q)}</div>` : '',
+          };
+        }
+        return { label: '', commandHtml: '' };
+      }
+
+      function _suppressRawToolOutput(tool, ok) {
+        if (!ok) return false;
+        const lower = String(tool || '').toLowerCase();
+        if (lower === 'manage_calendar' || lower.endsWith('manage_calendar')) return true;
+        return (
+          lower.includes('email')
+          && (
+            lower.includes('list_emails')
+            || lower.includes('search_emails')
+            || lower.includes('read_email')
+            || lower.includes('download_attachment')
+            || lower.includes('scan_spam')
+            || lower.includes('scan_email_unsubscribes')
+          )
+        );
+      }
+
       function _thinkingLabel() {
         if (!_lastToolName) {
           return 'Thinking';
@@ -1034,7 +3102,10 @@ import createResearchSynapse from './researchSynapse.js';
       }
 
       function _showThinkingSpinner(label) {
-        if (document.querySelector('.agent-thinking-dots')) return;
+        if (sessionModule.getCurrentSessionId && sessionModule.getCurrentSessionId() !== streamSessionId) return;
+        const chatBox = document.getElementById('chat-history');
+        if (!chatBox) return;
+        if (_thinkingSpinnerEl || chatBox.querySelector('.agent-thinking-dots')) return;
         const _thinkMsg = document.createElement('div');
         _thinkMsg.className = 'msg msg-ai agent-thinking-dots';
         const _thinkBody = document.createElement('div');
@@ -1044,8 +3115,14 @@ import createResearchSynapse from './researchSynapse.js';
         _ts.start(120);
         _thinkMsg._spinner = _ts;
         _thinkMsg.appendChild(_thinkBody);
-        document.getElementById('chat-history').appendChild(_thinkMsg);
+        _thinkingSpinnerEl = _thinkMsg;
+        chatBox.appendChild(_thinkMsg);
         uiModule.scrollHistory();
+      }
+
+      function _replaceThinkingSpinner(label) {
+        _removeThinkingSpinner();
+        _showThinkingSpinner(label);
       }
 
       // Auto-show thinking spinner after text stops streaming
@@ -1053,32 +3130,309 @@ import createResearchSynapse from './researchSynapse.js';
       function _scheduleThinkingSpinner() {
         if (_textPauseTimer) clearTimeout(_textPauseTimer);
         _textPauseTimer = setTimeout(() => {
-          if (!document.querySelector('.agent-thinking-dots') && isStreaming) {
+          const active = _activeStreams.get(streamSessionId);
+          const isVisible = !(sessionModule.getCurrentSessionId && sessionModule.getCurrentSessionId() !== streamSessionId);
+          if (active && isVisible && !_thinkingSpinnerEl) {
             _showThinkingSpinner(_thinkingLabel());
           }
         }, 400);
       }
-      function _cancelThinkingTimer() {
+      _cancelThinkingTimer = () => {
         if (_textPauseTimer) { clearTimeout(_textPauseTimer); _textPauseTimer = null; }
-      }
+      };
 
       // Document streaming state (text-fence detection)
       let _docFenceOpened = false;
-      let _docFenceContentStart = -1;
+      const _thinkingAnalysisGate = createThinkingAnalysisGate({
+        startsWithReasoningPrefix: markdownModule.startsWithReasoningPrefix,
+      });
+      const _roundDisplayProjector = createIncrementalDisplayProjector(_streamDisplayText);
+      const _replyDisplayProjector = createIncrementalDisplayProjector(_streamDisplayText);
+      let _thinkingMode = null;
+      let _thinkingRecheckAt = 0;
+      let _thinkingGraceTimer = null;
       let _liveThinkSection = null;
       let _liveThinkContent = null;
       let _liveThinkInner = null;
       let _liveThinkHeader = null;
       let _liveThinkSpinnerSlot = null;
       let _liveThinkTimerEl = null;
+      let _liveThinkTokenCount = 0;
       let _liveThinkToggle = null;
       let _liveThinkDomId = null;
+      let _liveThinkRenderThrottle = null;
+      let _liveThinkLatestText = '';
+      let _liveThinkTimerId = null;
+      let _liveThinkReducedMotion = false;
 
-      // Offscreen measurement div — reused across renders
-      let _measureDiv = null;
+      function _estimateThinkingTokens(text) {
+        const clean = (text || '').trim();
+        if (!clean) return 0;
+        return Math.max(1, Math.ceil(clean.length / 4));
+      }
+
+      function _formatThinkStats(seconds, tokenCount) {
+        const time = seconds ? seconds + 's' : '';
+        const tokens = tokenCount ? tokenCount + ' tok' : '';
+        return time && tokens ? time + ' · ' + tokens : (time || tokens);
+      }
+
+      function _stripThinkingWrappers(text) {
+        return text
+          .replace(/<\|channel>thought\s*\n?/gi, '')
+          .replace(/<\|channel>response\s*\n?/gi, '')
+          .replace(/<channel\|>/gi, '')
+          .replace(/^\s*Thinking(?:\s+Process)?:\s*/i, '');
+      }
+
+      // While thinking is still open, every think tag in the round is noise, so
+      // strip them all. Do NOT slice from the first <think> to the first </think>:
+      // the false-close detection below deliberately keeps us in the thinking
+      // state for `<think>The</think>` followed by real thinking left untagged,
+      // and slicing would pin the live box to "The" for the rest of the stream.
+      function _liveThinkingText(text) {
+        const normalized = markdownModule.normalizeThinkingMarkup(_streamDisplayText(text || ''));
+        return _stripThinkingWrappers(stripLiveThinkingTags(normalized));
+      }
+
+      // Once thinking has closed, the reply that follows </think> must not leak
+      // into the thinking box, so go through extractThinkingBlocks — it already
+      // collapses the false-close pattern and merges every block into one.
+      function _closedThinkingText(text) {
+        const normalized = markdownModule.normalizeThinkingMarkup(_streamDisplayText(text || ''));
+        const blocks = markdownModule.extractThinkingBlocks
+          ? markdownModule.extractThinkingBlocks(normalized)?.thinkingBlocks
+          : null;
+        if (blocks?.length) return _stripThinkingWrappers(blocks.join('\n\n'));
+        return _liveThinkingText(text);
+      }
+
+      function _commitLiveThinkingText(text) {
+        _liveThinkLatestText = String(text ?? '');
+        _liveThinkTokenCount = _estimateThinkingTokens(_liveThinkLatestText);
+        const target = _liveThinkInner;
+        if (!target || !target.isConnected) return;
+        const thinkBox = target.closest('.thinking-content');
+        const nearBottom = !thinkBox || thinkBox.scrollHeight - thinkBox.clientHeight - thinkBox.scrollTop < 80;
+        target.style.whiteSpace = 'pre-wrap';
+        target.textContent = _liveThinkLatestText;
+        if (thinkBox && nearBottom) thinkBox.scrollTop = thinkBox.scrollHeight;
+        if (nearBottom) uiModule.scrollHistory();
+      }
+
+      function _ensureLiveThinkingThrottle() {
+        if (!_liveThinkRenderThrottle) {
+          _liveThinkRenderThrottle = createLiveThinkingThrottle(_commitLiveThinkingText, {
+            prepare: ({ text, prepared }) => prepared ? String(text ?? '') : _liveThinkingText(text),
+          });
+        }
+        return _liveThinkRenderThrottle;
+      }
+
+      function _stopLiveThinkTimer() {
+        if (_liveThinkTimerId !== null) clearInterval(_liveThinkTimerId);
+        _liveThinkTimerId = null;
+      }
+
+      function _startLiveThinkTimer() {
+        if (_liveThinkTimerId !== null || !_liveThinkTimerEl) return;
+        _liveThinkReducedMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+        const cadence = _liveThinkReducedMotion ? 1000 : 250;
+        _liveThinkTimerId = setInterval(() => {
+          if (!_liveThinkTimerEl || !_liveThinkTimerEl.isConnected) {
+            _stopLiveThinkTimer();
+            return;
+          }
+          const elapsed = (Date.now() - thinkingStartTime) / 1000;
+          const seconds = elapsed.toFixed(_liveThinkReducedMotion ? 0 : 1);
+          _liveThinkTimerEl.textContent = _formatThinkStats(seconds, _liveThinkTokenCount);
+        }, cadence);
+      }
+
+      function _queueLiveThinking(text, prepared = false) {
+        _ensureLiveThinkingThrottle().update({ text, prepared });
+        _startLiveThinkTimer();
+      }
+
+      _flushLiveThinking = ({ text = null, rich = false } = {}) => {
+        if (text !== null) _queueLiveThinking(text, true);
+        if (_liveThinkRenderThrottle) _liveThinkRenderThrottle.flush();
+        if (rich && _liveThinkInner && _liveThinkInner.isConnected) {
+          _liveThinkInner.style.whiteSpace = '';
+          _liveThinkInner.innerHTML = markdownModule.mdToHtml(_liveThinkLatestText);
+        }
+        return _liveThinkLatestText;
+      };
+
+      _cancelLiveThinkingWork = () => {
+        if (_liveThinkRenderThrottle) _liveThinkRenderThrottle.cancel();
+        _liveThinkRenderThrottle = null;
+        _stopLiveThinkTimer();
+        _cancelThinkingGrace();
+      };
+
+      function _finalizeLiveThinking(text, rich = true) {
+        const finalText = _flushLiveThinking({ text, rich });
+        _cancelLiveThinkingWork();
+        return finalText;
+      }
+
+      // Close the synthetic <think> we opened around vLLM reasoning deltas, so a
+      // stream that ends mid-thinking doesn't persist an unclosed tag.
+      // `currentAccumulated` is the FOREGROUND stop-state text — mirror the guard
+      // the delta path uses (`if (!_isBg) currentAccumulated = accumulated`), or a
+      // backgrounded stream overwrites the visible session's stop-state and
+      // abortCurrentRequest/detachCurrentStream write it into the wrong bubble.
+      _closeOpenThinkingMarkup = (isBackground) => {
+        if (!_thinkOpen) return;
+        accumulated += '</think>';
+        roundText += '</think>';
+        if (!isBackground) currentAccumulated = accumulated;
+        _thinkOpen = false;
+      };
+
+      // Terminal finalize used by the catch path, which cannot see the
+      // block-scoped helpers below.
+      _endThinkingOnTerminalPath = ({ rich = true } = {}) => {
+        if (isThinking) {
+          isThinking = false;
+          _thinkingMode = null;
+          _thinkingRecheckAt = 0;
+          _finalizeLiveThinking(_closedThinkingText(roundText), rich);
+        } else {
+          _cancelLiveThinkingWork();
+        }
+      };
+
+      // Shared teardown for the terminal paths that end thinking without the
+      // normal </think> transition (tool_start, agent_step, [DONE], errors).
+      function _endLiveThinkingSection({ rich = true } = {}) {
+        isThinking = false;
+        _thinkingMode = null;
+        _thinkingRecheckAt = 0;
+        _finalizeLiveThinking(_closedThinkingText(roundText), rich);
+        const elapsed = thinkingStartTime ? ((Date.now() - thinkingStartTime) / 1000).toFixed(1) : null;
+        if (_liveThinkHeader) _liveThinkHeader.textContent = 'View thinking process';
+        if (_liveThinkTimerEl) _liveThinkTimerEl.textContent = elapsed ? _formatThinkStats(elapsed, _liveThinkTokenCount) : '';
+        if (_liveThinkSpinnerSlot) _liveThinkSpinnerSlot.remove();
+      }
+
+      function _cancelThinkingGrace() {
+        if (_thinkingGraceTimer !== null) clearTimeout(_thinkingGraceTimer);
+        _thinkingGraceTimer = null;
+        _thinkingRecheckAt = 0;
+      }
+
+      function _finishLiveThinkingTransition() {
+        if (!isThinking) return;
+        isThinking = false;
+        _thinkingMode = null;
+        _cancelThinkingGrace();
+        const closedText = _closedThinkingText(roundText);
+        const thinkTextLen = closedText.trim().length;
+        _finalizeLiveThinking(closedText, thinkTextLen >= 20);
+
+        // Models sometimes emit a trivial marker such as <think>The</think>.
+        if (thinkTextLen < 20 && _liveThinkSection) {
+          _liveThinkSection.remove();
+          _liveThinkSection = null;
+          _liveThinkContent = null;
+          _liveThinkInner = null;
+          _liveThinkHeader = null;
+          _liveThinkSpinnerSlot = null;
+          _liveThinkTimerEl = null;
+          _liveThinkTokenCount = 0;
+          _liveThinkToggle = null;
+          _liveThinkDomId = null;
+          if (spinner && spinner.element) spinner.destroy();
+          _renderStream({ knownNormal: true, displayText: _roundDisplayProjector.current() });
+          _scheduleThinkingSpinner();
+          return;
+        }
+
+        const elapsed = thinkingStartTime ? ((Date.now() - thinkingStartTime) / 1000).toFixed(1) : null;
+        if (elapsed) {
+          accumulated = accumulated.replace(/<think>/i, '<think time="' + elapsed + '">');
+          roundText = roundText.replace(/<think>/i, '<think time="' + elapsed + '">');
+        }
+        if (_liveThinkHeader) _liveThinkHeader.textContent = 'View thinking process';
+        if (_liveThinkSpinnerSlot) _liveThinkSpinnerSlot.remove();
+        if (_liveThinkTimerEl && elapsed) {
+          _liveThinkTimerEl.textContent = _formatThinkStats(elapsed, _liveThinkTokenCount);
+          _liveThinkTimerEl.style.marginLeft = 'auto';
+          _liveThinkTimerEl.style.marginRight = '5px';
+          const headerRow = _liveThinkTimerEl.closest('.thinking-header');
+          if (headerRow) {
+            if (_liveThinkToggle && _liveThinkToggle.parentElement === headerRow) headerRow.insertBefore(_liveThinkTimerEl, _liveThinkToggle);
+            else headerRow.appendChild(_liveThinkTimerEl);
+          }
+        }
+
+        const thinkingId = 'think-' + Date.now();
+        const liveHeader = _liveThinkSection && _liveThinkSection.querySelector('.thinking-header');
+        if (liveHeader) liveHeader.dataset.thinkingId = thinkingId;
+        if (_liveThinkContent) _liveThinkContent.id = thinkingId;
+        if (_liveThinkToggle) _liveThinkToggle.id = thinkingId + '-toggle';
+
+        const streamElement = _liveThinkSection ? _liveThinkSection.parentElement : roundHolder.querySelector('.stream-content');
+        const replyHost = streamElement || roundHolder.querySelector('.body');
+        if (replyHost && !replyHost.querySelector('.live-reply-content')) {
+          const replyElement = document.createElement('div');
+          replyElement.className = 'live-reply-content';
+          replyHost.appendChild(replyElement);
+        }
+        _renderStream();
+      }
+
+      function _scheduleThinkingGrace() {
+        if (_thinkingGraceTimer !== null || !_thinkingRecheckAt) return;
+        const delay = Math.max(0, _thinkingRecheckAt - Date.now());
+        _thinkingGraceTimer = setTimeout(() => {
+          _thinkingGraceTimer = null;
+          if (!isThinking || !roundHolder?.isConnected || abortCtrl?.signal?.aborted) return;
+          _finishLiveThinkingTransition();
+        }, delay);
+      }
+
+      // Terminal paths replace the whole round, so they should perform exactly
+      // one rich markdown render instead of richly finalizing thinking, then
+      // rendering the reply, then replacing both again.
+      _finalizeRoundRender = () => {
+        if (roundFinalized) return roundFinalization;
+        const terminalHolder = roundHolder || holder;
+        const dt = markdownModule.normalizeThinkingMarkup(_streamDisplayText(roundText));
+        if (!dt.trim()) {
+          terminalHolder.style.display = 'none';
+          roundFinalized = true;
+          roundFinalization = { rendered: true, holder: terminalHolder, hasContent: false };
+          return roundFinalization;
+        }
+        const body = terminalHolder.querySelector('.body');
+        const content = _ensureStreamLayout(body);
+        content.style.minHeight = '';
+        content.innerHTML = markdownModule.processWithThinking(markdownModule.squashOutsideCode(dt));
+        if (window.hljs) terminalHolder.querySelectorAll('pre code').forEach((block) => window.hljs.highlightElement(block));
+        roundFinalized = true;
+        lastContentRoundHolder = terminalHolder;
+        roundFinalization = { rendered: true, holder: terminalHolder, hasContent: true };
+        return roundFinalization;
+      };
+      _finalizeInterruptedView = () => {
+        _closeOpenThinkingMarkup(false);
+        _endThinkingOnTerminalPath({ rich: false });
+        const finalization = _finalizeRoundRender();
+        return {
+          rendered: !!finalization?.rendered,
+          holder: finalization?.hasContent
+            ? finalization.holder
+            : (lastContentRoundHolder || finalization?.holder || roundHolder || holder),
+          raw: accumulated,
+        };
+      };
 
       function _replyAfterClosedThinking(text) {
-        const closeRe = /<\/think(?:ing)?>/gi;
+        text = markdownModule.normalizeThinkingMarkup(text || '');
+        const closeRe = /<\/(?:think(?:ing)?|thought)>|<channel\|>/gi;
         let match = null;
         let last = null;
         while ((match = closeRe.exec(text || '')) !== null) last = match;
@@ -1086,33 +3440,88 @@ import createResearchSynapse from './researchSynapse.js';
         return (text || '').slice(last.index + last[0].length).trimStart();
       }
 
+      function _suppressThinkingForPersona() {
+        return !!(roundHolder?._characterName || holder?._characterName);
+      }
+
+      function _visiblePersonaReplyText(text) {
+        const normalized = markdownModule.normalizeThinkingMarkup(text || '');
+        const extracted = markdownModule.extractThinkingBlocks(normalized);
+        if (extracted && typeof extracted.content === 'string') return extracted.content.trimStart();
+        return normalized;
+      }
+
+      function _isDirectEmailListingPrompt(text) {
+        const q = String(text || '').toLowerCase();
+        if (/\b(summarize|summarise|summary|tldr|recap|rundown|brief|how many|count|number of|total|urgent|important|priority|spam|junk|phishing|unsubscribe)\b/i.test(q)) {
+          return false;
+        }
+        return /\b(show|list|display|view)\b.{0,50}\b(my\s+)?(inbox|emails?|mail|messages)\b/i.test(q)
+          || /\b(what'?s|what is|what are|check)\b.{0,30}\b(my\s+)?(inbox|emails?|mail|messages)\b/i.test(q)
+          || /\b(latest|newest|recent|last\s+\d+)\s+(emails?|messages|mail)\b/i.test(q)
+          || /\b(emails?|messages|mail)\s+(from\s+)?(today|yesterday|last\s+week|last\s+month|last\s+year)\b/i.test(q);
+      }
+
+      function _isIntermediateEmailListDump(text) {
+        const s = String(text || '').trim();
+        return /^Here (?:are your emails|is your latest email)\b/i.test(s)
+          || /^Latest emails? with attachments\b/i.test(s);
+      }
+
       // Direct render helper for streaming text
-      function _renderStream() {
-        let dt = stripToolBlocks(roundText);
+      _renderStream = ({ knownNormal = false, displayText = null, replyText = null } = {}) => {
+        if (
+          sessionModule.getCurrentSessionId
+          && sessionModule.getCurrentSessionId() !== streamSessionId
+        ) return;
+        if (!roundHolder || !roundHolder.isConnected) return;
+        let dt = displayText === null
+          ? (knownNormal
+              ? _roundDisplayProjector.current()
+              : markdownModule.normalizeThinkingMarkup(_streamDisplayText(roundText)))
+          : String(displayText);
         const bodyEl = roundHolder.querySelector('.body');
         const contentEl = _ensureStreamLayout(bodyEl);
+        if (_suppressThinkingForPersona()) {
+          const visiblePersonaText = _visiblePersonaReplyText(dt);
+          if (!visiblePersonaText.trim()) {
+            contentEl.textContent = '';
+            uiModule.scrollHistory();
+            return;
+          }
+          const renderer = contentEl._streamRenderer ||
+            (contentEl._streamRenderer = createStreamRenderer(contentEl, {
+              render: (t) => markdownModule.mdToHtml(markdownModule.squashOutsideCode(t)),
+              hljs: window.hljs,
+            }));
+          renderer.update(visiblePersonaText);
+          uiModule.scrollHistory();
+          return;
+        }
 
         // If thinking was already collapsed in-place, only render the reply portion
         let liveReply = contentEl.querySelector('.live-reply-content');
         if (liveReply) {
           // Extract reply text — handle native <think> tags and non-tag patterns
-          const closedThinkReply = _replyAfterClosedThinking(dt);
-          const { thinkingBlocks, content: replyText } = closedThinkReply
-            ? { thinkingBlocks: [''], content: closedThinkReply }
-            : markdownModule.extractThinkingBlocks(dt);
-          let replyTrimmed = '';
-          if (thinkingBlocks.length) {
-            replyTrimmed = (replyText || '').trim();
-          } else {
+          let replyTrimmed = replyText === null ? '' : String(replyText);
+          if (replyText === null) {
+            const dt = markdownModule.normalizeThinkingMarkup(_streamDisplayText(roundText));
+            const closedThinkReply = _replyAfterClosedThinking(dt);
+            const { thinkingBlocks, content: extractedReply } = closedThinkReply
+              ? { thinkingBlocks: [''], content: closedThinkReply }
+              : markdownModule.extractThinkingBlocks(dt);
+            if (thinkingBlocks.length) {
+              replyTrimmed = (extractedReply || '').trim();
+            } else {
             // Non-tag: check for garbled <think> (reasoning\n<think>reply)
-            const _gm = dt.match(/^[\s\S]+?<think(?:ing)?>\s*([\s\S]*?)(?:<\/think(?:ing)?>)?\s*$/i);
+            const _gm = dt.match(/^[\s\S]+?<(?:think(?:ing)?|thought)(?:\s+[^>]*)?>\s*([\s\S]*?)(?:<\/(?:think(?:ing)?|thought)>)?\s*$/i);
             if (_gm && _gm[1].trim()) {
               replyTrimmed = _gm[1].trim();
             } else {
               // Pure non-tag: find reply boundary
               const _rPrefixes = markdownModule.startsWithReasoningPrefix;
               const _rpStarts = ['Hey', 'Hi ', 'Hi!', 'Hello', 'Sure', 'Yes', 'No ', 'No,', 'Yo', 'OK', 'Here', 'Absolutely', 'Of course', 'Great', 'Alright', 'Thanks', 'Welcome', 'Good ', "I'm happy", "I'd be"];
-              const _rt = (replyText || '').trimStart();
+              const _rt = (extractedReply || '').trimStart();
               if (_rPrefixes(_rt)) {
                 const _rLines = _rt.split('\n');
                 for (let _ri = 1; _ri < _rLines.length; _ri++) {
@@ -1129,96 +3538,83 @@ import createResearchSynapse from './researchSynapse.js';
                 }
               }
             }
+            }
+          }
+          if (replyText === null) {
+            roundReplyText = replyTrimmed;
+            _replyDisplayProjector.reset();
+            replyTrimmed = _replyDisplayProjector.append(replyTrimmed, roundReplyText);
           }
           if (replyTrimmed) {
-            const replyHtml = markdownModule.mdToHtml(markdownModule.squashOutsideCode(replyTrimmed));
-            const prevLen = liveReply._prevTextLen || 0;
-            liveReply.innerHTML = replyHtml;
-            _fadeNewTokens(liveReply, prevLen);
-            liveReply._prevTextLen = liveReply.textContent.length;
-            if (window.hljs) liveReply.querySelectorAll('pre code').forEach((b) => window.hljs.highlightElement(b));
+            const r = liveReply._streamRenderer ||
+              (liveReply._streamRenderer = createStreamRenderer(liveReply, {
+                render: (t) => markdownModule.mdToHtml(markdownModule.squashOutsideCode(t)),
+                hljs: window.hljs,
+              }));
+            r.update(replyTrimmed);
           }
           // Reply empty or not — preserve thinking bar, don't fall through to full re-render
           uiModule.scrollHistory();
           return;
         }
 
-        const prevLen = contentEl._prevTextLen || 0;
+        // Thinking compatibility normalization and display stripping are
+        // intentionally omitted from the known-normal path. The incremental
+        // projector already handled the newly appended boundary, so repeating
+        // the full-round regex chains per delta would restore O(N^2) work.
         // If thinking is still streaming (unclosed <think>), show indicator instead of raw text
-        if (markdownModule.hasUnclosedThinkTag && markdownModule.hasUnclosedThinkTag(dt)) {
-          const thinkStart = dt.search(/<think(?:ing)?>/i);
-          const thinkContent = dt.substring(thinkStart).replace(/<think(?:ing)?>/i, '').trim();
+        if (!knownNormal && markdownModule.hasUnclosedThinkTag && markdownModule.hasUnclosedThinkTag(dt)) {
+          const thinkStart = dt.search(/<(?:think(?:ing)?|thought)(?:\s+[^>]*)?>|<\|channel>thought/i);
+          const thinkContent = dt.substring(Math.max(thinkStart, 0))
+            .replace(/<(?:think(?:ing)?|thought)(?:\s+[^>]*)?>|<\|channel>thought\s*\n?/i, '')
+            .replace(/<channel\|>/gi, '')
+            .trim();
           const lines = thinkContent.split('\n').length;
           // Don't show beforeThink text during streaming — it'll appear in the final render
           // This prevents the "split into two" duplication
           contentEl.innerHTML =
             '<div class="thinking-section"><div class="thinking-header"><div class="thinking-header-left">Thinking' +
             (lines > 1 ? ` (${lines} lines)` : '') + '</div></div></div>';
-          contentEl._prevTextLen = 0;
+          // The stream renderer self-heals when it next sees this overwritten
+          // container (streamingRenderer.js), so no explicit reset is needed here.
           uiModule.scrollHistory();
           return;
         }
-        const html = markdownModule.processWithThinking(markdownModule.squashOutsideCode(dt));
 
-        // Smooth expand only for regular chat text (not thinking/agent blocks)
-        const _hasThinking = html.includes('thinking-section');
-        const _isAgentRound = roundHolder !== holder;
-        if (!_hasThinking && !_isAgentRound) {
-          // Render into offscreen clone to measure new height before swapping
-          if (!_measureDiv) {
-            _measureDiv = document.createElement('div');
-            _measureDiv.style.cssText = 'position:absolute;visibility:hidden;pointer-events:none;z-index:-1;';
-          }
-          _measureDiv.style.width = contentEl.offsetWidth + 'px';
-          _measureDiv.className = contentEl.className;
-          _measureDiv.innerHTML = html;
-          contentEl.parentNode.appendChild(_measureDiv);
-          const measuredH = _measureDiv.offsetHeight;
-          _measureDiv.remove();
-          const curMin = parseFloat(contentEl.style.minHeight) || 0;
-          contentEl.style.minHeight = Math.max(curMin, measuredH) + 'px';
-        } else {
-          contentEl.style.minHeight = '';
+        // Incremental streaming render: freeze finalized blocks, re-render only the
+        // growing tail, and highlight each code block once on completion. This is
+        // what keeps code-block hover buttons from flickering and avoids the O(N^2)
+        // re-parse/re-highlight of the whole message on every token.
+        // See streamingRenderer.js / streamingSegmenter.js.
+        if (_docFenceOpened && !dt.trim()) {
+          _showDocumentWritingStatus(contentEl);
+          uiModule.scrollHistory();
+          return;
         }
-
-        contentEl.innerHTML = html;
-        _fadeNewTokens(contentEl, prevLen);
-        contentEl._prevTextLen = contentEl.textContent.length;
-        if (window.hljs) contentEl.querySelectorAll('pre code').forEach((b) => window.hljs.highlightElement(b));
+        const renderer = contentEl._streamRenderer ||
+          (contentEl._streamRenderer = createStreamRenderer(contentEl, {
+            render: (t) => markdownModule.processWithThinking(markdownModule.squashOutsideCode(t)),
+            hljs: window.hljs,
+          }));
+        renderer.update(dt);
         uiModule.scrollHistory();
-      }
-
-      // Walk text nodes, skip past `prevLen` characters of old text,
-      // wrap everything after that in <span class="token-new"> for fade-in
-      function _fadeNewTokens(container, prevLen) {
-        if (!prevLen) return; // First chunk — skip, whole msg already has entrance anim
-        const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
-        let charCount = 0;
-        const toWrap = [];
-        while (walker.nextNode()) {
-          const node = walker.currentNode;
-          const len = node.textContent.length;
-          if (charCount + len <= prevLen) { charCount += len; continue; }
-          const splitAt = charCount < prevLen ? prevLen - charCount : 0;
-          toWrap.push({ node, splitAt });
-          charCount += len;
-        }
-        for (const { node, splitAt } of toWrap) {
-          const parent = node.parentNode;
-          if (!parent || parent.closest('pre, .think-content')) continue;
-          const target = splitAt > 0 ? node.splitText(splitAt) : node;
-          const span = document.createElement('span');
-          span.className = 'token-new';
-          parent.replaceChild(span, target);
-          span.appendChild(target);
-        }
-      }
+      };
 
       let _nextIsError = false;
+      let _streamSawDone = false;
+      let _streamTerminalError = null;
+      let _firstVisibleOutputSeen = false;
+      const markFirstVisibleOutput = () => {
+        if (_firstVisibleOutputSeen) return;
+        _firstVisibleOutputSeen = true;
+        _clientTtftSeconds = Number(((performance.now() - _ttftStartedAt) / 1000).toFixed(3));
+        _stopTtftDisplay();
+        clearFirstTokenWaitTimers();
+      };
 
       while (true) {
         const { done, value } = await reader.read();
-        _lastReaderActivity = Date.now();
+        _touchStreamActivity(streamSessionId);
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
@@ -1242,24 +3638,36 @@ import createResearchSynapse from './researchSynapse.js';
 
             // On first transition to background, store state in map
             if (_isBg && !_backgroundStreams.has(streamSessionId)) {
+              // Leave the block in its finished shape (rich, no pre-wrap) rather
+              // than frozen as plain text — the user may navigate back to it.
+              _flushLiveThinking({ rich: true });
+              _cancelLiveThinkingWork();
               _backgroundStreams.set(streamSessionId, {
                 status: 'running',
                 accumulated: accumulated,
                 sourcesHtml: _sourcesHtml,
                 findingsData: null,
-                abortCtrl: currentAbort,
+                abortCtrl,
                 query: streamQuery,
                 metrics: null,
               });
               if (sessionModule && sessionModule.markStreaming) {
                 sessionModule.markStreaming(streamSessionId);
               }
+              _syncForegroundStreamGlobals();
             }
 
             if (data === '[DONE]') {
+              _streamSawDone = true;
+              const _completedStreamState = _activeStreams.get(streamSessionId);
+              const _completedWhileAway = document.visibilityState !== 'visible' || !!_completedStreamState?.wasAway;
+              _closeOpenThinkingMarkup(_isBg);
               // Always update background map if entry exists (even if user switched back)
               var bgDone = _backgroundStreams.get(streamSessionId);
-              if (bgDone) {
+              if (bgDone && !_isBg) {
+                _backgroundStreams.delete(streamSessionId);
+                _syncForegroundStreamGlobals();
+              } else if (bgDone) {
                 bgDone.status = 'completed';
                 bgDone.accumulated = accumulated;
                 if (_isBg) {
@@ -1282,10 +3690,20 @@ import createResearchSynapse from './researchSynapse.js';
                 // will detect 'completed' and reload history cleanly
                 break;
               }
+              if (_completedWhileAway && sessionModule && sessionModule.markStreamComplete) {
+                sessionModule.markStreamComplete(streamSessionId, { force: true });
+                try {
+                  _notifyStreamComplete(streamSessionId, streamQuery);
+                } catch (notifyErr) {
+                  console.warn('[stream] Away completion notification failed:', notifyErr);
+                }
+              }
               // Force-close thinking if still open (model never output boundary)
               if (isThinking) {
                 isThinking = false;
-                cancelAnimationFrame(_thinkTimerRAF);
+                // The final round render below is authoritative and will render
+                // the complete thinking + reply markup once.
+                _finalizeLiveThinking(_closedThinkingText(roundText), false);
                 var _elapsedDone = thinkingStartTime ? ((Date.now() - thinkingStartTime) / 1000).toFixed(1) : null;
                 if (_elapsedDone) {
                   accumulated = accumulated.replace(/<think>/i, '<think time="' + _elapsedDone + '">');
@@ -1294,7 +3712,7 @@ import createResearchSynapse from './researchSynapse.js';
                 if (_liveThinkHeader) _liveThinkHeader.textContent = 'View thinking process';
                 if (_liveThinkSpinnerSlot) _liveThinkSpinnerSlot.remove();
                 if (_liveThinkTimerEl && _elapsedDone) {
-                  _liveThinkTimerEl.textContent = _elapsedDone + 's';
+                  _liveThinkTimerEl.textContent = _formatThinkStats(_elapsedDone, _liveThinkTokenCount);
                   _liveThinkTimerEl.style.marginLeft = 'auto';
                   _liveThinkTimerEl.style.marginRight = '5px';
                   var _hdrDone = _liveThinkTimerEl.closest('.thinking-header');
@@ -1313,33 +3731,123 @@ import createResearchSynapse from './researchSynapse.js';
                 if (_liveHdrDone) _liveHdrDone.dataset.thinkingId = _thinkIdDone;
                 if (_liveThinkContent) _liveThinkContent.id = _thinkIdDone;
                 if (_liveThinkToggle) _liveThinkToggle.id = _thinkIdDone + '-toggle';
-                // Create live-reply container so final render preserves thinking bar
-                var _streamElDone = _liveThinkSection ? _liveThinkSection.parentElement : roundHolder.querySelector('.stream-content');
-                if (!_streamElDone) _streamElDone = roundHolder.querySelector('.body');
-                if (_streamElDone && !_streamElDone.querySelector('.live-reply-content')) {
-                  var _replyElDone = document.createElement('div');
-                  _replyElDone.className = 'live-reply-content';
-                  _streamElDone.appendChild(_replyElDone);
-                }
               }
               // Normal foreground completion — metrics will be displayed in the final render block below
               break;
             }
             try {
               const json = JSON.parse(data);
+              if (['stable', 'complete', 'error', 'agent_terminal', 'chat_terminal'].includes(json.type)) _settleTurnRendering();
+              if (
+                (typeof json.delta === 'string' && json.delta.length > 0)
+                || (json.type === 'final_response' && String(json.content || json.delta || '').length > 0)
+              ) {
+                markFirstVisibleOutput();
+              }
               // Handle SSE error events (e.g. HTTP 404 from provider)
               if (_nextIsError || json.status >= 400) {
                 _nextIsError = false;
-                const errMsg = json.text || json.error?.message || `Error ${json.status || 'unknown'}`;
-                console.error('Stream error:', errMsg);
+                _streamTerminalError = createTerminalStreamError(json);
+                console.error('Stream error:', _streamTerminalError.message);
                 if (spinner && spinner.element) spinner.destroy();
-                typewriterInto(roundHolder.querySelector('.body'), errMsg);
                 break;
               }
-              if (json.delta || json.type === 'tool_start' || json.type === 'agent_step' || json.type === 'doc_stream_delta') {
+              if (json.delta || json.type === 'final_response' || json.type === 'agent_prep' || json.type === 'tool_approval_resolved' || json.type === 'generated_image' || json.type === 'tool_start' || json.type === 'tool_output' || json.type === 'tool_progress' || json.type === 'agent_step' || json.type === 'loop_breaker_triggered' || json.type === 'intent_nudge_exhausted' || json.type === 'doc_stream_open' || json.type === 'doc_stream_delta' || json.type === 'research_progress') {
+                clearResponseTimeout();
                 clearProcessingProbe();
+                clearFirstTokenWaitTimers();
+              }
+              if (json.type === 'generated_image') {
+                _rememberGeneratedImage(json);
+                if (!_isBg) _appendGeneratedImageBubble(json, streamSessionId);
+                continue;
+              }
+              if (json.type === 'turn_mode') {
+                if (!_isBg && _userMsgEl && chatRenderer.setUserModePill) {
+                  chatRenderer.setUserModePill(_userMsgEl, json.mode || 'chat', !!json.auto_escalated);
+                }
+                continue;
+              }
+              if (json.type === 'agent_prep') {
+                if (!_isBg) {
+                  _cancelThinkingTimer();
+                  _replaceThinkingSpinner('Preparing agent');
+                }
+                continue;
+              }
+              if (json.type === 'tool_approval_resolved') {
+                _cancelThinkingTimer();
+                _removeThinkingSpinner();
+                if (spinner && spinner.element) spinner.destroy();
+                if (!_isBg && roundHolder && roundHolder !== holder) roundHolder.remove();
+                if (!_isBg && holder) holder.remove();
+                continue;
+              }
+              if (json.type === 'final_response') {
+                try {
+                  window.dispatchEvent(new CustomEvent('odysseus:agent-final-response', { detail: json }));
+                } catch (_) {}
+                const finalText = String(json.content || json.delta || '');
+                if (!finalText.trim()) continue;
+                if (!_isDirectEmailListingPrompt(msg) && _isIntermediateEmailListDump(finalText)) {
+                  console.debug('[chat] suppressed intermediate email list final_response for non-list prompt');
+                  continue;
+                }
+                if (!_turnRendering.accepts(json)) continue;
+                _cancelThinkingTimer();
+                _removeThinkingSpinner();
+                _closeOpenThinkingMarkup(_isBg);
+                if (isThinking) {
+                  _endLiveThinkingSection({ rich: false });
+                } else {
+                  _cancelLiveThinkingWork();
+                }
+                accumulated = finalText;
+                if (!_isBg) currentAccumulated = accumulated;
+                if (_isBg) {
+                  var bgFinal = _backgroundStreams.get(streamSessionId);
+                  if (bgFinal) bgFinal.accumulated = accumulated;
+                  continue;
+                }
+                if (spinner && spinner.element) spinner.destroy();
+                _ensureVisibleRoundForDelta();
+                roundText = finalText;
+                roundReplyText = null;
+                roundFinalized = true;
+                terminalFinalResponseRendered = true;
+                roundFinalization = null;
+                isThinking = false;
+                _thinkingMode = null;
+                _thinkingAnalysisGate.reset();
+                _roundDisplayProjector.reset();
+                _replyDisplayProjector.reset();
+                const threadAbove = roundHolder?.previousElementSibling;
+                if (threadAbove && threadAbove.classList.contains('agent-thread')) {
+                  threadAbove.classList.add('has-bottom');
+                }
+                terminalFinalResponseRendered = _renderTerminalAnswer(finalText, '', json.render_owner, json.replacement_scope);
+                lastContentRoundHolder = roundHolder || lastContentRoundHolder;
+                uiModule.scrollHistory();
+                continue;
               }
               if (json.delta) {
+                if (!_turnRendering.accepts(json)) continue;
+                if (!json.thinking && json.render_owner === 'streamed' && json.replacement_scope === 'turn') {
+                  // The backend explicitly resumed synthesis after an
+                  // intermediate structured answer. Start a fresh prose buffer.
+                  accumulated = '';
+                  roundText = '';
+                  roundReplyText = null;
+                  roundFinalized = false;
+                  terminalFinalResponseRendered = false;
+                  roundFinalization = null;
+                  _roundDisplayProjector.reset();
+                  _replyDisplayProjector.reset();
+                  if (!_isBg) {
+                    _ensureVisibleRoundForDelta();
+                    _turnRendering.render({ body: roundHolder.querySelector('.body'), html: '', raw: '', render_owner: 'streamed', replacement_scope: 'turn' });
+                  }
+                }
                 _cancelThinkingTimer();
                 _removeThinkingSpinner();
                 // Text arrived after tools — connect thread line to this bubble
@@ -1347,62 +3855,79 @@ import createResearchSynapse from './researchSynapse.js';
                 if (_threadAbove && _threadAbove.classList.contains('agent-thread') && !_threadAbove.classList.contains('has-bottom')) {
                   _threadAbove.classList.add('has-bottom');
                 }
-                // VLLM reasoning tokens: wrap in <think> tags for the thinking UI
-                let _delta = json.delta;
-                if (json.thinking) {
-                  if (!accumulated.includes('<think>')) _delta = '<think>' + _delta;
-                } else if (accumulated.includes('<think>') && !accumulated.includes('</think>')) {
-                  _delta = '</think>' + _delta;
-                }
-                const wasEmpty = !accumulated;
-                accumulated += _delta;
-                roundText += _delta;
-                currentAccumulated = accumulated; // Update global tracker
-                // First token arrived — switch stop button from processing to streaming
-                if (wasEmpty && submitBtn && !_isBg) {
-                  submitBtn.dataset.phase = 'receiving';
+                // VLLM reasoning tokens: wrap in <think> tags for the thinking UI.
+                // Stateful open/close (not a whole-message substring check) so each round
+                // of a multi-round agent response gets its own <think>…</think> — otherwise
+	                // only round 1 is wrapped and rounds 2+ reasoning leaks into the answer.
+	                let _delta = json.delta;
+	                if (json.thinking && _suppressThinkingForPersona()) {
+	                  continue;
+	                }
+	                if (json.thinking) {
+	                  if (!_thinkOpen) { _delta = '<think>' + _delta; _thinkOpen = true; }
+	                } else if (_thinkOpen) {
+                  _delta = '</think>' + _delta; _thinkOpen = false;
+	                }
+	                const wasEmpty = !accumulated;
+		                accumulated += _delta;
+		                if (!_isBg) currentAccumulated = accumulated; // Foreground stop-state text
+	                // First token arrived — switch stop button from processing to streaming
+	                if (wasEmpty && submitBtn && !_isBg) {
+	                  submitBtn.dataset.phase = 'receiving';
                 }
 
                 // Update background map if running in background
                 if (_isBg) {
                   var bgEntry = _backgroundStreams.get(streamSessionId);
-                  if (bgEntry) bgEntry.accumulated = accumulated;
-                  continue; // Skip all DOM writes
-                }
+	                  if (bgEntry) bgEntry.accumulated = accumulated;
+	                  continue; // Skip all DOM writes
+	                }
+	                _ensureVisibleRoundForDelta();
+	                roundText += _delta;
+	                _roundDisplayProjector.append(_delta, roundText);
 
-                // --- Text-fence doc streaming (for models that don't use native tool calls) ---
-                if (!_docFenceOpened && documentModule && roundText.includes('```create_document\n')) {
-                  const fenceIdx = roundText.indexOf('```create_document\n');
-                  const afterFence = roundText.slice(fenceIdx + '```create_document\n'.length);
-                  const fenceLines = afterFence.split('\n');
-                  if (fenceLines.length >= 1 && fenceLines[0].trim()) {
-                    _docFenceOpened = true;
-                    const title = fenceLines[0].trim();
-                    // Keep in sync with backend _KNOWN_LANGS in src/tool_implementations.py
-                    const knownLangs = ['python','py','javascript','js','typescript','ts','html','css','json','yaml','bash','sql','rust','go','java','c','cpp','markdown','text','plain','ruby','swift','kotlin','php','email','csv','xml','toml','ini'];
-                    const isLang = fenceLines.length >= 2 && knownLangs.includes(fenceLines[1].trim().toLowerCase());
-                    const lang = isLang ? fenceLines[1].trim() : '';
-                    _docFenceContentStart = fenceIdx + '```create_document\n'.length + title.length + 1 + (isLang ? fenceLines[1].length + 1 : 0);
-                    documentModule.streamDocOpen(title, lang);
-                  }
-                }
-                if (_docFenceOpened && _docFenceContentStart > 0 && documentModule) {
-                  let raw = roundText.slice(_docFenceContentStart);
-                  const closeIdx = raw.indexOf('\n```');
-                  if (closeIdx >= 0) raw = raw.slice(0, closeIdx);
-                  documentModule.streamDocDelta(raw);
+                // Raw model text is not authorization to mutate the editor.
+                // Detect document fences only for chat projection/status; the
+                // server emits doc_stream_* after successful dispatch.
+                if (!_docFenceOpened) {
+                  _docFenceOpened = /```(?:create_document|documen(?:t)?)\s*\n/i.test(roundText);
                 }
 
                 // Detect thinking-in-progress:
                 // 1. Normal: <think>...no closing tag yet
                 // 2. Malformed: <think></think>\n...text but no second </think> yet
                 // 3. Qwen3.5: "Thinking Process:" without <think> tags
-                let hasUnclosedThink = markdownModule.hasUnclosedThinkTag(roundText);
+                // Most deltas cannot change thinking state. Analyze cumulative
+                // text only for a fresh tag/channel/reply boundary, an initial
+                // reasoning prefix, or an expired false-close grace period.
+                if (!_thinkingAnalysisGate.shouldAnalyze(roundText, {
+                  isThinking,
+                  nonTagThinking: _thinkingMode === 'prefix',
+                  recheckAt: _thinkingRecheckAt,
+                })) {
+                  if (isThinking) {
+                    _queueLiveThinking(roundText);
+                  } else {
+                    if (spinner && spinner.element) spinner.destroy();
+                    if (roundReplyText !== null) {
+                      roundReplyText += _delta;
+                      const replyDisplayText = _replyDisplayProjector.append(_delta, roundReplyText);
+                      _renderStream({ replyText: replyDisplayText });
+                    } else {
+                      _renderStream({ knownNormal: true, displayText: _roundDisplayProjector.current() });
+                    }
+                    _scheduleThinkingSpinner();
+                    if (streamingTTS) window.aiTTSManager.streamingUpdate(roundText);
+                  }
+                  continue;
+                }
+                const normalizedRoundText = markdownModule.normalizeThinkingMarkup(roundText);
+                let hasUnclosedThink = markdownModule.hasUnclosedThinkTag(normalizedRoundText);
                 // Detect non-tag thinking patterns: "Thinking:", "Thinking Process:", Gemma-style reasoning
                 // These patterns don't use <think> tags, so we simulate unclosed thinking during streaming
                 const _replyPrefixes = ['Hey', 'Hi ', 'Hi!', 'Hello', 'Sure', 'Yes', 'No ', 'No,', 'Yo', 'OK', 'Here', 'Absolutely', 'Of course', 'Great', 'Alright', 'Thanks', 'Welcome', 'Good ', "I'm happy", "I'd be"];
-                if (!hasUnclosedThink && !roundText.includes('<think')) {
-                  const _trimmedRT = roundText.trimStart();
+                if (!hasUnclosedThink && !/<(?:think(?:ing)?|thought)(?:\s+[^>]*)?>|<\|channel>thought/i.test(normalizedRoundText)) {
+                  const _trimmedRT = normalizedRoundText.trimStart();
                   const _isReasoning = markdownModule.startsWithReasoningPrefix(_trimmedRT);
                   if (_isReasoning) {
                     // Check if we can see a reply boundary yet (newline then reply pattern)
@@ -1427,34 +3952,39 @@ import createResearchSynapse from './researchSynapse.js';
                     }
                   }
                 }
-                if (!hasUnclosedThink && /^<think(?:ing)?>\s*<\/think(?:ing)?>/i.test(roundText)) {
-                  // Empty <think></think> — the model likely put thinking outside the tags
-                  const afterEmpty = roundText.replace(/^<think(?:ing)?>\s*<\/think(?:ing)?>/i, '').trim();
-                  const closeTags = (afterEmpty.match(/<\/think(?:ing)?>/gi) || []).length;
-                  if (closeTags === 0 && afterEmpty.length > 0) {
-                    hasUnclosedThink = true; // still waiting for real closing tag
-                  }
-                }
                 // Detect false close: <think>short</think> where real thinking follows untagged
-                // Only applies when there's a second </think> later (model leaked thinking outside tags)
-                // Do NOT trigger if the text after </think> contains tool calls (that's real content)
-                if (!hasUnclosedThink && isThinking) {
-                  const _thinkMatch = roundText.match(/<think(?:ing)?>([\s\S]*?)<\/think(?:ing)?>/i);
+                // Do NOT require a prior unclosed delta: providers can emit the
+                // short open+close and leaked reasoning in one chunk.
+                let _falseCloseDeadline = 0;
+                if (!hasUnclosedThink) {
+                  const _thinkMatch = normalizedRoundText.match(/<(?:think(?:ing)?|thought)(?:\s+[^>]*)?>([\s\S]*?)<\/(?:think(?:ing)?|thought)>/i);
                   const _thinkLen = _thinkMatch ? _thinkMatch[1].trim().length : 0;
-                  if (_thinkLen < 20) {
-                    const _afterClose = roundText.replace(/<think(?:ing)?>([\s\S]*?)<\/think(?:ing)?>/i, '').trim();
+                  if (_thinkMatch && _thinkLen < 20) {
+                    const _afterClose = normalizedRoundText.replace(/<(?:think(?:ing)?|thought)(?:\s+[^>]*)?>([\s\S]*?)<\/(?:think(?:ing)?|thought)>/i, '').trim();
                     // Only keep waiting if there's trailing text that looks like thinking (not tool calls)
                     const _hasToolCall = /```(?:bash|python|web_search|read_file|write_file|create_document|edit_document|manage_|generate_image)/i.test(_afterClose);
-                    const _hasOrphanClose = /<\/think(?:ing)?>/i.test(_afterClose);
-                    if (!_hasToolCall && (_hasOrphanClose || (Date.now() - thinkingStartTime) < 500)) {
-                      hasUnclosedThink = true; // keep waiting for real </think>
+                    const _hasOrphanClose = /<\/(?:think(?:ing)?|thought)>/i.test(_afterClose);
+                    const _falseCloseStart = thinkingStartTime || Date.now();
+                    if (_afterClose && !_hasToolCall && !_hasOrphanClose && (Date.now() - _falseCloseStart) < 500) {
+                      hasUnclosedThink = true;
+                      _falseCloseDeadline = _falseCloseStart + 500;
+                      if (isThinking) {
+                        _thinkingRecheckAt = _falseCloseDeadline;
+                        _scheduleThinkingGrace();
+                      }
+                    } else if (isThinking) {
+                      _cancelThinkingGrace();
                     }
                   }
                 }
 
                 if (hasUnclosedThink && !isThinking) {
                   isThinking = true;
+                  _thinkingMode = /<(?:think(?:ing)?|thought)(?:\s+[^>]*)?>|<\|channel>thought/i.test(normalizedRoundText)
+                    ? 'tag'
+                    : 'prefix';
                   thinkingStartTime = Date.now();
+                  _thinkingRecheckAt = _falseCloseDeadline || 0;
                   if (spinner && spinner.element) spinner.destroy();
 
                   // Create a live thinking box — starts expanded so content streams visibly
@@ -1468,9 +3998,9 @@ import createResearchSynapse from './researchSynapse.js';
                         <div class="thinking-header-left"><span class="live-think-header-text">Thinking\u2026</span></div>
                         <span class="live-think-spinner-slot" style="flex-shrink:0;margin-left:auto;"></span>
                         <span class="live-think-timer" style="font-size:11px;opacity:0.4;font-variant-numeric:tabular-nums;margin-left:6px;margin-right:5px;"></span>
-                        <span class="thinking-toggle live-think-toggle" id="${_liveThinkDomId}-toggle"></span>
+                        <span class="thinking-toggle live-think-toggle expanded" id="${_liveThinkDomId}-toggle"></span>
                       </div>
-                      <div class="thinking-content" id="${_liveThinkDomId}">
+                      <div class="thinking-content expanded" id="${_liveThinkDomId}">
                         <div class="thinking-content-inner live-think-inner"></div>
                       </div>
                     </div>`;
@@ -1481,16 +4011,9 @@ import createResearchSynapse from './researchSynapse.js';
                   _liveThinkSpinnerSlot = thinkContent.querySelector('.live-think-spinner-slot');
                   _liveThinkTimerEl = thinkContent.querySelector('.live-think-timer');
                   _liveThinkToggle = thinkContent.querySelector('.live-think-toggle');
-                  // Live timer
-                  var _thinkTimerStart = Date.now();
-                  var _thinkTimerRAF = 0;
-                  function _tickThinkTimer() {
-                    if (!_liveThinkTimerEl || !_liveThinkTimerEl.isConnected) return;
-                    var s = ((Date.now() - _thinkTimerStart) / 1000).toFixed(1);
-                    _liveThinkTimerEl.textContent = s + 's';
-                    _thinkTimerRAF = requestAnimationFrame(_tickThinkTimer);
-                  }
-                  _thinkTimerRAF = requestAnimationFrame(_tickThinkTimer);
+                  _liveThinkLatestText = '';
+                  _cancelLiveThinkingWork();
+                  _queueLiveThinking(roundText);
                   // Whirlpool spinner
                   if (_liveThinkSpinnerSlot) {
                     var _wp = spinnerModule.createWhirlpool(12);
@@ -1500,89 +4023,22 @@ import createResearchSynapse from './researchSynapse.js';
                     _wp.element.style.transform = 'translateY(-1px)'; // align the whirlpool with the header text
                     _liveThinkSpinnerSlot.appendChild(_wp.element);
                   }
+                  if (_thinkingRecheckAt) _scheduleThinkingGrace();
                 } else if (hasUnclosedThink && isThinking) {
-                  if (_liveThinkInner) {
-                    // Extract raw thinking text (strip all <think>/<thinking> open/close tags and prefixes)
-                    var thinkText = roundText.replace(/<\/?think(?:ing)?>/gi, '');
-                    thinkText = thinkText.replace(/^\s*Thinking(?:\s+Process)?:\s*/i, '');
-                    _liveThinkInner.innerHTML = markdownModule.mdToHtml(thinkText);
-                    // Keep thinking box scrolled to bottom
-                    var thinkBox = _liveThinkInner.closest('.thinking-content');
-                    if (thinkBox) thinkBox.scrollTop = thinkBox.scrollHeight;
-                  }
-                  uiModule.scrollHistory();
+                  _queueLiveThinking(roundText);
                   continue;
                 } else if (!hasUnclosedThink && isThinking) {
-                  isThinking = false;
-                  var _thinkTextLen = _liveThinkInner ? _liveThinkInner.textContent.trim().length : 0;
-
-                  // If thinking was trivially short (< 20 chars), remove the section entirely
-                  // Models sometimes emit <think>The</think> or similar noise
-                  if (_thinkTextLen < 20 && _liveThinkSection) {
-                    _liveThinkSection.remove();
-                    _liveThinkSection = null;
-                    _liveThinkContent = null;
-                    _liveThinkInner = null;
-                    _liveThinkHeader = null;
-                    _liveThinkSpinnerSlot = null;
-                    _liveThinkTimerEl = null;
-                    _liveThinkToggle = null;
-                    _liveThinkDomId = null;
-                    // Fall through to normal streaming
-                    if (spinner && spinner.element) spinner.destroy();
-                    _renderStream();
-                    _scheduleThinkingSpinner();
-                    continue;
-                  }
-
-                  // Thinking ended — smooth transition: update header, pause, then collapse
-                  // Stop live timer and spinner
-                  cancelAnimationFrame(_thinkTimerRAF);
-                  var elapsed = thinkingStartTime ? ((Date.now() - thinkingStartTime) / 1000).toFixed(1) : null;
-                  // Embed thinking time in the <think> tag for persistence on reload
-                  if (elapsed) {
-                    accumulated = accumulated.replace(/<think>/i, '<think time="' + elapsed + '">');
-                    roundText = roundText.replace(/<think>/i, '<think time="' + elapsed + '">');
-                  }
-                  if (_liveThinkHeader) _liveThinkHeader.textContent = 'View thinking process';
-                  if (_liveThinkSpinnerSlot) _liveThinkSpinnerSlot.remove();
-                  // Move timer to right side of header
-                  if (_liveThinkTimerEl && elapsed) {
-                    _liveThinkTimerEl.textContent = elapsed + 's';
-                    _liveThinkTimerEl.style.marginLeft = 'auto';
-                    _liveThinkTimerEl.style.marginRight = '5px';
-                    var _hdrRow = _liveThinkTimerEl.closest('.thinking-header');
-                    // Chevron furthest right, timer to its left — insert before
-                    // the toggle (appending would put the timer after it).
-                    if (_hdrRow) {
-                      if (_liveThinkToggle && _liveThinkToggle.parentElement === _hdrRow)
-                        _hdrRow.insertBefore(_liveThinkTimerEl, _liveThinkToggle);
-                      else _hdrRow.appendChild(_liveThinkTimerEl);
-                    }
-                  }
-
-                  // Assign stable IDs (for click-toggle handler in markdown.js)
-                  var _thinkId = 'think-' + Date.now();
-                  var _liveHdr = _liveThinkSection && _liveThinkSection.querySelector('.thinking-header');
-                  if (_liveHdr) _liveHdr.dataset.thinkingId = _thinkId;
-                  if (_liveThinkContent) _liveThinkContent.id = _thinkId;
-                  if (_liveThinkToggle) _liveThinkToggle.id = _thinkId + '-toggle';
-
-                  // Append a container for the reply text that follows thinking
-                  var _streamEl = _liveThinkSection ? _liveThinkSection.parentElement : roundHolder.querySelector('.stream-content');
-                  if (!_streamEl) _streamEl = roundHolder.querySelector('.body');
-                  if (_streamEl) {
-                    var _replyEl = document.createElement('div');
-                    _replyEl.className = 'live-reply-content';
-                    _streamEl.appendChild(_replyEl);
-                  }
-
-                  // Render any reply text that arrived with the closing </think> token
-                  _renderStream();
+                  _finishLiveThinkingTransition();
                 } else {
                   // Normal streaming
                   if (spinner && spinner.element) spinner.destroy();
-                  _renderStream();
+                  if (roundReplyText !== null) {
+                    roundReplyText += _delta;
+                    const replyDisplayText = _replyDisplayProjector.append(_delta, roundReplyText);
+                    _renderStream({ replyText: replyDisplayText });
+                  } else {
+                    _renderStream({ knownNormal: true, displayText: _roundDisplayProjector.current() });
+                  }
                   _scheduleThinkingSpinner();
                   // Feed streaming TTS with accumulated text
                   if (streamingTTS) window.aiTTSManager.streamingUpdate(roundText);
@@ -1727,39 +4183,125 @@ import createResearchSynapse from './researchSynapse.js';
                   _sourcesData = json.data; _sourcesType = 'web';
                   _sourcesHtml = _buildSourcesBox(json.data, 'web');
                 }
-              } else if (json.type === 'model_fallback') {
-                // Model went offline — switched to fallback
-                var _fbData = json.data || {};
+              } else if (json.type === 'workspace_rejected') {
+                // Server refused to bind the posted workspace (deleted folder,
+                // file path, sensitive dir, filesystem root). Clear the stored
+                // value so the pill stops claiming a confinement that is not in
+                // effect, and tell the user.
+                const _wsPath = (json.data && json.data.path) || '';
+                import('./workspace.js').then((m) => {
+                  const ws = m.default || m;
+                  if (ws && ws.setWorkspace) ws.setWorkspace('');
+                });
                 uiModule.showToast(
-                  `Model ${_fbData.old_model || '?'} offline — switched to ${_fbData.new_model || '?'}`,
-                  5000
+                  `Workspace ${_wsPath || '(unknown)'} is no longer usable; running without confinement`,
+                  6000
                 );
-                // Update the model picker to reflect the new model
-                if (sessionModule && sessionModule.updateModelPicker) {
-                  sessionModule.updateModelPicker();
-                }
                 continue;
               } else if (json.type === 'model_info') {
                 // Update role label with model name as soon as we know it
                 if (!_isBg && holder) {
                   const roleEl = holder.querySelector('.role');
                   if (roleEl) {
-                    const tsSpan = roleEl.querySelector('.role-timestamp');
-                    var _modelLabel = _shortModel(json.model);
-                    if (json.suffix) {
-                      _modelLabel += ' (' + json.suffix + ')';
-                      holder._roleSuffix = json.suffix;
-                    }
+                    holder._requestedModel = json.requested_model || json.model || holder._requestedModel;
+                    holder._actualModel = json.model || holder._actualModel || holder._requestedModel;
+                    holder._requestedEndpointId = json.requested_endpoint_id || json.endpoint_id || holder._requestedEndpointId || null;
+                    holder._requestedEndpointLabel = json.requested_endpoint_label || json.endpoint_label || holder._requestedEndpointLabel || 'Selected route';
+                    holder._actualEndpointId = json.endpoint_id || holder._actualEndpointId || holder._requestedEndpointId;
+                    holder._actualEndpointLabel = json.endpoint_label || holder._actualEndpointLabel || holder._requestedEndpointLabel;
+                    if (json.suffix) holder._roleSuffix = json.suffix;
                     // Prepend character name if sent by server or set locally
                     var _charName = json.character_name || (presetsModule.getCharacterName ? presetsModule.getCharacterName() : '');
-                    if (_charName) {
-                      _modelLabel = _charName;
-                      holder._characterName = _charName;
-                    }
-                    roleEl.textContent = _modelLabel + ' ';
-                    _applyModelColor(roleEl, json.model);
-                    if (tsSpan) roleEl.appendChild(tsSpan);
+                    if (_charName) holder._characterName = _charName;
+                    _setRoleModelLabel(roleEl, holder._requestedModel, holder._actualModel, {
+                      suffix: holder._roleSuffix,
+                      characterName: holder._characterName,
+                      requestedEndpointId: holder._requestedEndpointId,
+                      requestedEndpointLabel: holder._requestedEndpointLabel,
+                      actualEndpointId: holder._actualEndpointId,
+                      actualEndpointLabel: holder._actualEndpointLabel,
+                    });
                   }
+                }
+              } else if (json.type === 'fallback') {
+                // The selected model failed and another provider answered. Make
+                // it visible so a misconfigured provider is never silently
+                // masked under the selected model's name.
+                if (!_isBg) {
+                  var _selM = _shortModel(json.selected_model || '');
+                  var _ansM = _shortModel(json.answered_by || '');
+                  uiModule.showToast('Fallback: ' + _selM + ' failed — answered by ' + _ansM, 6000);
+                  var _fallbackHolder = applyModelRouteEventState(json, holder, roundHolder, modelName);
+                  if (_fallbackHolder) {
+                    var _rEl = _fallbackHolder.querySelector('.role');
+                    if (_rEl) {
+                      var _tsS = _rEl.querySelector('.role-timestamp');
+                      _rEl.textContent = _ansM + ' (fallback) ';
+                      _rEl.title = (json.selected_model || '') + ' failed' +
+                        (json.reason ? ': ' + json.reason : '') + ' — answered by ' + (json.answered_by || '');
+                      _applyModelColor(_rEl, json.answered_by);
+                      if (_tsS) _rEl.appendChild(_tsS);
+                      _setRoleModelLabel(_rEl, _fallbackHolder._requestedModel, _fallbackHolder._actualModel, {
+                        suffix: _fallbackHolder._roleSuffix,
+                        characterName: _fallbackHolder._characterName,
+                        reason: json.reason,
+                        requestedEndpointId: _fallbackHolder._requestedEndpointId,
+                        requestedEndpointLabel: _fallbackHolder._requestedEndpointLabel,
+                        actualEndpointId: _fallbackHolder._actualEndpointId,
+                        actualEndpointLabel: _fallbackHolder._actualEndpointLabel,
+                      });
+                    }
+                  }
+                }
+              } else if (json.type === 'rounds_exhausted') {
+                // The agent hit the per-turn step limit while still working.
+                // Offer a Continue button instead of stalling silently.
+                // NOTE: append to the chat-history container (bottom), NOT the
+                // message body — the body innerHTML is re-rendered at stream
+                // finalize, which would wipe a note placed inside it.
+                const _chatBox = document.getElementById('chat-history');
+                if (!_isBg && _chatBox) {
+                  // Drop any prior box so repeated cap-hits each get a fresh
+                  // Continue at the bottom (multiple continues in a row).
+                  const _old = _chatBox.querySelector('.rounds-exhausted');
+                  if (_old) _old.remove();
+                  const note = document.createElement('div');
+                  note.className = 'stopped-indicator rounds-exhausted';
+                  const label = document.createElement('span');
+                  label.className = 'rounds-exhausted-label';
+                  label.textContent = `Reached the ${json.rounds || ''}-step limit — not finished.`;
+                  note.appendChild(label);
+                  const contBtn = document.createElement('button');
+                  contBtn.className = 'continue-btn';
+                  contBtn.title = 'Continue the task';
+                  contBtn.textContent = 'Continue ▸';
+                  const _holder = holder;
+                  contBtn.addEventListener('click', () => {
+                    note.remove();
+                    _hideUserBubble = true;
+                    _pendingContinue = _holder;
+                    const msgInput = uiModule.el('message');
+                    if (msgInput) {
+                      msgInput.value = 'You hit the step limit before finishing — the task is not complete. Continue from exactly where you left off and keep going until it is done. Do NOT repeat work already done.';
+                      const sb = document.querySelector('.send-btn');
+                      if (sb) sb.click();
+                    }
+                  });
+                  note.appendChild(contBtn);
+                  _chatBox.appendChild(note);
+                  try { note.scrollIntoView({ block: 'end', behavior: 'smooth' }); } catch (_) { uiModule.scrollHistory && uiModule.scrollHistory(); }
+                }
+              } else if (json.type === 'model_actual') {
+                if (!_isBg) {
+                  var _modelHolder = applyModelRouteEventState(json, holder, roundHolder, modelName);
+                  if (_modelHolder) _setRoleModelLabel(_modelHolder.querySelector('.role'), _modelHolder._requestedModel, _modelHolder._actualModel, {
+                    suffix: _modelHolder._roleSuffix,
+                    characterName: _modelHolder._characterName,
+                    requestedEndpointId: _modelHolder._requestedEndpointId,
+                    requestedEndpointLabel: _modelHolder._requestedEndpointLabel,
+                    actualEndpointId: _modelHolder._actualEndpointId,
+                    actualEndpointLabel: _modelHolder._actualEndpointLabel,
+                  });
                 }
               } else if (json.type === 'attachments') {
                 if (_isBg) continue;
@@ -1836,55 +4378,99 @@ import createResearchSynapse from './researchSynapse.js';
                 if (!_isBg) {
                   uiModule.showToast('Context compacted — older messages summarized');
                 }
+              } else if (json.type === 'context_trimmed') {
+                if (!_isBg) {
+                  const d = json.data || {};
+                  const before = Number(d.messages_before || 0);
+                  const after = Number(d.messages_after || 0);
+                  const detail = before && after && before > after ? ` (${after}/${before} messages sent)` : '';
+                  uiModule.showToast(`Context trimmed for this model${detail}`);
+                }
+              } else if (json.type === 'agent_terminal' || json.type === 'chat_terminal') {
+                try {
+                  window.dispatchEvent(new CustomEvent('odysseus:agent-terminal', { detail: json }));
+                } catch (_) {}
+                // The backend persisted canonical partial output, sanitized
+                // failure metadata, and actual-route provenance before this
+                // event. The terminal catch below reloads that exact record.
+                _canonicalTerminalSaved = true;
+                _terminalSavedStreams.add(streamSessionId);
+                const priorMetrics = metrics;
+                metrics = json.data || metrics;
+                if (metrics && streamRunId) {
+                  metrics._costRecordId = _metricsCostRecordId(streamRunId, json);
+                }
+                // Direct Chat may have emitted provider usage before its
+                // terminal event. Carry that already-recorded state onto the
+                // canonical terminal metadata instead of billing it twice.
+                if (priorMetrics && priorMetrics._costRecorded && metrics) {
+                  metrics._costRecorded = true;
+                }
+                if (_isBg) {
+                  var bgTerminal = _backgroundStreams.get(streamSessionId);
+                  if (bgTerminal) {
+                    if (
+                      bgTerminal.metrics
+                      && bgTerminal.metrics._costRecorded
+                      && metrics
+                    ) {
+                      metrics._costRecorded = true;
+                    }
+                    bgTerminal.metrics = metrics;
+                    bgTerminal.status = 'completed';
+                    if (metrics) {
+                      chatRenderer.recordSessionMetricsCost(metrics, streamSessionId);
+                    }
+                  }
+                  continue;
+                }
+                if (holder && metrics) {
+                  applyModelMetricsState(metrics, holder, roundHolder, modelName);
+                  const terminalMetricsTarget = _metricsTargetForTurn();
+                  if (terminalMetricsTarget) displayMetrics(terminalMetricsTarget, metrics);
+                }
               } else if (json.type === 'metrics') {
                 metrics = json.data;
+                if (metrics && _clientTtftSeconds != null) metrics.client_ttft = _clientTtftSeconds;
+                if (metrics && streamRunId) {
+                  metrics._costRecordId = _metricsCostRecordId(streamRunId, json);
+                }
+                if (!_isBg && holder && metrics) {
+                  applyModelMetricsState(metrics, holder, roundHolder, modelName);
+                }
                 if (_isBg) {
                   var bgM = _backgroundStreams.get(streamSessionId);
-                  if (bgM) bgM.metrics = json.data;
+                  if (bgM) {
+                    bgM.metrics = json.data;
+                    chatRenderer.recordSessionMetricsCost(bgM.metrics, streamSessionId);
+                  }
                   continue;
+                }
+                if (metrics) {
+                  const metricsTarget = _metricsTargetForTurn();
+                  if (metricsTarget) displayMetrics(metricsTarget, metrics);
+                  refreshChatContextHeader('metrics');
                 }
 
               } else if (json.type === 'message_saved') {
                 // Wire the persisted DB id onto the just-streamed bubble so it
                 // can be edited/deleted immediately, without reloading the chat.
                 if (_isBg) continue;
-                if (currentHolder && json.id) currentHolder.dataset.dbId = json.id;
+                if (json.id) _savedAssistantMessageId = String(json.id);
+                if (holder && json.id) holder.dataset.dbId = json.id;
 
               } else if (json.type === 'tool_start') {
+                _closeOpenThinkingMarkup(_isBg);
                 if (_isBg) continue;
                 _cancelThinkingTimer();
                 _removeThinkingSpinner();
                 // Force-close thinking if still open — tools are real content, not thinking
                 if (isThinking) {
-                  isThinking = false;
-                  cancelAnimationFrame(_thinkTimerRAF);
-                  var _elapsed2 = thinkingStartTime ? ((Date.now() - thinkingStartTime) / 1000).toFixed(1) : null;
-                  if (_liveThinkHeader) _liveThinkHeader.textContent = 'View thinking process';
-                  if (_liveThinkTimerEl) _liveThinkTimerEl.textContent = _elapsed2 ? _elapsed2 + 's' : '';
-                  if (_liveThinkSpinnerSlot) _liveThinkSpinnerSlot.remove();
-                  // Assign stable IDs
-                  var _thinkId2 = 'think-' + Date.now();
-                  var _liveHdr2 = _liveThinkSection && _liveThinkSection.querySelector('.thinking-header');
-                  if (_liveHdr2) _liveHdr2.dataset.thinkingId = _thinkId2;
-                  if (_liveThinkContent) _liveThinkContent.id = _thinkId2;
-                  if (_liveThinkToggle) _liveThinkToggle.id = _thinkId2 + '-toggle';
+                  _endLiveThinkingSection({ rich: false });
                 }
-                _renderStream();
                 // --- Finalize current text bubble (only once per round) ---
-                if (!roundFinalized) {
-                  roundFinalized = true;
-                  if (spinner && spinner.element) spinner.destroy();
-                  const dt = stripToolBlocks(roundText);
-                  if (dt.trim()) {
-                    var _body3 = roundHolder.querySelector('.body');
-                    var _contentEl3 = _ensureStreamLayout(_body3);
-                    _contentEl3.style.minHeight = '';  // clear streaming inflate
-                    _contentEl3.innerHTML = markdownModule.processWithThinking(markdownModule.squashOutsideCode(dt));
-                    if (window.hljs) roundHolder.querySelectorAll('pre code').forEach((b) => window.hljs.highlightElement(b));
-                  } else {
-                    roundHolder.style.display = 'none';
-                  }
-                }
+                if (spinner && spinner.element) spinner.destroy();
+                _finalizeRoundRender();
 
                 // Track tool name for contextual spinner labels
                 _lastToolName = json.tool || '';
@@ -1923,14 +4509,21 @@ import createResearchSynapse from './researchSynapse.js';
                   chatBox.appendChild(threadWrap);
                 }
                 threadWrap.classList.add('streaming');
-                const toolLabel = _toolLabels[json.tool.toLowerCase()] || json.tool;
-                const node = document.createElement('div')
-                node.className = 'agent-thread-node running';
-                const cmdHtml = cmd ? `<pre class="agent-thread-cmd">${esc(cmd)}</pre>` : '';
-                node.innerHTML = `<div class="agent-thread-dot"></div><div class="agent-thread-header"><span class="agent-thread-icon">\u25B6</span><span class="agent-thread-tool">${toolLabel}</span><span class="agent-thread-wave">▁▂▃</span></div><div class="agent-thread-content">${cmdHtml}</div>`;
+                lastToolThread = threadWrap;
+		                const toolInfo = _toolDisplayInfo(json.tool, cmd, json);
+	                const toolLabel = toolInfo.label || _toolLabels[json.tool.toLowerCase()] || json.tool;
+                const toolIcon = renderToolIcon(json.tool, cmd, json) || `<span class="agent-thread-icon">\u25B6</span>`;
+	                const toolHeaderAction = toolInfo.headerActionHtml || '';
+	                const node = document.createElement('div')
+	                node.className = 'agent-thread-node running' + (_isPrivateBrowserTool(json.tool) ? ' open browser-preview-node' : '');
+		                const cmdHtml = _isPrivateBrowserTool(json.tool) ? '' : (toolInfo.commandHtml || (cmd ? `<pre class="agent-thread-cmd">${esc(cmd)}</pre>` : ''));
+                node.innerHTML = `<div class="agent-thread-dot"></div><div class="agent-thread-header">${toolIcon}<span class="agent-thread-tool">${esc(toolLabel)}</span>${toolHeaderAction}<span class="agent-thread-wave">▁▂▃</span></div><div class="agent-thread-content">${cmdHtml}</div>`;
                 // Expand/collapse via delegated click handler (init at module bottom).
                 threadWrap.appendChild(node);
                 currentToolBubble = node;
+                if (_isPrivateBrowserTool(json.tool)) {
+                  _showPrivateBrowserPreview(json.command || '', node.querySelector('.agent-thread-content'));
+                }
                 // Animate the wave
                 const waveEl = node.querySelector('.agent-thread-wave');
                 if (waveEl) {
@@ -1970,6 +4563,29 @@ import createResearchSynapse from './researchSynapse.js';
                 // user doesn't stare at a blind "Running…" spinner.
                 if (_isBg) continue;
                 if (!currentToolBubble) continue;
+                const isImageProgress = /image/i.test(String(json.tool || '')) || /image/i.test(String(json.message || ''));
+                if (json.total || json.percent != null || isImageProgress) {
+                  const content = currentToolBubble.querySelector('.agent-thread-content');
+                  if (content) {
+                    let progressEl = currentToolBubble.querySelector('.agent-image-progress');
+	                    if (!progressEl) {
+	                      progressEl = document.createElement('div');
+	                      progressEl.className = 'agent-image-progress';
+	                      progressEl.innerHTML = '<div class="agent-image-progress-row"><span class="agent-image-progress-label"></span><span class="agent-image-progress-value"></span></div>';
+	                      content.appendChild(progressEl);
+	                    }
+                    const step = Number(json.step || 0);
+                    const total = Number(json.total || 0);
+                    const hasExactProgress = total > 0 || json.percent != null;
+                    progressEl.classList.toggle('is-indeterminate', !hasExactProgress);
+                    const pct = Number(json.percent != null ? json.percent : (total ? (step / total) * 100 : 0));
+	                    const bounded = Math.max(0, Math.min(100, Number.isFinite(pct) ? pct : 0));
+	                    const label = progressEl.querySelector('.agent-image-progress-label');
+	                    const value = progressEl.querySelector('.agent-image-progress-value');
+	                    if (label) label.textContent = json.message || 'Editing image…';
+	                    if (value) value.textContent = hasExactProgress ? (total ? `${step}/${total}` : `${Math.round(bounded)}%`) : (json.elapsed ? `${json.elapsed}s` : '');
+	                  }
+	                }
                 // The per-second ticker (started in tool_start) owns the
                 // elapsed display; here we just surface the live output tail.
                 const tailStr = (json.tail || '').trim();
@@ -1988,6 +4604,13 @@ import createResearchSynapse from './researchSynapse.js';
                 uiModule.scrollHistory();
 
               } else if (json.type === 'tool_output') {
+                // Let feature panels reconcile state from the actual tool
+                // result rather than trying to infer completion from the
+                // assistant's prose. Email unsubscribe uses this for the
+                // exact UIDs deleted by an agent follow-up.
+                try {
+                  window.dispatchEvent(new CustomEvent('odysseus:agent-tool-output', { detail: json }));
+                } catch (_) {}
                 if (_isBg) continue;
                 // --- Update the current thread node ---
                 if (currentToolBubble) {
@@ -2003,38 +4626,78 @@ import createResearchSynapse from './researchSynapse.js';
                   const ok = (json.exit_code === 0 || json.exit_code == null);
                   const cmd = json.command || '';
                   let outHtml = '';
-                  if (json.output && json.output.trim()) {
+                  if (!_suppressRawToolOutput(json.tool, ok) && json.output && json.output.trim()) {
                     outHtml = `<details class="agent-tool-output"><summary>Output</summary><pre>${esc(json.output)}</pre></details>`;
                   }
-                  const cmdHtml2 = cmd ? `<pre class="agent-thread-cmd">${esc(cmd)}</pre>` : '';
+                  // File-write diff (write_file): show a before/after unified diff.
+                  let diffHtml = '';
+                  if (json.diff && json.diff.text) {
+                    const d = json.diff;
+                    // Collapsed summary: filename + +adds (green) / −dels (red).
+                    const stat = [
+                      d.new_file ? '<span class="diff-stat-new">new</span>' : '',
+                      d.added ? `<span class="diff-stat-add">+${d.added}</span>` : '',
+                      d.removed ? `<span class="diff-stat-del">−${d.removed}</span>` : '',
+                    ].filter(Boolean).join(' ');
+                    const rows = d.text.split('\n').map(line => {
+                      let cls = 'diff-ctx', text = line;
+                      if (line.startsWith('+++') || line.startsWith('---')) cls = 'diff-meta';
+                      else if (line.startsWith('@@')) cls = 'diff-hunk';
+                      // Drop the leading diff marker (+/-/space) — the row colour
+                      // already encodes add/del, and keeping it doubles up with
+                      // markdown "- " bullets (reads as "+-"/"--").
+                      else if (line.startsWith('+')) { cls = 'diff-add'; text = line.slice(1); }
+                      else if (line.startsWith('-')) { cls = 'diff-del'; text = line.slice(1); }
+                      else if (line.startsWith(' ')) { text = line.slice(1); }
+                      return `<span class="${cls}">${esc(text) || '&nbsp;'}</span>`;
+                    }).join('');  // spans are display:block — a literal \n here would double-space the diff
+                    diffHtml = `<details class="agent-tool-output agent-tool-diff"><summary><span class="diff-file">${esc(d.file || 'diff')}</span> <span class="diff-summary-stats">${stat}</span></summary><pre class="diff-pre">${rows}</pre></details>`;
+                  }
+                  // For file edits the "command" is the raw JSON args — redundant
+                  // next to the diff, so hide it when we have a diff to show.
+	                  const toolInfo2 = _toolDisplayInfo(json.tool, cmd, json);
+		                  const browserTool = _isPrivateBrowserTool(json.tool);
+		                  const toolHeaderAction2 = toolInfo2.headerActionHtml || '';
+                  const toolIcon2 = renderToolIcon(json.tool, cmd, json);
+		                  const cmdHtml2 = browserTool ? '' : (toolInfo2.commandHtml || ((cmd && !(json.diff && json.diff.text)) ? `<pre class="agent-thread-cmd">${esc(cmd)}</pre>` : ''));
                   // Preserve the user's .open choice across the innerHTML
                   // rewrite \u2014 otherwise expanding a running tool collapses
                   // it as soon as the result lands, forcing the user to
                   // click again. Click handling is delegated (see init at
                   // bottom of file) so no per-node listener needed.
-                  const _wasOpen = currentToolBubble.classList.contains('open');
-                  currentToolBubble.className = 'agent-thread-node' + (ok ? '' : ' error') + (_wasOpen ? ' open' : '');
-                  currentToolBubble.innerHTML = `<div class="agent-thread-dot"></div><div class="agent-thread-header"><span class="agent-thread-icon">${ok ? '\u2713' : '\u2717'}</span><span class="agent-thread-tool">${esc(json.tool)}</span><span class="agent-thread-status">${ok ? 'done' : 'failed'}</span><span class="agent-thread-chevron">\u25B6</span></div><div class="agent-thread-content">${cmdHtml2}${outHtml}</div>`;
+	                  if (browserTool) {
+                    outHtml = _privateBrowserPreviewHtml(cmd, json.screenshot) + outHtml;
+                  }
+	                  const _wasOpen = currentToolBubble.classList.contains('open') || browserTool;
+                  currentToolBubble.className = 'agent-thread-node' + (ok ? '' : ' error') + (_wasOpen ? ' open' : '') + (browserTool ? ' browser-preview-node' : '');
+                  currentToolBubble.innerHTML = `<div class="agent-thread-dot"></div><div class="agent-thread-header"><span class="agent-thread-icon">${ok ? '\u2713' : '\u2717'}</span>${toolIcon2}<span class="agent-thread-tool">${esc(toolInfo2.label || json.tool)}</span>${toolHeaderAction2}<span class="agent-thread-status">${ok ? 'done' : 'failed'}</span><span class="agent-thread-chevron" aria-hidden="true"></span></div><div class="agent-thread-content">${cmdHtml2}${outHtml}${diffHtml}</div>`;
                   // Reset so thinking spinner between tools says "Thinking" not the old tool's label
                   _lastToolName = '';
                   uiModule.scrollHistory();
                 }
                 // --- Render generated images inline ---
                 if (json.image_url) {
-                  const chatBox = document.getElementById('chat-history');
-                  chatBox.appendChild(_buildImageBubble(json.image_url, json.image_prompt, json.image_model, json.image_size, json.image_quality, json.image_id));
-                  uiModule.scrollHistory();
-                  // Notify gallery to refresh if open
-                  window.dispatchEvent(new CustomEvent('gallery-refresh'));
+                  _rememberGeneratedImage(json);
+                  _appendGeneratedImageBubble(json, streamSessionId);
                 }
                 // --- Render browser screenshots in tool output ---
                 if (json.screenshot && currentToolBubble) {
                   const contentEl = currentToolBubble.querySelector('.agent-thread-content');
                   if (contentEl) {
-                    const details = document.createElement('details');
-                    details.className = 'agent-tool-output';
-                    details.innerHTML = `<summary>Screenshot</summary><img src="${json.screenshot}" style="max-width:100%;border-radius:6px;margin-top:6px;border:1px solid var(--border)" />`;
-                    contentEl.appendChild(details);
+                    _updatePrivateBrowserPreview(json, contentEl);
+                    const screenshotSrc = chatRenderer.safeToolScreenshotSrc(json.screenshot);
+                    if (screenshotSrc && !_isPrivateBrowserTool(json.tool)) {
+                      const details = document.createElement('details');
+                      details.className = 'agent-tool-output';
+                      const summary = document.createElement('summary');
+                      summary.textContent = 'Screenshot';
+                      const img = document.createElement('img');
+                      img.src = screenshotSrc;
+                      img.style.cssText = 'max-width:100%;border-radius:6px;margin-top:6px;border:1px solid var(--border)';
+                      details.appendChild(summary);
+                      details.appendChild(img);
+                      contentEl.appendChild(details);
+                    }
                   }
                 }
                 // --- Reload sessions after manage_session tool (delete, rename, etc.) ---
@@ -2060,6 +4723,35 @@ import createResearchSynapse from './researchSynapse.js';
                 // --- Apply UI control actions embedded in tool_output ---
                 if (json.ui_event) {
                   chatStream.handleUIControl(json);
+                }
+                // Native document tool calls can arrive as a completed
+                // tool_output without the text-fence streaming path. Open the
+                // document editor from the real doc metadata carried on the
+                // tool result so "create a document" never leaves only a chat
+                // link behind if the later doc_update event is missed.
+                if (
+                  documentModule
+                  && json.doc_id
+                  && ['create_document', 'update_document', 'edit_document',
+                      'draft_email', 'mcp__email__draft_email',
+                      'draft_email_reply', 'mcp__email__draft_email_reply',
+                      'ai_draft_email_reply', 'mcp__email__ai_draft_email_reply'].includes(json.tool)
+                ) {
+                  if (['draft_email', 'mcp__email__draft_email',
+                       'draft_email_reply', 'mcp__email__draft_email_reply',
+                       'ai_draft_email_reply', 'mcp__email__ai_draft_email_reply'].includes(json.tool)
+                      && documentModule.loadDocument) {
+                    documentModule.loadDocument(json.doc_id);
+                  } else {
+                    documentModule.handleDocUpdate({
+                      type: 'doc_update',
+                      doc_id: json.doc_id,
+                      title: json.document_title || '',
+                      language: json.document_language || '',
+                      version: json.document_version || 1,
+                      content: json.document_content || '',
+                    });
+                  }
                 }
 
                 // Schedule a thinking spinner between tool rounds (short delay so
@@ -2109,11 +4801,38 @@ import createResearchSynapse from './researchSynapse.js';
                 if (_isBg) continue;
                 chatStream.handleUIControl(json.data || {});
 
+              } else if (json.type === 'ask_user') {
+                if (_isBg) continue;
+                // The agent posed a multiple-choice question; the turn has ended.
+                // Use the shared history renderer so the live and restored
+                // versions have identical behavior.
+                _cancelThinkingTimer();
+                _removeThinkingSpinner();
+                chatRenderer.renderAskUserCard(json.data || {});
+
+              } else if (json.type === 'plan_update') {
+                if (_isBg) continue;
+                // Agent wrote back to the plan (ticked a step / revised). Update
+                // the stored plan + live-refresh the docked plan window.
+                const _pu = (json.data && json.data.plan) ? json.data.plan : '';
+                if (_pu) _setStoredPlan(_pu);
+
               } else if (json.type === 'agent_step') {
+                if (!_turnRendering.accepts(json)) continue;
+                if (!startsContinuationRound(json)) {
+                  if (spinner && spinner.element) spinner.updateMessage('Generating response');
+                  continue;
+                }
+                _closeOpenThinkingMarkup(_isBg);
                 if (_isBg) continue;
                 _cancelThinkingTimer();
                 _removeThinkingSpinner();
-                _renderStream();
+                if (isThinking) {
+                  _endLiveThinkingSection({ rich: false });
+                } else {
+                  _cancelLiveThinkingWork();
+                }
+                _finalizeRoundRender();
                 // Mark thread as connected to bubble below
                 const _activeThread = document.querySelector('.agent-thread.streaming');
                 if (_activeThread) {
@@ -2122,9 +4841,16 @@ import createResearchSynapse from './researchSynapse.js';
                 // --- New round: create fresh AI bubble with spinner ---
                 currentToolBubble = null;
                 roundFinalized = false;
+                terminalFinalResponseRendered = false;
+                roundFinalization = null;
                 isThinking = false;
+                roundReplyText = null;
+                _thinkingMode = null;
+                _thinkingRecheckAt = 0;
+                _thinkingAnalysisGate.reset();
+                _roundDisplayProjector.reset();
+                _replyDisplayProjector.reset();
                 _docFenceOpened = false;
-                _docFenceContentStart = -1;
                 const box = document.getElementById('chat-history');
                 const newWrap = document.createElement('div');
                 newWrap.className = 'msg msg-ai msg-continuation streaming';
@@ -2132,8 +4858,18 @@ import createResearchSynapse from './researchSynapse.js';
                 const newRole = document.createElement('div');
                 newRole.className = 'role';
                 const metaS = sessionModule.getSessions().find(s => s.id === streamSessionId);
-                newRole.textContent = _shortModel(metaS?.model) || '';
-                _applyModelColor(newRole, metaS?.model);
+                inheritModelRouteState(holder, roundHolder, newWrap, metaS?.model || modelName);
+                const _roundRequested = newWrap._requestedModel;
+                const _roundActual = newWrap._actualModel;
+                newRole.textContent = _modelRouteLabel(
+                  _roundRequested,
+                  _roundActual,
+                  newWrap._requestedEndpointLabel,
+                  newWrap._actualEndpointLabel,
+                  newWrap._requestedEndpointId,
+                  newWrap._actualEndpointId,
+                ) || '';
+                _applyModelColor(newRole, _roundActual);
                 newWrap.appendChild(newRole);
                 const newBody = document.createElement('div');
                 newBody.className = 'body';
@@ -2161,7 +4897,24 @@ import createResearchSynapse from './researchSynapse.js';
                 const chatBox = document.getElementById('chat-history');
                 chatBox.appendChild(budgetDiv);
 
+              } else if (json.type === 'loop_breaker_triggered' || json.type === 'intent_nudge_exhausted') {
+                if (_isBg) continue;
+                _cancelThinkingTimer();
+                _removeThinkingSpinner();
+                const guardDiv = document.createElement('div');
+                guardDiv.className = 'stopped-indicator';
+                const guardLabel = document.createElement('span');
+                guardLabel.textContent = `[Agent guard: ${json.message || json.reason || 'internal stop'}]`;
+                guardDiv.appendChild(guardLabel);
+                const targetBody = roundHolder && roundHolder.querySelector('.body');
+                if (targetBody) targetBody.appendChild(guardDiv);
+                else {
+                  const chatBox = document.getElementById('chat-history');
+                  if (chatBox) chatBox.appendChild(guardDiv);
+                }
+
               } else if (json.type === 'teacher_takeover') {
+                if (!_turnRendering.accepts(json)) continue;
                 if (_isBg) continue;
                 _cancelThinkingTimer();
                 _removeThinkingSpinner();
@@ -2180,6 +4933,8 @@ import createResearchSynapse from './researchSynapse.js';
                 roundHolder = null;
                 roundText = '';
                 roundFinalized = false;
+                terminalFinalResponseRendered = false;
+                roundFinalization = null;
                 currentToolBubble = null;
                 uiModule.scrollHistory();
 
@@ -2222,31 +4977,68 @@ import createResearchSynapse from './researchSynapse.js';
         }
       }
 
-      _renderStream();
+      if (_streamTerminalError) {
+        throw _streamTerminalError;
+      }
+      if (!_streamSawDone) {
+        if (!_canonicalTerminalSaved) {
+          throw new Error('Stream closed before completion');
+        }
+        // The backend persisted a canonical terminal record (partial output +
+        // failure metadata) before the connection died. Route through the
+        // terminal-error path so that record is reloaded; falling through to
+        // the success renderer would present the partial output as a clean
+        // completion.
+        throw createTerminalStreamError({
+          text: 'Stream closed after canonical terminal event',
+        });
+      }
+
+      // The final foreground render below is authoritative. Cancel any delayed
+      // live-view work instead of parsing and rendering the full round once
+      // here and then immediately replacing it.
+      _cancelLiveThinkingWork();
+      if (spinner && spinner.element) { try { spinner.destroy(); } catch (_) {} spinner = null; }
       _cancelThinkingTimer();
       _removeThinkingSpinner();
       // Stop any thread pulse animations
       document.querySelectorAll('.agent-thread.streaming').forEach(t => t.classList.remove('streaming'));
       // --- Final render (skip if stream was ever backgrounded or currently in background) ---
+      const _isBgFinal = (sessionModule.getCurrentSessionId() !== streamSessionId) || _backgroundStreams.has(streamSessionId);
+      if (!_isBgFinal) {
+        if (!terminalFinalResponseRendered && !_turnRendering.isVisible(roundHolder.querySelector('.body'), _terminalAnswerHtml(roundText, roundHolder.querySelector('.body')))) _renderStream();
+        if (spinner && spinner.element) { try { spinner.destroy(); } catch (_) {} spinner = null; }
+        _cancelThinkingTimer();
+        _removeThinkingSpinner();
+        // Stop this visible thread's pulse animations.
+        document.querySelectorAll('#chat-history .agent-thread.streaming').forEach(t => t.classList.remove('streaming'));
+      }
       // Remove streaming class from all round bubbles
       holder.classList.remove('streaming');
       if (roundHolder && roundHolder !== holder) roundHolder.classList.remove('streaming');
 
-      const _isBgFinal = (sessionModule.getCurrentSessionId() !== streamSessionId) || _backgroundStreams.has(streamSessionId);
       if (!_isBgFinal) {
         finalMeta = sessionModule.getSessions().find(s => s.id === sessionModule.getCurrentSessionId());
-        finalModelName = _shortModel(metrics?.model || finalMeta?.model);
-        // Preserve suffix (e.g. "Research") if set by model_info event
-        if (holder._roleSuffix) finalModelName += ' (' + holder._roleSuffix + ')';
+        const _finalModelHolder = applyModelMetricsState(
+          metrics,
+          holder,
+          roundHolder,
+          finalMeta?.model || modelName,
+        ) || holder;
+        const _finalActualModel = _finalModelHolder._actualModel || finalMeta?.model;
+        const _finalRequestedModel = _finalModelHolder._requestedModel || finalMeta?.model || _finalActualModel;
         // Prepend character name if set
         var _charNameFinal = presetsModule.getCharacterName ? presetsModule.getCharacterName() : '';
-        if (_charNameFinal) finalModelName = _charNameFinal;
-        const roleEl = holder.querySelector('.role');
+        const roleEl = _finalModelHolder.querySelector('.role');
         if (roleEl) {
-          const tsSpan = roleEl.querySelector('.role-timestamp');
-          roleEl.textContent = finalModelName + ' ';
-          _applyModelColor(roleEl, metrics?.model || finalMeta?.model);
-          if (tsSpan) roleEl.appendChild(tsSpan);
+          _setRoleModelLabel(roleEl, _finalRequestedModel, _finalActualModel, {
+            suffix: _finalModelHolder._roleSuffix,
+            characterName: _charNameFinal || _finalModelHolder._characterName,
+            requestedEndpointId: _finalModelHolder._requestedEndpointId,
+            requestedEndpointLabel: _finalModelHolder._requestedEndpointLabel,
+            actualEndpointId: _finalModelHolder._actualEndpointId,
+            actualEndpointLabel: _finalModelHolder._actualEndpointLabel,
+          });
         }
         holder.dataset.raw = accumulated;
 
@@ -2266,9 +5058,9 @@ import createResearchSynapse from './researchSynapse.js';
             _lbl.textContent = 'Paused mid-task';
             _stall.appendChild(_lbl);
             const _cont = document.createElement('button');
-            _cont.className = 'continue-btn agent-continue-btn';
+            _cont.className = 'continue-btn resume-btn agent-continue-btn';
             _cont.title = 'Continue — pick up where it left off';
-            _cont.textContent = '▸';
+            _cont.innerHTML = '<span class="resume-btn-label">Resume</span><svg class="resume-btn-icon" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="m8 5 10 7-10 7z"></path></svg>';
             _cont.addEventListener('click', () => {
               _stall.remove();
               const mi = uiModule.el('message');
@@ -2283,82 +5075,101 @@ import createResearchSynapse from './researchSynapse.js';
           }
         } catch (_) {}
 
+        const _terminalScrollSnapshot = uiModule.captureHistoryScroll?.();
+
         // Clear streaming minHeight lock
         const _streamContent = roundHolder.querySelector('.stream-content');
         if (_streamContent) _streamContent.style.minHeight = '';
+        if (_docFenceOpened) {
+          _finishDocumentWritingStatus(roundHolder, true);
+          roundHolder.style.display = '';
+        }
 
         // Finalize the last round's bubble — flatten stream-content wrapper for clean DOM
-        const finalDisplay = stripToolBlocks(roundText);
-        if (finalDisplay.trim()) {
-          var _body4 = roundHolder.querySelector('.body');
-          // Preserve sources expanded state before final render
-          var _wasExpanded = _sourcesExpanded || !!(_body4 && _body4.querySelector('.sources-content.expanded'));
+		        const finalDisplay = terminalFinalResponseRendered ? '' : _streamDisplayText(roundText, { final: _docFenceOpened });
+	        if (terminalFinalResponseRendered) {
+              // A canonical answer must not fall through to the empty-round
+              // branch below, which hides continuation bubbles.
+              _renderTerminalAnswer(roundText);
+            } else if (finalDisplay.trim() && _turnRendering.isVisible(roundHolder.querySelector('.body'), _terminalAnswerHtml(finalDisplay, roundHolder.querySelector('.body')))) {
+              // Preserve the actual streamed nodes, including selection.
+            } else if (finalDisplay.trim()) {
+	          var _body4 = roundHolder.querySelector('.body');
+	          // Preserve sources expanded state before final render
+	          var _wasExpanded = _sourcesExpanded || !!(_body4 && _body4.querySelector('.sources-content.expanded'));
+	          if (_suppressThinkingForPersona()) {
+	            const _personaFinal = _visiblePersonaReplyText(finalDisplay);
+	            _body4.innerHTML = (_sourcesData ? _buildSourcesBox(_sourcesData, _sourcesType, _wasExpanded) : '')
+	              + (_personaFinal.trim() ? markdownModule.mdToHtml(markdownModule.squashOutsideCode(_personaFinal)) : '')
+	              + (_findingsData ? chatRenderer.buildFindingsBox(_findingsData) : '');
+	          } else {
 
-          // If thinking was collapsed in-place during streaming, preserve it
-          var _liveReplyEl = _body4 && _body4.querySelector('.live-reply-content');
-          var _extracted = _liveReplyEl ? markdownModule.extractThinkingBlocks(finalDisplay) : null;
-          var _finalReply = '';
-          if (_liveReplyEl) {
-            // Try standard extraction first (for native <think> tags)
-            if (_extracted?.thinkingBlocks?.length) {
-              _finalReply = (_extracted.content || '').trim();
-            } else {
-              // Non-tag thinking: extract reply from raw text
-              // Handle garbled <think> tag: "Thinking: reasoning\n<think>reply"
-              const _garbledMatch = finalDisplay.match(/^[\s\S]+?<think(?:ing)?>\s*([\s\S]*?)(?:<\/think(?:ing)?>)?\s*$/i);
-              if (_garbledMatch && _garbledMatch[1].trim()) {
-                _finalReply = _garbledMatch[1].trim();
-              } else {
-                // Pure non-tag: find reply boundary by prefix patterns
-                const _rs2 = ['Hey', 'Hi ', 'Hi!', 'Hello', 'Sure', 'Yes', 'No ', 'No,', 'Yo', 'OK', 'Here', 'Absolutely', 'Of course', 'Great', 'Alright', 'Thanks', 'Welcome', 'Good ', "I'm happy", "I'd be"];
-                const _fr = (finalDisplay || '').trimStart();
-                if (markdownModule.startsWithReasoningPrefix(_fr)) {
-                  const _fLines = _fr.split('\n');
-                  for (let _fi = 1; _fi < _fLines.length; _fi++) {
-                    const _fl = _fLines[_fi].trim();
-                    if (!_fl) continue;
-                    if (_rs2.some(rp => _fl.startsWith(rp))) { _finalReply = _fLines.slice(_fi).join('\n'); break; }
-                  }
-                  // Within-line check
-                  if (!_finalReply) {
-                    for (const rp of _rs2) {
-                      const rx = new RegExp('[.!?]\\s*(' + rp.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')');
-                      const m = rx.exec(_fr);
-                      if (m && m.index > 20) { _finalReply = _fr.slice(m.index + 1).trim(); break; }
-                    }
-                  }
-                }
-              }
-            }
-          }
-          if (_liveReplyEl && _finalReply) {
-            // Render reply into the live-reply container (thinking bar already showing)
-            var _replyHtml = markdownModule.mdToHtml(markdownModule.squashOutsideCode(_finalReply));
-            _liveReplyEl.innerHTML = _replyHtml;
-            _liveReplyEl.classList.remove('live-reply-content');
-            if (_sourcesData) {
-              var _srcEl = document.createElement('div');
-              _srcEl.innerHTML = _buildSourcesBox(_sourcesData, _sourcesType, _wasExpanded);
-              _body4.insertBefore(_srcEl.firstChild || _srcEl, _body4.firstChild);
-            }
-            if (_findingsData) _body4.insertAdjacentHTML('beforeend', chatRenderer.buildFindingsBox(_findingsData));
-          } else {
-            // Full re-render (reply empty or no live-reply container)
-            _body4.innerHTML = (_sourcesData ? _buildSourcesBox(_sourcesData, _sourcesType, _wasExpanded) : '')
-              + markdownModule.processWithThinking(markdownModule.squashOutsideCode(finalDisplay))
-              + (_findingsData ? chatRenderer.buildFindingsBox(_findingsData) : '');
-          }
+	            // If thinking was collapsed in-place during streaming, preserve it
+	            var _liveReplyEl = _body4 && _body4.querySelector('.live-reply-content');
+	            var _extracted = _liveReplyEl ? markdownModule.extractThinkingBlocks(finalDisplay) : null;
+	            var _finalReply = '';
+	            if (_liveReplyEl) {
+	              // Try standard extraction first (for native <think> tags)
+	              if (_extracted?.thinkingBlocks?.length) {
+	                _finalReply = (_extracted.content || '').trim();
+	              } else {
+	                // Non-tag thinking: extract reply from raw text
+	                // Handle garbled thinking tag: "Thinking: reasoning\n<think>reply"
+	                const _garbledMatch = finalDisplay.match(/^[\s\S]+?<(?:think(?:ing)?|thought)(?:\s+[^>]*)?>\s*([\s\S]*?)(?:<\/(?:think(?:ing)?|thought)>)?\s*$/i);
+	                if (_garbledMatch && _garbledMatch[1].trim()) {
+	                  _finalReply = _garbledMatch[1].trim();
+	                } else {
+	                  // Pure non-tag: find reply boundary by prefix patterns
+	                  const _rs2 = ['Hey', 'Hi ', 'Hi!', 'Hello', 'Sure', 'Yes', 'No ', 'No,', 'Yo', 'OK', 'Here', 'Absolutely', 'Of course', 'Great', 'Alright', 'Thanks', 'Welcome', 'Good ', "I'm happy", "I'd be"];
+	                  const _fr = (finalDisplay || '').trimStart();
+	                  if (markdownModule.startsWithReasoningPrefix(_fr)) {
+	                    const _fLines = _fr.split('\n');
+	                    for (let _fi = 1; _fi < _fLines.length; _fi++) {
+	                      const _fl = _fLines[_fi].trim();
+	                      if (!_fl) continue;
+	                      if (_rs2.some(rp => _fl.startsWith(rp))) { _finalReply = _fLines.slice(_fi).join('\n'); break; }
+	                    }
+	                    // Within-line check
+	                    if (!_finalReply) {
+	                      for (const rp of _rs2) {
+	                        const rx = new RegExp('[.!?]\\s*(' + rp.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')');
+	                        const m = rx.exec(_fr);
+	                        if (m && m.index > 20) { _finalReply = _fr.slice(m.index + 1).trim(); break; }
+	                      }
+	                    }
+	                  }
+	                }
+	              }
+	            }
+	            if (_liveReplyEl && _finalReply) {
+	              // Render reply into the live-reply container (thinking bar already showing)
+	              var _replyHtml = markdownModule.mdToHtml(markdownModule.squashOutsideCode(_finalReply));
+	              _liveReplyEl.innerHTML = _replyHtml;
+	              _liveReplyEl.classList.remove('live-reply-content');
+	              if (_sourcesData) {
+	                var _srcEl = document.createElement('div');
+	                _srcEl.innerHTML = _buildSourcesBox(_sourcesData, _sourcesType, _wasExpanded);
+	                _body4.insertBefore(_srcEl.firstChild || _srcEl, _body4.firstChild);
+	              }
+	              if (_findingsData) _body4.insertAdjacentHTML('beforeend', chatRenderer.buildFindingsBox(_findingsData));
+	            } else {
+	              // Full re-render (reply empty or no live-reply container)
+	              _body4.innerHTML = (_sourcesData ? _buildSourcesBox(_sourcesData, _sourcesType, _wasExpanded) : '')
+	                + markdownModule.processWithThinking(markdownModule.squashOutsideCode(finalDisplay))
+	                + (_findingsData ? chatRenderer.buildFindingsBox(_findingsData) : '');
+	            }
+	          }
         } else if (_sourcesHtml) {
           var _body4b = roundHolder.querySelector('.body');
           var _wasExpanded2 = _sourcesExpanded || !!(_body4b && _body4b.querySelector('.sources-content.expanded'));
           _body4b.innerHTML = _sourcesData ? _buildSourcesBox(_sourcesData, _sourcesType, _wasExpanded2) : _sourcesHtml;
         } else if (roundHolder !== holder) {
           // Check if there's thinking content worth showing
-          const _thinkMatch = roundText.match(/<think(?:ing)?>([\s\S]*?)<\/think(?:ing)?>/i);
-          if (_thinkMatch && _thinkMatch[1].trim()) {
+          const _thinkingOnly = markdownModule.extractThinkingBlocks(_streamDisplayText(roundText));
+          if (_thinkingOnly.thinkingBlocks?.length && !_thinkingOnly.content) {
             // Show thinking in a collapsed section even if no visible reply text
             const _body4c = roundHolder.querySelector('.body');
-            if (_body4c) _body4c.innerHTML = markdownModule.processWithThinking(roundText);
+            if (_body4c) _body4c.innerHTML = markdownModule.processWithThinking(_streamDisplayText(roundText));
           } else {
             roundHolder.style.display = 'none';
             // Thread above expected a bubble below — remove has-bottom since bubble is hidden
@@ -2377,7 +5188,6 @@ import createResearchSynapse from './researchSynapse.js';
         }
         if (markdownModule.renderMermaid) markdownModule.renderMermaid(roundHolder);
 
-        uiModule.scrollHistory();
         // Render RAG sources if present
         if (holder._ragSources && holder._ragSources.length) {
           const details = document.createElement('details');
@@ -2404,16 +5214,28 @@ import createResearchSynapse from './researchSynapse.js';
 
         // Attach footer to the last visible bubble (roundHolder for multi-round agent, holder for single)
         const footerTarget = (roundHolder && roundHolder !== holder && roundHolder.style.display !== 'none') ? roundHolder : holder;
-        footerTarget.appendChild(createMsgFooter(footerTarget));
+        if (!footerTarget.querySelector('.msg-footer')) {
+          footerTarget.appendChild(createMsgFooter(footerTarget));
+        }
+        if (_generatedImagesForTurn.length && !_isBg) {
+          _generatedImagesForTurn.forEach(imgData => _appendGeneratedImageBubble(imgData, streamSessionId));
+        }
         // Add "View Report" link for completed research
         if (_researchingStreamIds.has(streamSessionId)) {
           _appendViewReportLink(footerTarget, streamSessionId);
         }
         // Also store raw on the footer target so copy/TTS work
-        if (footerTarget !== holder) footerTarget.dataset.raw = accumulated;
-        if (addAITTSButton && accumulated && window.aiTTSManager?._provider !== 'disabled' && window.aiTTSManager?.available) {
-          addAITTSButton(footerTarget, accumulated);
-        }
+	        if (footerTarget !== holder) footerTarget.dataset.raw = accumulated;
+		        try {
+		          const _endToggles = Storage.loadToggleState();
+		          if (_endToggles.plan_mode && accumulated) {
+		            _setStoredPlan(accumulated);
+		            _attachPlanActions(footerTarget, accumulated);
+		          }
+		        } catch (_) {}
+	        if (addAITTSButton && accumulated && window.aiTTSManager?._provider !== 'disabled' && window.aiTTSManager?.available) {
+	          addAITTSButton(footerTarget, accumulated);
+	        }
         // TTS auto-play: streaming mode flushes remaining text, non-streaming enqueues full message
         if (accumulated && window.aiTTSManager && window.aiTTSManager.autoPlay) {
           const ttsBtn = holder.querySelector('.ai-tts-button');
@@ -2444,7 +5266,7 @@ import createResearchSynapse from './researchSynapse.js';
           }
         }
         if (metrics) {
-          displayMetrics(footerTarget, metrics);
+          displayMetrics(_metricsTargetForTurn() || footerTarget, metrics);
         }
         // Attach variant navigation if this was a regeneration
         _attachVariantNav(footerTarget);
@@ -2485,40 +5307,106 @@ import createResearchSynapse from './researchSynapse.js';
             }
           }
         }
+        // Reconcile only the final answer; the tool timeline retains its DOM.
+        uiModule.restoreHistoryScroll?.(_terminalScrollSnapshot);
+
+        // A saved answer can correct the live answer without rebuilding the turn.
+        if (!_pendingContinue) {
+          const _needsCanonicalTurnRebuild = !!(
+            lastToolThread
+            || terminalFinalResponseRendered
+            || _generatedImagesForTurn.length
+          );
+          if (_needsCanonicalTurnRebuild) {
+            await _replaceLiveTurnWithSavedAssistantMessage();
+          }
+          if (_streamTurnMarker && _streamTurnMarker.parentNode) {
+            _turnRendering.settle();
+            _streamTurnMarker.remove();
+          }
+        }
       } // end if (!_isBgFinal)
 
     } catch (err) {
-      _renderStream();
-      // Clean up any active spinner (e.g. "Generating response" during tool calls)
-      if (spinner && spinner.element) spinner.destroy();
-      _cancelThinkingTimer();
-      _removeThinkingSpinner();
-      document.querySelectorAll('.agent-thread.streaming').forEach(t => t.classList.remove('streaming'));
-      // Check if this stream was running in background
+      // If a Stop or timeout was waiting for an identity header and the POST
+      // failed before producing one, keep this on the cancellation path. There
+      // is no safe headerless server cancel to send, but it must not be turned
+      // into an automatic recovery attempt either. Only this send's own
+      // queued Stop counts; a replacement's queued Stop is not ours to spend.
+      const _pendingCatchKey = streamSessionId + ':' + streamGeneration;
+      if (
+        _pendingRunStops.has(_pendingCatchKey)
+        && abortCtrl
+        && !abortCtrl.signal.aborted
+      ) {
+        _pendingRunStops.delete(_pendingCatchKey);
+        abortCtrl._reason = 'user-stop';
+        abortCtrl.abort();
+      }
+      // Check if this stream was running in background — needed before any
+      // stop-state write, so an errored background stream can't clobber the
+      // foreground session's text.
       const _isBgCatch = (sessionModule.getCurrentSessionId() !== streamSessionId) || _backgroundStreams.has(streamSessionId);
+      let _catchTerminalView = null;
+      _closeOpenThinkingMarkup(_isBgCatch);
+      if (_isBgCatch) {
+        _cancelLiveThinkingWork();
+
+        // A canonical terminal event may have been persisted immediately
+        // before the stream moved into the background. Preserve that terminal
+        // state instead of allowing the catch path to turn it back into a
+        // running/error stream.
+        const bgTerminal = _backgroundStreams.get(streamSessionId);
+        if (bgTerminal && _terminalSavedStreams.has(streamSessionId)) {
+          bgTerminal.status = 'completed';
+          if (sessionModule && sessionModule.clearStreaming) {
+            sessionModule.clearStreaming(streamSessionId);
+          }
+        }
+      } else if (accumulated) {
+        _catchTerminalView = _finalizeInterruptedView();
+      } else {
+        // Empty terminal views are owned by _renderCancelledBubble; do not run
+        // the rich round renderer first because it hides an empty holder.
+        _endThinkingOnTerminalPath({ rich: false });
+      }
+      const _catchViewHolder = _catchTerminalView?.holder || holder;
 
       if (_isBgCatch) {
-        // Error happened while backgrounded — update map, don't touch DOM
-        console.error('Background stream error:', err);
+        // Detaching intentionally closes only this browser subscriber. The
+        // server-owned run is still live and will be rejoined on session entry.
         var bgErr = _backgroundStreams.get(streamSessionId);
-        if (bgErr && bgErr.status === 'completed') {
+        if (abortCtrl && abortCtrl._reason === 'detach') {
+          if (bgErr && bgErr.status !== 'completed') bgErr.status = 'running';
+        } else if (bgErr && (
+          bgErr.status === 'completed' || _terminalSavedStreams.has(streamSessionId)
+        )) {
+          bgErr.status = 'completed';
           // [DONE] was already processed — this error is benign (e.g. reader.read() after close)
           // Don't override the completed status; just ensure the completed dot stays
           if (sessionModule && sessionModule.clearStreaming) {
             sessionModule.clearStreaming(streamSessionId);
           }
         } else if (bgErr) {
+          console.error('Background stream error:', err);
           bgErr.status = 'error';
           if (sessionModule && sessionModule.clearStreaming) {
             sessionModule.clearStreaming(streamSessionId);
           }
         }
-      } else {
+      }
+      if (!_isBgCatch) {
+        // Clean up any active spinner (e.g. "Generating response" during tool calls)
+        if (spinner && spinner.element) spinner.destroy();
+        _cancelThinkingTimer();
+        _removeThinkingSpinner();
+        document.querySelectorAll('#chat-history .agent-thread.streaming').forEach(t => t.classList.remove('streaming'));
+
         // Stop streaming TTS on any error/abort
         if (streamingTTS && window.aiTTSManager) window.aiTTSManager.stop();
 
-        if (currentAbort && currentAbort.signal.aborted) {
-          const abortReason = currentAbort._reason || '';
+        if (abortCtrl && abortCtrl.signal.aborted) {
+          const abortReason = abortCtrl._reason || '';
           // Timeout-triggered aborts should remain visible instead of disappearing.
           if (timedOut || abortReason === 'timeout') {
             const timeoutMsg = _isAgent
@@ -2528,14 +5416,14 @@ import createResearchSynapse from './researchSynapse.js';
             if (holder && !accumulated) {
               holder.querySelector('.body').innerHTML =
                 `<div style="color: var(--color-error); font-style: italic; padding: 4px 0;">[${timeoutMsg}]</div>`;
-            } else if (holder && accumulated) {
+            } else if (_catchViewHolder && accumulated) {
               const timeoutNote = document.createElement('div');
               timeoutNote.className = 'stopped-indicator';
               timeoutNote.innerHTML =
                 `<span style="color: var(--color-error);">[${timeoutMsg}]</span>`;
-              holder.querySelector('.body').appendChild(timeoutNote);
+              _catchViewHolder.querySelector('.body').appendChild(timeoutNote);
             }
-            currentAbort = null;
+            if (currentAbort === abortCtrl) currentAbort = null;
             return;
           }
 
@@ -2544,14 +5432,14 @@ import createResearchSynapse from './researchSynapse.js';
             if (holder && !accumulated) {
               holder.querySelector('.body').innerHTML =
                 `<div style="color: var(--color-error); font-style: italic; padding: 4px 0;">[${offlineMsg}]</div>`;
-            } else if (holder && accumulated) {
+            } else if (_catchViewHolder && accumulated) {
               const offlineNote = document.createElement('div');
               offlineNote.className = 'stopped-indicator';
               offlineNote.innerHTML =
                 `<span style="color: var(--color-error);">[${offlineMsg}]</span>`;
-              holder.querySelector('.body').appendChild(offlineNote);
+              _catchViewHolder.querySelector('.body').appendChild(offlineNote);
             }
-            currentAbort = null;
+            if (currentAbort === abortCtrl) currentAbort = null;
             return;
           }
 
@@ -2560,14 +5448,29 @@ import createResearchSynapse from './researchSynapse.js';
             if (holder && !accumulated) {
               holder.querySelector('.body').innerHTML =
                 `<div style="color: var(--color-error); font-style: italic; padding: 4px 0;">[${recoveryMsg}]</div>`;
-            } else if (holder && accumulated) {
+            } else if (_catchViewHolder && accumulated) {
               const recoveryNote = document.createElement('div');
               recoveryNote.className = 'stopped-indicator';
               recoveryNote.innerHTML =
                 `<span style="color: var(--color-error);">[${recoveryMsg}]</span>`;
-              holder.querySelector('.body').appendChild(recoveryNote);
+              _catchViewHolder.querySelector('.body').appendChild(recoveryNote);
             }
-            currentAbort = null;
+            if (currentAbort === abortCtrl) currentAbort = null;
+            return;
+          }
+
+          if (abortReason === 'stale-local') {
+            const staleMsg = 'Stream connection ended. Composer unlocked; send again if needed.';
+            if (holder && !accumulated) {
+              holder.querySelector('.body').innerHTML =
+                `<div style="opacity:0.7;font-style:italic;padding:4px 0;">[${staleMsg}]</div>`;
+            } else if (_catchViewHolder && accumulated) {
+              const staleNote = document.createElement('div');
+              staleNote.className = 'stopped-indicator';
+              staleNote.innerHTML = `<span style="opacity:0.7;">[${staleMsg}]</span>`;
+              _catchViewHolder.querySelector('.body').appendChild(staleNote);
+            }
+            if (currentAbort === abortCtrl) currentAbort = null;
             return;
           }
 
@@ -2578,56 +5481,47 @@ import createResearchSynapse from './researchSynapse.js';
             _renderCancelledBubble(holder);
           }
 
-          // But just in case the stop button didn't render it, render it here
-          if (holder && accumulated && !currentHolder) {
-            holder.dataset.raw = accumulated;
-            holder.querySelector('.body').innerHTML = markdownModule.processWithThinking(
-              markdownModule.squashOutsideCode(accumulated)
-            );
-
-            if (window.hljs) {
-              holder.querySelectorAll('pre code').forEach((block) => {
-                window.hljs.highlightElement(block);
-              });
-            }
-
+          // Navigation and non-button aborts do not pass through the synchronous
+          // Stop renderer. The catch render above owns markdown; add only the
+          // interruption controls here so each terminal path renders once.
+          if (_catchViewHolder && accumulated && currentHolder) {
+            _catchViewHolder.dataset.raw = accumulated;
             const stoppedIndicator = document.createElement('div');
             stoppedIndicator.className = 'stopped-indicator';
             const stoppedLabel = document.createElement('span');
             stoppedLabel.textContent = '[Message interrupted]';
             stoppedIndicator.appendChild(stoppedLabel);
             const continueBtn = document.createElement('button');
-            continueBtn.className = 'continue-btn';
-            continueBtn.title = 'Continue';
-            continueBtn.textContent = '\u25B8';
+            continueBtn.className = 'continue-btn resume-btn';
+            continueBtn.title = 'Resume response';
+            continueBtn.innerHTML = '<span class="resume-btn-label">Resume</span><svg class="resume-btn-icon" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="m8 5 10 7-10 7z"></path></svg>';
             continueBtn.addEventListener('click', () => {
               stoppedIndicator.remove();
               _hideUserBubble = true;
-              _pendingContinue = holder;
-              const cutoff = accumulated;
+              _pendingContinue = _catchViewHolder;
               const msgInput = uiModule.el('message');
               if (msgInput) {
-                msgInput.value = 'Your previous response was interrupted. It ended with:\n\n' + cutoff.slice(-500) + '\n\nDo NOT repeat what you already said. Continue exactly from where you were cut off.';
+                msgInput.value = 'Continue from where you left off.';
                 const sb = document.querySelector('.send-btn');
                 if (sb) sb.click();
               }
             });
             stoppedIndicator.appendChild(continueBtn);
-            holder.querySelector('.body').appendChild(stoppedIndicator);
+            _catchViewHolder.querySelector('.body').appendChild(stoppedIndicator);
 
             // Tell server to mark this message as stopped
             const _sid2 = sessionModule.getCurrentSessionId();
             if (_sid2) fetch(`${API_BASE}/api/session/${_sid2}/mark-stopped`, { method: 'POST' }).catch(e => console.warn('mark-stopped failed:', e));
 
-            if (!holder.querySelector('.msg-footer')) {
-              holder.appendChild(createMsgFooter(holder));
+            if (!_catchViewHolder.querySelector('.msg-footer')) {
+              _catchViewHolder.appendChild(createMsgFooter(_catchViewHolder));
             }
 
             uiModule.scrollHistory();
           }
 
           // Now clear the abort controller
-          currentAbort = null;
+          if (currentAbort === abortCtrl) currentAbort = null;
         } else {
           console.error(err);
           // Stream died with a tool node still spinning. Its per-node tickers
@@ -2646,8 +5540,40 @@ import createResearchSynapse from './researchSynapse.js';
           // cap. Only auto-recover from connection-class failures; deterministic
           // errors (unsupported tools, 4xx/5xx, parse failures) surface right away
           // instead of burning the nudge budget on a guaranteed-to-fail retry.
-          if (!(_isRecoverableStreamErr(err) && _tryAutoRecover(holder, accumulated, streamSessionId))) {
-            const errorHolder = document.querySelector('.msg-ai:last-of-type .body');
+          if (!(isRecoverableStreamError(err) && _tryAutoRecover(_catchViewHolder, accumulated, streamSessionId))) {
+            if (err.terminalStreamError) {
+              if (_canonicalTerminalSaved) {
+                // Let this stream's finally block clear foreground state before
+                // reselecting; otherwise selectSession would detach the already
+                // terminal reader and leave a stale background-stream marker.
+                setTimeout(async () => {
+                  if (sessionModule.getCurrentSessionId() === streamSessionId) {
+                    await sessionModule.selectSession(streamSessionId, { showLoading: false });
+                  } else {
+                    await sessionModule.loadSessions();
+                  }
+                }, 0);
+              } else {
+                // Streamed text is not evidence of a saved terminal record.
+                // Reloading here erases partial replies when an upstream
+                // failure left only the user message in server history.
+                // Preserve the live answer and append the escaped error.
+                const terminalBody =
+                  _catchViewHolder?.querySelector('.body')
+                  || roundHolder?.querySelector('.body')
+                  || document.querySelector('.msg-ai:last-of-type .body');
+                if (terminalBody) {
+                  const terminalNote = document.createElement('div');
+                  terminalNote.style.cssText = 'color: var(--color-error); font-style: italic; padding: 4px 0;';
+                  terminalNote.textContent = `[Error: ${err.message}]`;
+                  terminalBody.appendChild(terminalNote);
+                }
+              }
+              return;
+            }
+            const errorHolder =
+              _catchViewHolder?.querySelector('.body')
+              || document.querySelector('.msg-ai:last-of-type .body');
             if (errorHolder) {
               let errMsg = `Error: ${err.message}`;
               // Add hint for tool-call errors
@@ -2660,18 +5586,58 @@ import createResearchSynapse from './researchSynapse.js';
         }
       }
     } finally {
+      _settleTurnRendering();
+      _cancelLiveThinkingWork();
+      clearResponseTimeout();
       clearProcessingProbe();
-      // Always clean up research tracking regardless of background state
-      _researchingStreamIds.delete(streamSessionId);
+      clearFirstTokenWaitTimers();
+      _stopTtftDisplay();
+      // A replacement send bumps the session's generation the moment it
+      // starts, before it registers or reaches the server, so cleanup rights
+      // are decided by generation: a superseded send may remove only what it
+      // itself owns (its stream registration by controller identity, its own
+      // generation's queued Stop) and must leave session-level state — the
+      // reader session id, research marker, UI — to the replacement.
+      const _ownsStreamState =
+        _streamGenerations.get(streamSessionId) === streamGeneration;
+      const _finallyRegistered = _activeStreams.get(streamSessionId);
+      if (!_finallyRegistered || _finallyRegistered.abortCtrl === abortCtrl) {
+        _activeStreams.delete(streamSessionId);
+      }
+      _pendingRunStops.delete(streamSessionId + ':' + streamGeneration);
+      if (_ownsStreamState) {
+        if (_streamSessionId === streamSessionId) _streamSessionId = null;
+        if (_sendStates.get(streamSessionId) === _sendState) {
+          _sendStates.delete(streamSessionId);
+        }
+        // Superseded sends must not resync: with the replacement not yet
+        // registered, a stale sync would set isStreaming false and drop
+        // currentAbort while _sendInFlight is already false, reopening the
+        // send gate mid-preflight. The replacement syncs when it registers
+        // or finishes.
+        _syncForegroundStreamGlobals();
+      }
+      // Streaming done — let screen readers announce the settled response.
+      if (_ownsStreamState) {
+        const _chatLogDone = document.getElementById('chat-history');
+        if (_chatLogDone) _chatLogDone.setAttribute('aria-busy', 'false');
+      }
+      // Research markers gate /api/research/cancel in the Stop handler, so a
+      // superseded send must not strip a replacement research run's marker.
+      if (_ownsStreamState) _researchingStreamIds.delete(streamSessionId);
       if (_researchingStreamIds.size === 0) {
         var _rToggleCleanup = document.getElementById('research-toggle-btn');
         if (_rToggleCleanup) _rToggleCleanup.classList.remove('research-running');
       }
 
-      // Only reset UI state if still on the stream's session and was never backgrounded
+      // Only reset UI state if still on the stream's session, never
+      // backgrounded, and no replacement stream owns the session now — the
+      // replacement disabled the composer for its own send, so re-enabling
+      // it here would hand input back mid-stream.
       const _isBgFinally = (sessionModule.getCurrentSessionId() !== streamSessionId) || _backgroundStreams.has(streamSessionId);
+      if (_ownsStreamState) _terminalSavedStreams.delete(streamSessionId);
 
-      if (!_isBgFinally) {
+      if (!_isBgFinally && _ownsStreamState) {
         // Reset button to idle state
         updateSubmitButton('idle', submitBtn);
 
@@ -2680,8 +5646,12 @@ import createResearchSynapse from './researchSynapse.js';
           messageInput.disabled = false;
           if (window.innerWidth <= 768) {
             messageInput.blur();
-          } else {
-            messageInput.focus();
+          } else if (!document.getElementById('doc-editor-pane')) {
+            // Do not steal focus from an open document at stream completion.
+            // preventScroll also keeps the chat viewport stable in browsers
+            // that reveal a focused input even when it is already visible.
+            try { messageInput.focus({ preventScroll: true }); }
+            catch (_) { messageInput.focus(); }
           }
         }
 
@@ -2753,6 +5723,7 @@ import createResearchSynapse from './researchSynapse.js';
           sessionModule.loadSessions();
         }
       }, 3000);
+      _drainQueuedAgentRequests();
     }
   }
 
@@ -2765,70 +5736,64 @@ import createResearchSynapse from './researchSynapse.js';
   // the server run — otherwise closing the tab would kill the background task,
   // defeating the whole point. Only the Stop button cancels the server run.
   export function abortCurrentRequest(stopServer = false) {
-    if (currentAbort) {
-      currentAbort.abort();
-      // Don't set to null here - let catch block handle it
-    }
+    const _sid = (sessionModule && sessionModule.getCurrentSessionId && sessionModule.getCurrentSessionId())
+      || _streamSessionId
+      || (window.sessionModule && window.sessionModule.getCurrentSessionId && window.sessionModule.getCurrentSessionId());
+    // The CURRENT send's controller comes from its send state, installed at
+    // send commit — never borrowed from the stream registry, which during the
+    // replacement's preflight still holds the superseded send's entry.
+    // Aborting that older controller here would sever the only identity
+    // channel able to name the old run. A send committed but pre-POST has a
+    // null controller: the Stop queues and there is nothing to abort yet.
+    const _sendStateNow = _sid ? _sendStates.get(_sid) : null;
+    const active = _getForegroundStreamState();
+    const abortCtrl = _sendStateNow
+      ? _sendStateNow.abortCtrl
+      : (active ? active.abortCtrl : currentAbort);
+    let abortNow = true;
     if (stopServer) {
       try {
-        const _sid = _streamSessionId
-          || (window.sessionModule && window.sessionModule.getCurrentSessionId && window.sessionModule.getCurrentSessionId());
         if (_sid) {
-          fetch(`/api/chat/stop/${encodeURIComponent(_sid)}`, { method: 'POST', credentials: 'same-origin' }).catch(() => {});
+          // Before response headers arrive there is no safe server-side stop
+          // identity yet. Keep the POST alive just long enough to receive that
+          // opaque id, then _rememberStreamRunId sends the exact Stop and aborts
+          // this reader. Never fall back to a headerless session-wide cancel.
+          abortNow = _stopExactRun(_sid, abortCtrl);
         }
       } catch (_) {}
+    }
+    if (abortCtrl && abortNow) {
+      abortCtrl.abort();
+      // Don't set to null here - let catch block handle it
     }
   }
 
   // ── Stall watchdog ──────────────────────────────────────────────
-  // Auto-recover a turn whose stream died (connection drop) or went silent:
-  // preserve the partial, then re-submit a completion handshake by reusing the
-  // existing continue/resume path. Returns false at the cap so the caller can
-  // surface the failure instead of nudging forever.
+  // Auto-recover a turn whose browser stream died by reconnecting to the exact
+  // detached server run. Returns false at the cap so the caller can surface
+  // the failure instead of retrying forever.
   // Only auto-recover from connection-class failures (the genuine "silently
   // died" case). Deterministic errors — unsupported tools, HTTP 4xx/5xx, JSON
   // parse failures — will fail identically on retry, so surfacing them
   // immediately is both more honest and avoids wasting the nudge budget.
-  function _isRecoverableStreamErr(err) {
-    if (!err) return false;
-    if (err.name === 'TypeError') return true;   // fetch/reader network failure
-    const m = (err.message || '').toLowerCase();
-    if (/\btool\b|unsupported|json|parse|\b4\d\d\b|\b5\d\d\b/.test(m)) return false;
-    return /network|fetch|connection|reset|closed|aborted|stream|tim(?:e|ed)\s?out|econn|eof/.test(m);
-  }
-
   function _tryAutoRecover(holder, accumulated, sessionId) {
     if (_autoNudges >= _AUTO_NUDGE_CAP) return false;
     _autoNudges++;
     if (holder && accumulated) {
       holder.dataset.raw = accumulated;
-      try {
-        holder.querySelector('.body').innerHTML =
-          markdownModule.processWithThinking(markdownModule.squashOutsideCode(accumulated));
-      } catch (_) {}
     }
-    _pendingContinue = holder || null;   // merge the continuation into the same bubble
-    _hideUserBubble = true;              // no user bubble for the handshake
-    _autoContinuePending = true;         // don't reset the counter on this submit
-    const _abandon = () => {             // clear the pending flags so they can't
-      _pendingContinue = null;           // leak into whatever chat is now open
-      _hideUserBubble = false;
-      _autoContinuePending = false;
-    };
-    // Defer so the stream's finally resets state first — otherwise the send
-    // button is still in "stop" mode and clicking it would toggle, not send.
-    setTimeout(() => {
+    // The server run is detached and keeps its exact pinned model/tool state.
+    // Reconnect to that run instead of submitting a new user turn, which would
+    // cancel it, retry the selected model, and risk duplicating side effects.
+    setTimeout(async () => {
       // The stream that died may not be the chat the user is now looking at —
-      // never inject the recovery handshake into the wrong conversation.
-      if (sessionId && sessionModule.getCurrentSessionId() !== sessionId) { _abandon(); return; }
-      const msgInput = uiModule.el('message');
-      const sb = document.querySelector('.send-btn');
-      if (!msgInput || !sb) { _abandon(); return; }
-      const tail = (accumulated || '').slice(-400);
-      msgInput.value = tail
-        ? `The stream dropped before you finished. It ended with:\n\n${tail}\n\nIf the task is fully complete, reply with just: DONE. Otherwise continue exactly where you left off and finish it — do not repeat what you already wrote.`
-        : `The stream dropped before you produced anything. If the task is already done, reply with just: DONE. Otherwise complete it now.`;
-      sb.click();
+      // never attach the recovery reader to the wrong conversation.
+      if (sessionId && sessionModule.getCurrentSessionId() !== sessionId) return;
+      const resumed = await resumeStream(sessionId, holder || null);
+      if (!resumed && holder && holder.isConnected) {
+        const body = holder.querySelector('.body');
+        if (body) typewriterInto(body, 'Connection lost. The existing run could not be resumed.');
+      }
     }, 200);
     return true;
   }
@@ -2871,12 +5836,52 @@ import createResearchSynapse from './researchSynapse.js';
     box.appendChild(bar);
     if (uiModule.scrollHistory) uiModule.scrollHistory();
   }
+  async function _probeStaleLocalStream() {
+    const active = _getForegroundStreamState();
+    if (!active || _staleStreamProbeInFlight) return;
+    if (Date.now() - (active.lastActivity || _lastReaderActivity) < STALE_LOCAL_STREAM_MS) return;
+    const sid = sessionModule.getCurrentSessionId && sessionModule.getCurrentSessionId();
+    if (!sid) return;
+    if (_backgroundStreams.has(sid) || (sessionModule.getCurrentSessionId && sessionModule.getCurrentSessionId() !== sid)) return;
+    _staleStreamProbeInFlight = true;
+    try {
+      const res = await fetch(`${API_BASE}/api/chat/stream_status/${encodeURIComponent(sid)}`, {
+        credentials: 'same-origin',
+        cache: 'no-store',
+      });
+      if (!_getForegroundStreamState() || _backgroundStreams.has(sid)) return;
+      if (res.status !== 404) return;
+
+      console.warn('[stream-watchdog] Local stream was stale and server has no active stream. Unlocking composer.');
+      if (active.abortCtrl && !active.abortCtrl.signal.aborted) {
+        active.abortCtrl._reason = 'stale-local';
+        active.abortCtrl.abort();
+      }
+      _activeStreams.delete(sid);
+      _syncForegroundStreamGlobals();
+      _sendInFlight = false;
+      if (_webLockRelease) {
+        _webLockRelease();
+        _webLockRelease = null;
+      }
+      const submitBtn = document.querySelector('.send-btn');
+      if (submitBtn) updateSubmitButton('idle', submitBtn);
+      const messageInput = uiModule.el('message');
+      if (messageInput) messageInput.disabled = false;
+      _drainQueuedAgentRequests();
+    } catch (err) {
+      console.warn('[stream-watchdog] Stream status probe failed:', err);
+    } finally {
+      _staleStreamProbeInFlight = false;
+    }
+  }
+
   function _startStallWatchdog() {
-    // Disabled: the server-side stall detector / auto-continue (agent
-    // loop-breaker) handles quiet/stalled streams now, so the manual
-    // "Quiet for Nm — still working?" banner is redundant (and annoying).
+    // Keep the old noisy stall banner disabled. This watchdog only unlocks
+    // a dead local stream after the backend confirms no active stream exists.
     if (_stallWatchdog) { clearInterval(_stallWatchdog); _stallWatchdog = null; }
     _removeStallBanner();
+    _stallWatchdog = setInterval(_probeStaleLocalStream, 5000);
   }
   function _stopStallWatchdog() {
     if (_stallWatchdog) { clearInterval(_stallWatchdog); _stallWatchdog = null; }
@@ -2888,7 +5893,10 @@ import createResearchSynapse from './researchSynapse.js';
    *  Called from both abort paths when no tokens had streamed yet. */
   function _renderCancelledBubble(holder) {
     if (!holder) return;
+    if (holder.dataset.cancelledRendered === '1') return;
+    holder.dataset.cancelledRendered = '1';
     holder.dataset.raw = '';
+    holder.style.display = '';
     const body = holder.querySelector('.body');
     if (body) {
       body.innerHTML = '';
@@ -2938,30 +5946,45 @@ import createResearchSynapse from './researchSynapse.js';
    * Called when user switches sessions mid-stream.
    */
   export function detachCurrentStream(sessionId) {
-    if (!isStreaming || !currentAbort) {
+    const active = sessionId ? _activeStreams.get(sessionId) : _getForegroundStreamState();
+    if (!active || !active.abortCtrl) {
       // Not streaming — fall through to abort
       abortCurrentRequest();
       return;
     }
-    // Store background stream state
+    // The backend owns the detached run. Stop this tab's subscriber and its
+    // delayed rendering; session re-entry will replay and follow the same run.
+    if (active.cancelViewWork) active.cancelViewWork();
+
+    const terminalSaved = _terminalSavedStreams.has(sessionId);
+    // Store background stream state. A canonical terminal event can precede
+    // its SSE error event; preserve completion if the user switches sessions
+    // during that gap instead of creating a fresh running/error marker.
     _backgroundStreams.set(sessionId, {
-      status: 'running',
+      status: terminalSaved ? 'completed' : 'running',
       accumulated: currentAccumulated,
       sourcesHtml: '',
       findingsData: null,
-      abortCtrl: currentAbort,
-      query: currentHolder ? (currentHolder._researchQuery || '') : '',
+      abortCtrl: active.abortCtrl,
+      query: active.query || (active.holder ? (active.holder._researchQuery || '') : ''),
       metrics: null,
     });
     // Mark session with pulsing dot in sidebar
-    if (sessionModule && sessionModule.markStreaming) {
+    if (!terminalSaved && sessionModule && sessionModule.markStreaming) {
       sessionModule.markStreaming(sessionId);
+    } else if (terminalSaved && sessionModule && sessionModule.clearStreaming) {
+      sessionModule.clearStreaming(sessionId);
     }
-    // Clear local state WITHOUT aborting the fetch
-    currentAbort = null;
-    isStreaming = false;
-    currentHolder = null;
+    active.abortCtrl._reason = 'detach';
+    _activeStreams.delete(sessionId);
+    if (!active.abortCtrl.signal.aborted) active.abortCtrl.abort();
+
+    // Clear foreground state without cancelling the server-owned run.
+    if (currentAbort === active.abortCtrl) currentAbort = null;
+    if (currentHolder === active.holder) currentHolder = null;
+    if (_streamSessionId === sessionId) _streamSessionId = null;
     currentAccumulated = '';
+    _syncForegroundStreamGlobals();
     // Reset submit button so the new chat is ready to send
     const submitBtn = document.querySelector('.send-btn');
     if (submitBtn) updateSubmitButton('idle', submitBtn);
@@ -2970,6 +5993,410 @@ import createResearchSynapse from './researchSynapse.js';
   // _notifyStreamComplete and _insertStreamDoneToast now in chatStream.js
   var _notifyStreamComplete = chatStream.notifyStreamComplete;
   var _insertStreamDoneToast = chatStream.insertStreamDoneToast;
+
+  /**
+   * Live-resume a chat run still streaming detached on the server (#2539).
+   *
+   * On session re-entry, GET /api/chat/resume/{id} replays the run's buffer then
+   * streams live; reply tokens render as they arrive. On completion a plain text
+   * reply is finalized in place (canonical bubble via chatRenderer.addMessage, no
+   * reload); a "rich" reply (tool calls, sources, doc streaming, multi-round) is
+   * reloaded from the DB so its full render stays faithful. Returns true if it
+   * attached, false to let the caller fall back to spinner+poll.
+   */
+  export async function resumeStream(sessionId, replaceHolder = null) {
+    if (!sessionId) return false;
+    if (hasActiveStream(sessionId)) return false;
+
+    let res;
+    try {
+      res = await fetch(`${API_BASE}/api/chat/resume/${sessionId}`);
+    } catch (e) {
+      return false;
+    }
+    if (!res.ok || !res.body) return false;
+    const resumeRunId = res.headers.get('X-Odysseus-Run-Id') || '';
+    if (resumeRunId) _streamRunIds.set(sessionId, resumeRunId);
+
+    const box = document.getElementById('chat-history');
+    if (!box) return false;
+    if (replaceHolder && replaceHolder.parentNode) replaceHolder.remove();
+
+    // Block duplicate re-attach attempts while this reader is live. A dedicated
+    // set (not _backgroundStreams) so checkBackgroundStream doesn't mistake this
+    // for a same-tab POST stream and spawn its own spinner+poll on re-entry.
+    _resumingStreams.add(sessionId);
+    _backgroundStreams.delete(sessionId);
+    const submitBtn = document.querySelector('.send-btn');
+    if (submitBtn) updateSubmitButton('streaming', submitBtn);
+    if (sessionModule && sessionModule.markStreaming) sessionModule.markStreaming(sessionId);
+
+    const holder = document.createElement('div');
+    holder.className = 'msg msg-ai';
+    const meta = sessionModule.getSessions().find(s => s.id === sessionId);
+    const roleLabel = _shortModel(meta && meta.model);
+    const roleTs = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    holder.innerHTML = '<div class="role">' + uiModule.esc(roleLabel) +
+      ' <span class="role-timestamp">' + roleTs + '</span></div>' +
+      '<div class="body"><div class="stream-content"></div></div>';
+    holder._requestedModel = meta && meta.model;
+    holder._actualModel = holder._requestedModel;
+    _applyModelColor(holder.querySelector('.role'), meta && meta.model);
+    let roundHolder = holder;
+    let contentDiv = holder.querySelector('.stream-content');
+    const replayMarker = document.createComment('live-stream-turn');
+    box.appendChild(replayMarker);
+    const replayRendering = createTurnRendering({ root: box, start: replayMarker });
+    box.appendChild(holder);
+    const replayNodes = [holder];
+
+    const spinner = spinnerModule.create('Generating response...', 'right');
+    holder.querySelector('.body').appendChild(spinner.createElement());
+    spinner.start();
+    uiModule.scrollHistory();
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let roundText = '';
+    let replayThinking = '';
+    let replayMessageId = '';
+    let docFenceOpened = false;
+    let gotDelta = false;
+    let leftSession = false;
+    let metricsData = null;
+    let replayError = null;
+    let canonicalTerminalSeen = false;
+    let currentToolBubble = null;
+    let currentToolThread = null;
+    // "Rich" responses (tool calls, sources, doc streaming, multi-round) need the
+    // full canonical render, which is rebuilt from the saved DB record on reload.
+    // Plain text replies can be finalized in place without a reload.
+    let rich = false;
+
+    const cleanup = () => {
+      replayRendering.settle();
+      try { spinner.destroy(); } catch (_) {}
+      _resumingStreams.delete(sessionId);
+      if (sessionModule.getCurrentSessionId && sessionModule.getCurrentSessionId() === sessionId) {
+        if (submitBtn) updateSubmitButton('idle', submitBtn);
+        if (sessionModule && sessionModule.clearStreaming) sessionModule.clearStreaming(sessionId);
+        const input = uiModule.el && uiModule.el('message');
+        if (input) input.disabled = false;
+      }
+    };
+
+    const renderDelta = (event = {}, scroll = true) => {
+      if (!roundHolder.isConnected || roundHolder.style.display === 'none'
+          || (event.type === 'final_response' && currentToolThread?.isConnected
+              && (roundHolder.compareDocumentPosition(currentToolThread) & Node.DOCUMENT_POSITION_FOLLOWING))) {
+        const text = roundText;
+        const thinking = replayThinking;
+        startReplayRound();
+        roundText = text;
+        replayThinking = thinking;
+      }
+      contentDiv = roundHolder.querySelector('.body');
+      const dt = markdownModule.normalizeThinkingMarkup(_streamDisplayText(roundText, { final: docFenceOpened }));
+      if (docFenceOpened && !dt.trim()) {
+        _showDocumentWritingStatus(contentDiv);
+      } else {
+        const source = (replayThinking ? `<think>${replayThinking}</think>` : '') + markdownModule.squashOutsideCode(dt);
+        const html = markdownModule.processWithThinking
+          ? markdownModule.processWithThinking(source)
+          : markdownModule.mdToHtml(source);
+        replayRendering.render({ body: contentDiv, html, raw: roundText, messageId: replayMessageId,
+          render_owner: event.render_owner, replacement_scope: event.replacement_scope });
+      }
+      if (scroll) uiModule.scrollHistory();
+    };
+
+    const removeReplayNodes = () => {
+      replayNodes.forEach(node => { if (node && node.parentNode) node.remove(); });
+      replayMarker.remove();
+    };
+
+    const startReplayRound = () => {
+      if (!roundText.trim() && roundHolder) roundHolder.style.display = 'none';
+      if (currentToolThread) currentToolThread.classList.add('has-bottom');
+      roundText = '';
+      replayThinking = '';
+      const next = document.createElement('div');
+      next.className = 'msg msg-ai msg-continuation streaming';
+      next.innerHTML = '<div class="body"><div class="stream-content"></div></div>';
+      box.appendChild(next);
+      replayNodes.push(next);
+      roundHolder = next;
+      contentDiv = next.querySelector('.stream-content');
+      currentToolBubble = null;
+      currentToolThread = null;
+    };
+
+    const startReplayTool = (json) => {
+      try { spinner.destroy(); } catch (_) {}
+      if (!roundText.trim() && roundHolder) roundHolder.style.display = 'none';
+      const thread = document.createElement('div');
+      thread.className = 'agent-thread streaming' + (roundText.trim() ? ' has-top' : '');
+      const node = document.createElement('div');
+      node.className = 'agent-thread-node running';
+      const command = String(json.command || json.args || '');
+      const label = String(json.label || json.tool || 'Tool');
+      const icon = renderToolIcon(json.tool || '', command, json) || '<span class="agent-thread-icon">▶</span>';
+      node.innerHTML = '<div class="agent-thread-dot"></div><div class="agent-thread-header">' +
+        icon + '<span class="agent-thread-tool">' + uiModule.esc(label) + '</span>' +
+        '<span class="agent-thread-wave">▁▂▃</span></div><div class="agent-thread-content">' +
+        (command ? '<pre class="agent-thread-cmd">' + uiModule.esc(command) + '</pre>' : '') + '</div>';
+      thread.appendChild(node);
+      box.appendChild(thread);
+      replayNodes.push(thread);
+      currentToolThread = thread;
+      currentToolBubble = node;
+      uiModule.scrollHistory();
+    };
+
+    const finishReplayTool = (json) => {
+      if (!currentToolBubble) return;
+      const ok = json.exit_code === 0 || json.exit_code == null;
+      const command = String(json.command || json.args || '');
+      const output = String(json.output || '');
+      const label = String(json.label || json.tool || 'Tool');
+      const icon = renderToolIcon(json.tool || '', command, json) || '';
+      currentToolBubble.className = 'agent-thread-node' + (ok ? '' : ' error');
+      currentToolBubble.innerHTML = '<div class="agent-thread-dot"></div><div class="agent-thread-header">' +
+        '<span class="agent-thread-icon">' + (ok ? '✓' : '✗') + '</span>' + icon +
+        '<span class="agent-thread-tool">' + uiModule.esc(label) + '</span>' +
+        '<span class="agent-thread-status">' + (ok ? 'done' : 'failed') + '</span>' +
+        '<span class="agent-thread-chevron" aria-hidden="true"></span></div>' +
+        '<div class="agent-thread-content">' +
+        (command ? '<pre class="agent-thread-cmd">' + uiModule.esc(command) + '</pre>' : '') +
+        (output ? '<details class="agent-tool-output"><summary>Output</summary><pre>' + uiModule.esc(output) + '</pre></details>' : '') +
+        '</div>';
+      if (currentToolThread) currentToolThread.classList.remove('streaming');
+    };
+
+    try {
+      readLoop:
+      while (true) {
+        // User left this session: stop rendering, the run continues server-side.
+        if (sessionModule.getCurrentSessionId &&
+            sessionModule.getCurrentSessionId() !== sessionId) {
+          leftSession = true;
+          try { await reader.cancel(); } catch (_) {}
+          break;
+        }
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop();
+        for (const part of parts) {
+          const eventIsError = part.split('\n').some(l => l.trim() === 'event: error');
+          if (eventIsError) rich = true;
+          const line = part.split('\n').find(l => l.startsWith('data: '));
+          if (!line) continue;
+          const payload = line.slice(6);
+          if (payload === '[DONE]') {
+            try { await reader.cancel(); } catch (_) {}
+            break readLoop;
+          }
+          let json;
+          try { json = JSON.parse(payload); } catch (_) { continue; }
+          if (eventIsError || ['stable', 'complete', 'error', 'agent_terminal', 'chat_terminal'].includes(json.type)) replayRendering.settle();
+          if (eventIsError) {
+            replayError = createTerminalStreamError(json);
+          } else if (json.type === 'final_response') {
+            const finalText = String(json.content || json.delta || '');
+            if (!finalText.trim()) continue;
+            if (!replayRendering.accepts(json)) continue;
+            roundText = finalText;
+            gotDelta = true;
+            try { spinner.destroy(); } catch (_) {}
+            renderDelta(json);
+            replayRendering.settle();
+          } else if (json.delta) {
+            if (!replayRendering.accepts(json)) continue;
+            if (!json.thinking && json.render_owner === 'streamed' && json.replacement_scope === 'turn') {
+              roundText = '';
+            }
+            if (json.thinking) replayThinking += json.delta;
+            else
+            roundText += json.delta;
+            if (!docFenceOpened && (roundText.includes('```create_document\n') || roundText.includes('```document\n') || roundText.includes('```documen\n'))) {
+              docFenceOpened = true;
+              rich = true;
+            }
+            if (!gotDelta) { gotDelta = true; try { spinner.destroy(); } catch (_) {} }
+            renderDelta(json);
+          } else if (json.type === 'doc_stream_open') {
+            rich = true;
+            if (documentModule) documentModule.streamDocOpen(json.title || '', json.lang || '');
+          } else if (json.type === 'doc_stream_delta') {
+            rich = true;
+            if (documentModule) documentModule.streamDocDelta(json.content || json.delta || '');
+          } else if (json.type === 'metrics') {
+            metricsData = json.data || metricsData;
+            if (metricsData && resumeRunId) {
+              metricsData._costRecordId = _metricsCostRecordId(resumeRunId, json);
+            }
+            if (metricsData) {
+              chatRenderer.recordSessionMetricsCost(metricsData, sessionId);
+            }
+          } else if (json.type === 'message_saved') {
+            replayMessageId = String(json.id || '');
+          } else if (json.type === 'fallback') {
+            // Replay can attach after the selected route has already failed.
+            // Reflect the fallback immediately, then reload the canonical
+            // multi-round record when the detached run completes.
+            rich = true;
+            const fallbackHolder = applyModelRouteEventState(json, holder, null, meta && meta.model);
+            if (fallbackHolder) {
+              _setRoleModelLabel(
+                fallbackHolder.querySelector('.role'),
+                fallbackHolder._requestedModel,
+                fallbackHolder._actualModel,
+                {
+                  reason: json.reason,
+                  requestedEndpointId: fallbackHolder._requestedEndpointId,
+                  requestedEndpointLabel: fallbackHolder._requestedEndpointLabel,
+                  actualEndpointId: fallbackHolder._actualEndpointId,
+                  actualEndpointLabel: fallbackHolder._actualEndpointLabel,
+                },
+              );
+            }
+            uiModule.showToast(
+              'Fallback: ' + _shortModel(json.selected_model || '') + ' failed — answered by ' +
+              _shortModel(json.answered_by || ''),
+              6000,
+            );
+          } else if (json.type === 'model_actual') {
+            rich = true;
+            const modelHolder = applyModelRouteEventState(json, holder, null, meta && meta.model);
+            if (modelHolder) {
+              _setRoleModelLabel(
+                modelHolder.querySelector('.role'),
+                modelHolder._requestedModel,
+                modelHolder._actualModel,
+                {
+                  requestedEndpointId: modelHolder._requestedEndpointId,
+                  requestedEndpointLabel: modelHolder._requestedEndpointLabel,
+                  actualEndpointId: modelHolder._actualEndpointId,
+                  actualEndpointLabel: modelHolder._actualEndpointLabel,
+                },
+              );
+            }
+          } else if (json.type === 'agent_terminal' || json.type === 'chat_terminal') {
+            // The server has already persisted canonical partial content plus
+            // a sanitized failure note and actual route provenance.  Do not
+            // finalize replayed deltas as a successful local-only answer.
+            rich = true;
+            canonicalTerminalSeen = true;
+            metricsData = json.data || metricsData;
+            if (metricsData && resumeRunId) {
+              metricsData._costRecordId = _metricsCostRecordId(resumeRunId, json);
+            }
+            if (metricsData) displayMetrics(holder, metricsData);
+          } else if (json.type === 'tool_start' || json.type === 'tool_output' ||
+                     json.type === 'tool_progress' || json.type === 'agent_step' ||
+                     json.type === 'web_sources' || json.type === 'rag_sources' ||
+                     json.type === 'research_progress' || json.type === 'research_sources' ||
+                     json.type === 'research_findings' || json.type === 'research_done') {
+            rich = true;
+            if (json.type === 'tool_start') {
+              startReplayTool(json);
+            } else if (json.type === 'tool_output') {
+              finishReplayTool(json);
+            } else if (json.type === 'tool_progress' && currentToolBubble) {
+              const target = currentToolBubble.querySelector('.agent-thread-content');
+              if (target && (json.tail || json.message)) {
+                let progress = target.querySelector('.agent-thread-tail');
+                if (!progress) {
+                  progress = document.createElement('pre');
+                  progress.className = 'agent-thread-tail';
+                  target.appendChild(progress);
+                }
+                progress.textContent = String(json.tail || json.message || '');
+              }
+            } else if (json.type === 'agent_step') {
+              if (replayRendering.accepts(json)) startReplayRound();
+            }
+          }
+        }
+      }
+    } catch (e) {
+      // Network drop or parse failure: fall through to the canonical reload.
+      rich = true;
+    }
+
+    cleanup();
+    if (docFenceOpened) _finishDocumentWritingStatus(holder, true);
+    if (leftSession) { removeReplayNodes(); return true; }
+
+    const onThisSession = sessionModule.getCurrentSessionId &&
+                          sessionModule.getCurrentSessionId() === sessionId;
+
+    // A failure before substantive output has no persisted assistant record to
+    // recover through a canonical reload. Keep its sanitized provider/request
+    // error visible in the replay holder instead of deleting the only evidence.
+    if (onThisSession && replayError && !canonicalTerminalSeen) {
+      const errorDiv = document.createElement('div');
+      errorDiv.style.cssText = 'color: var(--color-error); font-style: italic; padding: 4px 0;';
+      errorDiv.textContent = `[Error: ${replayError.message}]`;
+      contentDiv.appendChild(errorDiv);
+      uiModule.scrollHistory();
+      return true;
+    }
+
+    const isReplayCurrent = () => sessionModule.getCurrentSessionId() === sessionId
+      && replayMarker.parentNode === box
+      && (!resumeRunId || _streamRunIds.get(sessionId) === resumeRunId);
+    if (!onThisSession || !isReplayCurrent()) { removeReplayNodes(); return true; }
+    const scrollSnapshot = uiModule.captureHistoryScroll?.();
+    // Reconcile only this saved answer. Rebuilding history would discard open
+    // tool cards and resurrect drafts in clients with older history renderers.
+    if (replayMessageId) {
+      try {
+        const savedResponse = await fetch(`${API_BASE}/api/history/${encodeURIComponent(sessionId)}?limit=12`);
+        if (savedResponse.ok && isReplayCurrent()) {
+          const data = await savedResponse.json();
+          if (!isReplayCurrent()) { removeReplayNodes(); return true; }
+          const saved = (data.history || []).find(message => message.role === 'assistant'
+            && String(message.metadata?._db_id || '') === replayMessageId);
+          if (saved) {
+            metricsData = { ...metricsData, ...saved.metadata };
+            roundText = String(saved.content || '');
+            if (roundText.trim()) renderDelta(saved.metadata || {}, false);
+          }
+        }
+      } catch (error) {
+        console.warn('Could not reconcile resumed answer:', error);
+      }
+    }
+    if (!isReplayCurrent()) { removeReplayNodes(); return true; }
+    const target = roundHolder?.isConnected && roundHolder.style.display !== 'none'
+      ? roundHolder : currentToolThread;
+    if (target) {
+      target.classList.remove('streaming');
+      if (replayMessageId) target.dataset.dbId = replayMessageId;
+      if (target.classList.contains('msg-ai')) {
+        target.dataset.raw = roundText;
+        if (!target.querySelector('.msg-footer')) target.appendChild(createMsgFooter(target));
+        const body = target.querySelector('.body');
+        if (body && !body.querySelector('.sources-section')) {
+          const sources = metricsData?.web_sources || metricsData?.research_sources;
+          if (sources?.length) body.insertAdjacentHTML('afterbegin', chatRenderer.buildSourcesBox(sources, metricsData.web_sources ? 'web' : 'research'));
+          if (metricsData?.research_findings?.length) body.insertAdjacentHTML('beforeend', chatRenderer.buildFindingsBox(metricsData.research_findings));
+        }
+        if (body && metricsData?.rag_sources?.length && !body.querySelector('.rag-sources')) {
+          body.insertAdjacentHTML('beforeend', chatRenderer.buildRagSourcesBox(metricsData.rag_sources));
+        }
+      }
+      if (metricsData) displayMetrics(target, metricsData);
+    }
+    replayRendering.settle();
+    replayMarker.remove();
+    uiModule.restoreHistoryScroll?.(scrollSnapshot);
+    return true;
+  }
 
   /**
    * Check for background streams when switching to a session.
@@ -2982,11 +6409,13 @@ import createResearchSynapse from './researchSynapse.js';
     if (entry.status === 'completed') {
       // Response is already saved to DB and will appear in history — just clean up
       _backgroundStreams.delete(sessionId);
+      _syncForegroundStreamGlobals();
       return;
     }
 
     if (entry.status === 'error') {
       _backgroundStreams.delete(sessionId);
+      _syncForegroundStreamGlobals();
       var box = document.getElementById('chat-history');
       if (box) {
         var errHolder = document.createElement('div');
@@ -2998,62 +6427,11 @@ import createResearchSynapse from './researchSynapse.js';
     }
 
     if (entry.status === 'running') {
-      // Stream is still active — show a clean spinner, poll until done,
-      // then reload history to show the final saved response.
-      var box = document.getElementById('chat-history');
-      if (!box) return;
-
-      // Replay any doc content that was streamed in the background
-      if (entry._docTitle != null && documentModule) {
-        documentModule.streamDocOpen(entry._docTitle, entry._docLang || '');
-        if (entry._docContent) {
-          documentModule.streamDocDelta(entry._docContent);
-        }
-      }
-
-      var holder = document.createElement('div');
-      holder.className = 'msg msg-ai';
-      var meta = sessionModule.getSessions().find(function(s) { return s.id === sessionId; });
-      var roleLabel = _shortModel(meta && meta.model);
-      var roleTs = new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
-      holder.innerHTML = '<div class="role">' + roleLabel + ' <span class="role-timestamp">' + roleTs + '</span></div><div class="body"></div>';
-      _applyModelColor(holder.querySelector('.role'), meta && meta.model);
-
-      var bodyDiv = holder.querySelector('.body');
-      var spinner = spinnerModule.create('Response streaming in background', 'right');
-      bodyDiv.appendChild(spinner.createElement());
-      spinner.start();
-
-      box.appendChild(holder);
-      uiModule.scrollHistory();
-
-      // Poll map until stream finishes, then reload history
-      var pollId = setInterval(function() {
-        if (sessionModule.getCurrentSessionId() !== sessionId) {
-          clearInterval(pollId);
-          spinner.destroy();
-          if (holder.parentNode) holder.remove();
-          return;
-        }
-        // Update doc content while polling
-        var curPoll = _backgroundStreams.get(sessionId);
-        if (curPoll && curPoll._docContent && documentModule) {
-          documentModule.streamDocDelta(curPoll._docContent);
-        }
-        if (!curPoll || curPoll.status !== 'running') {
-          clearInterval(pollId);
-          spinner.destroy();
-          if (holder.parentNode) holder.remove(); // Remove entire holder, not just spinner
-          _backgroundStreams.delete(sessionId);
-          // Reload session to show the completed response — but only if the user
-          // is still on it; don't yank them back from a new chat they opened.
-          if (sessionModule.getCurrentSessionId && sessionModule.getCurrentSessionId() === sessionId) {
-            sessionModule.selectSession(sessionId);
-          } else {
-            sessionModule.loadSessions();
-          }
-        }
-      }, 500);
+      // The local subscriber was intentionally detached. Remove the local
+      // marker so sessions.js can attach /api/chat/resume and render the
+      // buffered structured events from the server.
+      _backgroundStreams.delete(sessionId);
+      _syncForegroundStreamGlobals();
     }
   }
 
@@ -3211,46 +6589,23 @@ import createResearchSynapse from './researchSynapse.js';
       pre.dataset.btnPosComputed = '1';
     }, true);
 
-    // Tab suspension recovery: when user tabs back in, check if stream froze
+    // A hidden browser tab may throttle timers and delivery for an arbitrary
+    // amount of time. The detached backend run is authoritative, so becoming
+    // visible must never abort an otherwise healthy run. Buffered SSE data will
+    // catch up naturally; genuine connection failures use resumeStream(), and
+    // the status probe only unlocks the composer when the server confirms that
+    // no run exists.
     document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState !== 'visible') return;
-      if (!isStreaming) return;
-
-      // Stream claims to be running — check if reader is actually alive
-      const staleSince = Date.now() - _lastReaderActivity;
-      if (staleSince < 20000) return; // Active recently, probably fine
-
-      // Reader hasn't produced data in 5+ seconds after tab resume.
-      // Give it a short grace period then recover.
-      console.warn('[tab-recovery] Stream appears frozen (no activity for ' + Math.round(staleSince/1000) + 's). Recovering...');
-
-      setTimeout(() => {
-        // Re-check — maybe the reader woke up during the grace period
-        if (!isStreaming) return;
-        const stillStale = Date.now() - _lastReaderActivity;
-        if (stillStale < 5000) return; // Came back to life
-
-        console.warn('[tab-recovery] Stream confirmed dead. Aborting and reloading session.');
-
-        // Abort the frozen stream, but preserve the visible bubble.
-        if (currentAbort) {
-          currentAbort._reason = 'recovery';
-          currentAbort.abort();
-        }
-        isStreaming = false;
-
-        // Release Web Lock
-        if (_webLockRelease) {
-          _webLockRelease();
-          _webLockRelease = null;
-        }
-
-        // Reset UI state
-        var _submitBtn = document.getElementById('submit');
-        updateSubmitButton('idle', _submitBtn);
-        var _msgInput = document.getElementById('message');
-        if (_msgInput) _msgInput.disabled = false;
-      }, 2000); // 2 second grace period
+      if (document.visibilityState !== 'visible') {
+        for (const active of _activeStreams.values()) active.wasAway = true;
+        return;
+      }
+      _restoreQueuedRequestsForCurrentSession();
+      _probeStaleLocalStream().then(() => {
+        _drainQueuedAgentRequests();
+      }).catch(err => {
+        console.warn('[tab-recovery] Server status probe failed:', err);
+      });
     });
 
     // On mobile, fade out welcome text when keyboard opens to prevent overlap
@@ -3309,7 +6664,8 @@ import createResearchSynapse from './researchSynapse.js';
     if (msgIndex < 0) return;
 
     const bodyEl = userMsgElement.querySelector('.body');
-    const currentText = bodyEl ? bodyEl.textContent.trim().replace(/\s*\[\d+ attachment\(s\)\]$/, '') : '';
+    let currentText = (userMsgElement.dataset.raw || (bodyEl ? bodyEl.textContent : '') || '').trim();
+    currentText = currentText.replace(/\s*\[\d+ attachment\(s\)\]$/, '');
 
     // Replace body with an editable textarea
     const editor = document.createElement('textarea');
@@ -3375,7 +6731,9 @@ import createResearchSynapse from './researchSynapse.js';
 
     // Also submit on Enter (without shift)
     editor.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && !e.shiftKey) {
+      const isMobile = window.innerWidth <= 768
+
+      if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && !isMobile) {
         e.preventDefault();
         saveBtn.click();
       }
@@ -3383,9 +6741,13 @@ import createResearchSynapse from './researchSynapse.js';
   }
 
   /**
-   * Resend a user message — truncates history to that point and resubmits.
+   * Resend a user message. By default this replaces from the selected user turn
+   * so failed attempts do not remain in model context or SFT traces. Callers can
+   * opt into append-only behavior with `{ append: true }`.
    */
-  export async function resendUserMessage(userMsgElement) {
+  export async function resendUserMessage(userMsgElement, opts = {}) {
+    const appendOnly = Boolean(opts && opts.append);
+    const replaceFromHere = !appendOnly || Boolean(opts && opts.replaceFromHere);
     const box = document.getElementById('chat-history');
     const allMsgs = Array.from(box.querySelectorAll('.msg'));
     const msgIndex = allMsgs.indexOf(userMsgElement);
@@ -3431,25 +6793,29 @@ import createResearchSynapse from './researchSynapse.js';
     const sessionId = sessionModule.getCurrentSessionId();
     if (!sessionId) return;
 
-    // Truncate backend to keep everything before this user message
-    const keepCount = msgIndex;
     try {
-      await fetch(`${API_BASE}/api/session/${sessionId}/truncate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ keep_count: keepCount })
-      });
+      if (replaceFromHere) {
+        // Resend/regenerate trims history to this point before resubmitting so
+        // the replacement request is the only copy the backend sees.
+        const keepCount = msgIndex;
+        const beforeMsgId = userMsgElement.dataset.dbId || '';
+        const truncateBody = beforeMsgId ? { before_msg_id: beforeMsgId } : { keep_count: keepCount };
+        const truncateRes = await fetch(`${API_BASE}/api/session/${sessionId}/truncate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(truncateBody)
+        });
+        if (!truncateRes.ok) throw new Error('Server error ' + truncateRes.status);
 
-      // Drop the AI replies after the user message but KEEP the user bubble
-      // itself (so its photo stays visible). Then suppress the new user
-      // bubble that send would otherwise add — same pattern as regenerate.
-      let sibling = userMsgElement.nextSibling;
-      while (sibling) {
-        const next = sibling.nextSibling;
-        sibling.remove();
-        sibling = next;
+        // Drop the selected user turn and every rendered trace after it,
+        // including agent-thread tool history that is not a `.msg` bubble.
+        let node = userMsgElement;
+        while (node) {
+          const prev = node;
+          node = node.nextElementSibling;
+          prev.remove();
+        }
       }
-      _hideUserBubble = true;
       _pendingRegenAttachments = _ids;
 
       // Resubmit
@@ -3555,15 +6921,19 @@ import createResearchSynapse from './researchSynapse.js';
         body: JSON.stringify({ keep_count: keepCount })
       });
 
-      for (let i = allMsgs.length - 1; i > aiIndex; i--) {
-        allMsgs[i].remove();
+      // Keep the original user bubble, but remove every rendered trace after
+      // it, including agent-thread tool history between the user and AI bubble.
+      let node = userMsgEl.nextElementSibling;
+      while (node) {
+        const prev = node;
+        node = node.nextElementSibling;
+        prev.remove();
       }
 
-      // Remove the AI message from DOM — it will be replaced by the new streaming response
+      // The old AI message was removed from DOM — it will be replaced by the new streaming response
       // But first, stash the variants data so we can transfer it to the new element
       _pendingVariants = variants;
       _pendingVariantLabel = 'regen';
-      aiMsgElement.remove();
 
       _hideUserBubble = true;
       const messageInput = uiModule.el('message');
@@ -3751,7 +7121,10 @@ import createResearchSynapse from './researchSynapse.js';
     if (!sessionId) return;
     try {
       const res = await fetch(`${API_BASE}/api/research/status/${sessionId}`);
-      if (!res.ok) return; // 404 = no research for this session
+      if (!res.ok) {
+        if (sessionModule && sessionModule.clearResearching) sessionModule.clearResearching(sessionId);
+        return; // 404 = no research for this session
+      }
       const data = await res.json();
 
       if (data.status === 'done') {
@@ -3818,7 +7191,7 @@ import createResearchSynapse from './researchSynapse.js';
       const roleTs = new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
       const agentMeta = sessionModule.getSessions().find(s => s.id === sessionModule.getCurrentSessionId());
       const agentModelLabel = _shortModel(agentMeta?.model);
-      holder.innerHTML = `<div class="role">${agentModelLabel} <span class="role-timestamp">${roleTs}</span></div><div class="body"></div>`;
+      holder.innerHTML = `<div class="role">${uiModule.esc(agentModelLabel)} <span class="role-timestamp">${roleTs}</span></div><div class="body"></div>`;
       _applyModelColor(holder.querySelector('.role'), agentMeta?.model);
       box.appendChild(holder);
 
@@ -3983,13 +7356,25 @@ import createResearchSynapse from './researchSynapse.js';
    * Delete an AI message and its preceding user message from the conversation.
    */
   export async function deleteMessage(msgElement) {
+    if (uiModule && uiModule.styledConfirm) {
+      const ok = await uiModule.styledConfirm('Delete this message?', {
+        confirmText: 'Delete',
+        cancelText: 'Cancel',
+        danger: true,
+      });
+      if (!ok) return;
+    }
+
     const box = document.getElementById('chat-history');
     const allMsgs = Array.from(box.querySelectorAll('.msg'));
     const clickedIndex = allMsgs.indexOf(msgElement);
     if (clickedIndex < 0) return;
 
+    // No early-out on a missing session: an output shown before any model was
+    // selected (issue #1428) has no session/persisted rows, but its "x" must
+    // still remove it. We only need the session id for the server-side delete
+    // below; without one we fall back to removing the DOM.
     const sessionId = sessionModule.getCurrentSessionId();
-    if (!sessionId) return;
 
     const clickedIsUser = msgElement.classList.contains('msg-user');
 
@@ -4065,8 +7450,10 @@ import createResearchSynapse from './researchSynapse.js';
       }
     }
 
-    if (!msgIds.length) {
-      // Fallback: just remove DOM elements if no DB IDs available
+    if (!msgIds.length || !sessionId) {
+      // No persisted rows to delete (no DB IDs, or no session at all — e.g. an
+      // error output shown before a model was selected, #1428). Just remove the
+      // DOM so the "x" works regardless.
       domToRemove.forEach(el => el.remove());
       if (uiModule) uiModule.showToast('Message deleted');
       return;
@@ -4281,9 +7668,10 @@ import createResearchSynapse from './researchSynapse.js';
       // never closes (so it would otherwise hide the whole answer). Peel all of
       // those off so what's left is just the rewritten text.
       const _stripThink = (t) => {
-        t = t.replace(/<think>[\s\S]*?<\/think>/gi, '');   // complete blocks
-        if (/<\/think>/i.test(t)) t = t.replace(/^[\s\S]*?<\/think>/i, '');  // reasoning w/o opener
-        return t.replace(/<\/?think>/gi, '').trim();        // any orphan tag
+        t = markdownModule.normalizeThinkingMarkup(t || '');
+        t = t.replace(/<(?:think(?:ing)?|thought)(?:\s+[^>]*)?>[\s\S]*?<\/(?:think(?:ing)?|thought)>/gi, '');   // complete blocks
+        if (/<\/(?:think(?:ing)?|thought)>/i.test(t)) t = t.replace(/^[\s\S]*?<\/(?:think(?:ing)?|thought)>/i, '');  // reasoning w/o opener
+        return t.replace(/<\/?(?:think(?:ing)?|thought)(?:\s+[^>]*)?>/gi, '').trim();        // any orphan tag
       };
       newText = _stripThink(newText);
 
@@ -4370,7 +7758,7 @@ import createResearchSynapse from './researchSynapse.js';
     // Images → Gallery editor.
     if (isImage) {
       try {
-        const gx = await import('./galleryEditor.js');
+        const gx = await loadPanel('editor');
         if (gx.openEditor) { gx.openEditor(url, id, null, name); return; }
       } catch (e) { console.warn('gallery open failed', e); }
       window.open(url, '_blank');
@@ -4433,7 +7821,7 @@ import createResearchSynapse from './researchSynapse.js';
       }
     } catch (e) {
       console.error('open attachment as document failed', e);
-      import('./ui.js').then(m => m.showError && m.showError('Could not open attachment')).catch(() => {});
+      import('./ui.js?v=20260908weekhoverfix1').then(m => m.showError && m.showError('Could not open attachment')).catch(() => {});
       window.open(url, '_blank');  // fallback so the file is still reachable
     }
   }
@@ -4449,6 +7837,7 @@ import createResearchSynapse from './researchSynapse.js';
     abortCurrentRequest,
     detachCurrentStream,
     checkBackgroundStream,
+    resumeStream,
     hideWelcomeScreen: chatRenderer.hideWelcomeScreen,
     showWelcomeScreen: chatRenderer.showWelcomeScreen,
     checkPendingResearch,
@@ -4466,6 +7855,14 @@ import createResearchSynapse from './researchSynapse.js';
     continueFrom,
     _appendViewReportLink,
     hasActiveStream,
+    openContextSettings: () => {
+      const pill = document.getElementById('chat-context-pill');
+      if (pill && !pill.hidden) {
+        pill.click();
+        return true;
+      }
+      return false;
+    },
   };
 
   // Single delegated handler for tool-call fold/expand. One listener on
@@ -4474,12 +7871,51 @@ import createResearchSynapse from './researchSynapse.js';
   // per-node listeners on every innerHTML rewrite was the source of the
   // "needs many clicks" bug.
   if (!window.__odysseus_thread_click_bound) {
-    document.body.addEventListener('click', (e) => {
+	    document.body.addEventListener('click', (e) => {
+	      const browserFrame = e.target.closest('.private-browser-preview-frame');
+	      if (browserFrame && browserFrame.querySelector('.private-browser-preview-img[src]')) {
+	        const preview = browserFrame.closest('.private-browser-preview');
+	        const url = preview && preview.dataset ? String(preview.dataset.browserUrl || '') : '';
+	        if (url) {
+	          e.preventDefault();
+	          e.stopPropagation();
+	          window.open(url, '_blank', 'noopener,noreferrer');
+	          return;
+	        }
+	      }
+	      const browserFold = e.target.closest('.private-browser-preview-fold');
+	      const browserHeader = e.target.closest('.private-browser-preview-header');
+      if (browserFold || browserHeader) {
+        e.preventDefault();
+        e.stopPropagation();
+        const preview = (browserFold || browserHeader).closest('.private-browser-preview');
+        if (preview) {
+          preview.classList.toggle('folded');
+          const foldButton = preview.querySelector('.private-browser-preview-fold');
+          if (foldButton) {
+            foldButton.textContent = preview.classList.contains('folded') ? '+' : '×';
+            foldButton.title = preview.classList.contains('folded') ? 'Unfold browser preview' : 'Fold browser preview';
+            foldButton.setAttribute('aria-label', foldButton.title);
+          }
+        }
+        return;
+      }
       const header = e.target.closest('.agent-thread-header');
       if (!header) return;
+      if (e.target.closest('.agent-thread-header-link')) return;
       const node = header.closest('.agent-thread-node');
       if (!node) return;
-      node.classList.toggle('open');
+      if (node.classList.contains('browser-preview-node')) return;
+      const opened = node.classList.toggle('open');
+      if (opened) {
+        // Expanding the final tool trace can push a pending ask_user card below
+        // the viewport.  Keep that immediately-adjacent prompt visible.
+        const thread = node.closest('.agent-thread');
+        const pendingCard = thread?.nextElementSibling;
+        if (pendingCard?.classList.contains('ask-user-card')) {
+          requestAnimationFrame(() => pendingCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' }));
+        }
+      }
     });
     window.__odysseus_thread_click_bound = true;
   }

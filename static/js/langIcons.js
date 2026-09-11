@@ -4,6 +4,11 @@
 // inset-on-a-page-outline approach. Designed to read clearly at 12–14px.
 
 const ICONS = {
+  // Rich text — a bold serif-style A with an underline.
+  richtext:
+    '<path d="M5 18 10.5 5h3L19 18"/>' +
+    '<line x1="7" y1="14" x2="17" y2="14"/>' +
+    '<line x1="4" y1="21" x2="20" y2="21"/>',
   // Markdown — the official "M↓" logo silhouette, simplified.
   markdown:
     '<rect x="2" y="5" width="20" height="14" rx="2"/>' +
@@ -148,6 +153,7 @@ const ICONS = {
 };
 
 const ALIASES = {
+  'rich-text': 'richtext',
   md: 'markdown',
   py: 'python',
   htm: 'html',
@@ -175,8 +181,8 @@ export function langIcon(lang, size = 14, opts = {}) {
   const key = String(lang).toLowerCase();
   const inner = ICONS[key] || ICONS[ALIASES[key]] || '';
   if (!inner) return '';
-  const cls = opts.className ? ` class="${opts.className}"` : '';
-  const style = opts.style ? ` style="${opts.style}"` : '';
+  const cls = (opts && opts.className) ? ` class="${opts.className}"` : '';
+  const style = (opts && opts.style) ? ` style="${opts.style}"` : '';
   return (
     `<svg${cls}${style} width="${size}" height="${size}" viewBox="0 0 24 24" ` +
     `fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">` +

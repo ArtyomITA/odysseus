@@ -24,9 +24,12 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
 
+from core.platform_compat import safe_chmod
+from src.constants import APP_KEY_FILE
+
 logger = logging.getLogger(__name__)
 
-_KEY_PATH = Path(__file__).resolve().parent.parent / "data" / ".app_key"
+_KEY_PATH = Path(APP_KEY_FILE)
 _PREFIX = "enc:"
 _fernet: Fernet | None = None
 
@@ -37,10 +40,9 @@ def _load_or_create_key() -> bytes:
     _KEY_PATH.parent.mkdir(parents=True, exist_ok=True)
     key = Fernet.generate_key()
     _KEY_PATH.write_bytes(key)
-    try:
-        os.chmod(_KEY_PATH, 0o600)
-    except Exception:
-        pass
+    # POSIX: lock the key to 0o600. Windows: no-op (the user-profile data dir is
+    # already ACL-restricted); safe_chmod swallows both cases.
+    safe_chmod(_KEY_PATH, 0o600)
     logger.info(f"Generated new app key at {_KEY_PATH}")
     return key
 

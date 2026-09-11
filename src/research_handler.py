@@ -16,10 +16,62 @@ from pathlib import Path
 from typing import Optional, Dict
 
 from src.research_utils import strip_thinking, is_low_quality
+from src.constants import DEEP_RESEARCH_DIR
 
 logger = logging.getLogger(__name__)
 
-RESEARCH_DATA_DIR = Path("data/deep_research")
+RESEARCH_DATA_DIR = Path(DEEP_RESEARCH_DIR)
+_RESEARCH_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9-]{1,128}$")
+_SEARCH_CONTINUATIONS = {
+    "search",
+    "search this",
+    "can you search",
+    "can you search this",
+    "please search",
+    "look it up",
+    "look this up",
+    "web search",
+    "use web",
+    "search online",
+}
+
+
+def _bounded_int(value, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, n))
+
+
+def _format_probe_failure(model: str, exc: Exception) -> str:
+    """Turn a failed research model probe into a user-facing message."""
+    detail = getattr(exc, "detail", None)
+    status = getattr(exc, "status_code", None)
+    err = str(detail if detail is not None else exc).strip()
+
+    if status in {401, 403} or "401" in err or "API key" in err or "Unauthorized" in err:
+        return f"Model '{model}' requires an API key. Check your endpoint configuration."
+
+    if status and err:
+        return f"Model '{model}' probe failed: {err}"
+
+    if err:
+        return f"Cannot reach model '{model}' — {err}"
+
+    return f"Cannot reach model '{model}' — check that the endpoint is running and accessible."
+
+
+def _research_json_path(session_id: str) -> Optional[Path]:
+    if not isinstance(session_id, str) or not _RESEARCH_SESSION_ID_RE.fullmatch(session_id):
+        return None
+    root = RESEARCH_DATA_DIR.resolve()
+    path = (RESEARCH_DATA_DIR / f"{session_id}.json").resolve()
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return None
+    return path
 
 
 class ResearchHandler:
@@ -61,8 +113,44 @@ class ResearchHandler:
         """
         # Build conversation context from history
         history = getattr(sess, 'history', [])
+
+        # A bare affirmation ("yes", "ok", "go ahead") is the user accepting the
+        # clarifying-question round, NOT a research topic — researching the word
+        # "yes" is the classic failure here. When synthesis can't run or fails,
+        # fall back to the earliest substantive user message (the original ask)
+        # rather than the literal follow-up.
+        #
+        # Match on an explicit affirmation/continuation phrase only (plus the
+        # empty/punctuation-only case). We deliberately do NOT use a length
+        # heuristic: a short answer like "UK", "C++", or "Rust" is a real topic
+        # in a clarification flow and must be left untouched.
+        _AFFIRMATIONS = {
+            "yes", "y", "yeah", "yep", "yup", "sure", "sure thing", "ok", "okay",
+            "k", "kk", "go", "go ahead", "go for it", "do it", "please",
+            "yes please", "sounds good", "continue", "proceed", "lets go",
+            "let's go", "yes go ahead",
+        }
+
+        def _normalize(text: str) -> str:
+            return (text or "").strip().lower().strip("!.? ")
+
+        def _is_continuation(text: str) -> bool:
+            normalized = re.sub(r"\s+", " ", _normalize(text))
+            return normalized in _AFFIRMATIONS or normalized in _SEARCH_CONTINUATIONS
+
+        def _fallback() -> str:
+            normalized = _normalize(latest_message)
+            if normalized and not _is_continuation(latest_message):
+                return latest_message  # short or long, it's a real topic
+            # Affirmation, or empty/punctuation-only: use the original ask.
+            for m in history:
+                c = (m.content or "").strip()
+                if m.role == "user" and c and not _is_continuation(c):
+                    return c
+            return latest_message
+
         if len(history) <= 1:
-            return latest_message  # No conversation to synthesize
+            return _fallback()  # No conversation to synthesize
 
         # Take last 6 messages max for context
         recent = history[-6:]
@@ -96,17 +184,17 @@ class ResearchHandler:
         except Exception as e:
             logger.warning(f"Query synthesis failed: {e}")
 
-        return latest_message  # Fallback
+        return _fallback()
 
     async def generate_plan(
         self, query: str, llm_endpoint: str, llm_model: str, llm_headers: dict = None,
     ) -> Optional[dict]:
         """Generate a research plan for user review before starting research."""
         try:
-            from src.deep_research import RESEARCH_PLAN_PROMPT
+            from src.deep_research import RESEARCH_PLAN_PROMPT, current_date_context
             from src.llm_core import llm_call_async
 
-            prompt = RESEARCH_PLAN_PROMPT.format(question=query)
+            prompt = current_date_context() + RESEARCH_PLAN_PROMPT.format(question=query)
             response = await llm_call_async(
                 url=llm_endpoint,
                 model=llm_model,
@@ -149,6 +237,22 @@ class ResearchHandler:
     # Task registry — background research with persistence
     # ------------------------------------------------------------------
 
+    def rename_owner(self, old_owner: str, new_owner: str) -> int:
+        """Move in-flight research tasks from one owner key to another."""
+        old_key = str(old_owner or "").strip().lower()
+        new_key = str(new_owner or "").strip().lower()
+        if not old_key or not new_key:
+            return 0
+
+        changed = 0
+        for entry in list(self._active_tasks.values()):
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("owner", "")).strip().lower() == old_key:
+                entry["owner"] = new_key
+                changed += 1
+        return changed
+
     def start_research(
         self,
         session_id: str,
@@ -156,7 +260,7 @@ class ResearchHandler:
         llm_endpoint: str,
         llm_model: str,
         max_time: int = 300,
-        hard_timeout: int = 600,
+        hard_timeout: int = None,
         llm_headers: dict = None,
         on_complete: callable = None,
         prior_report: str = "",
@@ -165,6 +269,8 @@ class ResearchHandler:
         max_rounds: int = 20,
         search_provider: str = None,
         category: str = None,
+        extraction_timeout: int = None,
+        extraction_concurrency: int = None,
         owner: str = "",
     ) -> dict:
         """Start research as a background task. Returns task info dict.
@@ -172,6 +278,31 @@ class ResearchHandler:
         max_rounds is the safety cap; the AI's _should_stop decision (after
         min_rounds) terminates the loop earlier in normal operation.
         """
+        if _research_json_path(session_id) is None:
+            raise ValueError("Invalid research session_id")
+
+        # Resolve the hard wall-clock timeout from settings when the caller
+        # didn't pin one. Local / edge models routinely need more than the
+        # old 600s default to finish a deep-research synthesis. A setting of
+        # 0 disables the cap entirely (unlimited run); any other value is
+        # bounded to [60, 86400] so a misconfigured settings.json can't
+        # explode into a multi-day hang.
+        if hard_timeout is None:
+            from src.settings import get_setting
+            try:
+                raw_timeout = int(get_setting("research_run_timeout_seconds", 1800))
+            except (TypeError, ValueError):
+                raw_timeout = 1800
+            if raw_timeout <= 0:
+                hard_timeout = None  # 0 = no wall-clock cap (asyncio.wait_for timeout=None)
+            else:
+                hard_timeout = _bounded_int(
+                    raw_timeout,
+                    default=1800,
+                    minimum=60,
+                    maximum=86400,
+                )
+
         # Cancel any existing research for this session
         if session_id in self._active_tasks:
             existing = self._active_tasks[session_id]
@@ -187,6 +318,7 @@ class ResearchHandler:
             "result": None,
             "started_at": time.time(),
             "category": category,
+            "mode": "research",
             # SECURITY: track ownership so all reads / saves can filter by user.
             "owner": owner or "",
         }
@@ -222,6 +354,9 @@ class ResearchHandler:
                         max_rounds=max_rounds,
                         search_provider=search_provider,
                         category=category,
+                        session_id=session_id,
+                        extraction_timeout=extraction_timeout,
+                        extraction_concurrency=extraction_concurrency,
                     ),
                     timeout=hard_timeout,
                 )
@@ -262,8 +397,26 @@ class ResearchHandler:
                 raise
             except Exception as e:
                 logger.error(f"Background research failed: {e}", exc_info=True)
-                entry["result"] = str(e)
-                entry["status"] = "error"
+                # Preserve partial findings if available (mirrors timeout branch)
+                researcher = entry.get("researcher")
+                if researcher and researcher.evolving_report:
+                    _elapsed = time.time() - entry["started_at"]
+                    entry["result"] = self._format_research_report(
+                        query, researcher.evolving_report,
+                        researcher.get_stats(), _elapsed,
+                    )
+                    entry["status"] = "done"
+                    self._save_result(session_id, entry)
+                    try:
+                        sources = self._extract_sources(researcher.findings) if researcher.findings else []
+                        findings = self._extract_raw_findings(researcher.findings) if researcher.findings else []
+                        _guarded_complete(session_id, entry["result"], sources, findings)
+                    except Exception as cb_err:
+                        logger.warning(f"on_complete callback failed in error branch: {cb_err}")
+                    on_progress({"phase": "warning", "message": f"Research finished with errors — partial results saved ({_elapsed:.0f}s elapsed)"})
+                else:
+                    entry["result"] = str(e)
+                    entry["status"] = "error"
 
         task = asyncio.create_task(_run())
         entry["task"] = task
@@ -271,7 +424,6 @@ class ResearchHandler:
 
     def get_status(self, session_id: str) -> Optional[dict]:
         """Get current research status for a session."""
-        avg = self.get_avg_duration()
         if session_id in self._active_tasks:
             entry = self._active_tasks[session_id]
             result = {
@@ -279,15 +431,31 @@ class ResearchHandler:
                 "progress": entry["progress"],
                 "query": entry["query"],
                 "started_at": entry["started_at"],
+                "category": (
+                    getattr(entry.get("researcher"), "category", None)
+                    or entry.get("category")
+                    or ""
+                ),
+                "mode": entry.get("mode") or "research",
             }
+            # avg_duration is a historical figure over completed reports on
+            # disk; get_avg_duration() globs and JSON-parses the whole research
+            # dir, so compute it at most once per active stream (memoized on the
+            # entry) instead of on every ~1s SSE poll. The disk branch below
+            # never used it, so it no longer pays that cost at all.
+            if "_avg_duration" not in entry:
+                entry["_avg_duration"] = self.get_avg_duration()
+            avg = entry["_avg_duration"]
             if avg is not None:
                 result["avg_duration"] = round(avg, 1)
             return result
         # Check disk for completed research (skip consumed results)
-        path = RESEARCH_DATA_DIR / f"{session_id}.json"
+        path = _research_json_path(session_id)
+        if path is None:
+            return None
         if path.exists():
             try:
-                data = json.loads(path.read_text())
+                data = json.loads(path.read_text(encoding="utf-8"))
                 if data.get("consumed"):
                     return None
                 return {
@@ -295,10 +463,32 @@ class ResearchHandler:
                     "progress": {},
                     "query": data.get("query", ""),
                     "started_at": data.get("started_at", 0),
+                    "category": data.get("category") or "",
+                    "mode": data.get("mode") or "research",
                 }
             except Exception:
                 pass
         return None
+
+    def get_category(self, session_id: str) -> str:
+        """Return the requested or auto-resolved report format."""
+        if session_id in self._active_tasks:
+            entry = self._active_tasks[session_id]
+            researcher = entry.get("researcher")
+            return str(
+                getattr(researcher, "category", None)
+                or entry.get("category")
+                or ""
+            )
+        data = self._get_session_json(session_id)
+        return str(data.get("category") or "") if isinstance(data, dict) else ""
+
+    def get_mode(self, session_id: str) -> str:
+        """Return whether the task performs research or a model-only explanation."""
+        if session_id in self._active_tasks:
+            return str(self._active_tasks[session_id].get("mode") or "research")
+        data = self._get_session_json(session_id)
+        return str(data.get("mode") or "research") if isinstance(data, dict) else "research"
 
     def cancel_research(self, session_id: str) -> bool:
         """Cancel running research for a session."""
@@ -323,10 +513,12 @@ class ResearchHandler:
             if entry["status"] in ("done", "error", "cancelled"):
                 return entry.get("result")
         # Check disk (skip consumed results)
-        path = RESEARCH_DATA_DIR / f"{session_id}.json"
+        path = _research_json_path(session_id)
+        if path is None:
+            return None
         if path.exists():
             try:
-                data = json.loads(path.read_text())
+                data = json.loads(path.read_text(encoding="utf-8"))
                 if data.get("consumed"):
                     return None
                 return data.get("result")
@@ -345,10 +537,12 @@ class ResearchHandler:
             if researcher and researcher.findings:
                 return self._extract_sources(researcher.findings)
         # Check disk
-        path = RESEARCH_DATA_DIR / f"{session_id}.json"
+        path = _research_json_path(session_id)
+        if path is None:
+            return None
         if path.exists():
             try:
-                data = json.loads(path.read_text())
+                data = json.loads(path.read_text(encoding="utf-8"))
                 return data.get("sources")
             except Exception:
                 pass
@@ -362,14 +556,97 @@ class ResearchHandler:
             if researcher and researcher.findings:
                 return self._extract_raw_findings(researcher.findings)
         # Check disk
-        path = RESEARCH_DATA_DIR / f"{session_id}.json"
+        path = _research_json_path(session_id)
+        if path is None:
+            return None
         if path.exists():
             try:
-                data = json.loads(path.read_text())
+                data = json.loads(path.read_text(encoding="utf-8"))
                 return data.get("raw_findings")
             except Exception as e:
                 logger.warning(f"Failed to read raw findings for {session_id}: {e}")
         return None
+
+    def get_analyzed_urls(self, session_id: str) -> Optional[list]:
+        """Get all analyzed URLs, including pages that did not yield findings."""
+        if session_id in self._active_tasks:
+            researcher = self._active_tasks[session_id].get("researcher")
+            if researcher:
+                return list(getattr(researcher, "analyzed_urls", []) or [])
+        data = self._get_session_json(session_id)
+        if isinstance(data, dict):
+            return data.get("analyzed_urls")
+        return None
+
+    def get_source_state(self, session_id: str) -> str:
+        """Get compact source-quality/gap state for UI/debug display."""
+        if session_id in self._active_tasks:
+            researcher = self._active_tasks[session_id].get("researcher")
+            if researcher:
+                try:
+                    return researcher._source_state_summary()
+                except Exception:
+                    return ""
+        data = self._get_session_json(session_id)
+        if isinstance(data, dict):
+            return str(data.get("source_state") or "")
+        return ""
+
+    def get_source_coverage(self, session_id: str) -> dict:
+        """Get machine-readable source coverage stats for UI/debug display."""
+        if session_id in self._active_tasks:
+            researcher = self._active_tasks[session_id].get("researcher")
+            if researcher:
+                try:
+                    coverage = researcher._source_coverage()
+                    return coverage if isinstance(coverage, dict) else {}
+                except Exception:
+                    return {}
+        data = self._get_session_json(session_id)
+        if isinstance(data, dict):
+            coverage = data.get("source_coverage")
+            return coverage if isinstance(coverage, dict) else {}
+        return {}
+
+    def get_navigation_trace(self, session_id: str) -> list:
+        """Get bounded research navigation/tool observations for debugging."""
+        if session_id in self._active_tasks:
+            researcher = self._active_tasks[session_id].get("researcher")
+            if researcher:
+                trace = getattr(researcher, "navigation_trace", []) or []
+                return list(trace) if isinstance(trace, list) else []
+        data = self._get_session_json(session_id)
+        if isinstance(data, dict):
+            trace = data.get("navigation_trace")
+            return trace if isinstance(trace, list) else []
+        return []
+
+    def get_action_trace(self, session_id: str) -> list:
+        """Get bounded research planner actions for debugging."""
+        if session_id in self._active_tasks:
+            researcher = self._active_tasks[session_id].get("researcher")
+            if researcher:
+                trace = getattr(researcher, "action_trace", []) or []
+                return list(trace) if isinstance(trace, list) else []
+        data = self._get_session_json(session_id)
+        if isinstance(data, dict):
+            trace = data.get("action_trace")
+            return trace if isinstance(trace, list) else []
+        return []
+
+    @staticmethod
+    def _source_metadata(f: dict) -> dict:
+        meta = {}
+        for key in ("retrieval", "source_kind", "source_reason"):
+            value = f.get(key)
+            if value:
+                meta[key] = value
+        try:
+            score = int(f.get("source_score"))
+            meta["source_score"] = score
+        except (TypeError, ValueError):
+            pass
+        return meta
 
     @staticmethod
     def _extract_sources(findings: list) -> list:
@@ -377,6 +654,8 @@ class ResearchHandler:
         seen = set()
         sources = []
         for f in findings:
+            if not isinstance(f, dict):
+                continue
             url = f.get("url", "")
             title = f.get("title", "") or url
             summary = f.get("summary", "") or f.get("evidence", "")
@@ -386,6 +665,7 @@ class ResearchHandler:
                 og_img = f.get("og_image", "")
                 if og_img:
                     entry["image"] = og_img
+                entry.update(ResearchHandler._source_metadata(f))
                 sources.append(entry)
         return sources
 
@@ -395,13 +675,17 @@ class ResearchHandler:
         try:
             items = []
             for f in findings:
+                if not isinstance(f, dict):
+                    continue
                 url = f.get("url", "")
                 title = f.get("title", "") or "Untitled"
                 summary = f.get("summary", "")
                 evidence = f.get("evidence", "")
                 content = summary if summary else (evidence[:2000] if evidence else "")
                 if url and content and not is_low_quality(content):
-                    items.append({"url": url, "title": title, "summary": content})
+                    item = {"url": url, "title": title, "summary": content}
+                    item.update(ResearchHandler._source_metadata(f))
+                    items.append(item)
             return items
         except Exception as e:
             logger.warning(f"Failed to extract raw findings: {e}")
@@ -413,7 +697,7 @@ class ResearchHandler:
         try:
             for p in RESEARCH_DATA_DIR.glob("*.json"):
                 try:
-                    data = json.loads(p.read_text())
+                    data = json.loads(p.read_text(encoding="utf-8"))
                     if data.get("status") == "done":
                         started = data.get("started_at", 0)
                         completed = data.get("completed_at", 0)
@@ -433,18 +717,24 @@ class ResearchHandler:
         Keeps the JSON on disk so visual reports can be generated later.
         """
         self._active_tasks.pop(session_id, None)
-        path = RESEARCH_DATA_DIR / f"{session_id}.json"
+        path = _research_json_path(session_id)
+        if path is None:
+            return
         if path.exists():
             try:
-                data = json.loads(path.read_text())
+                data = json.loads(path.read_text(encoding="utf-8"))
                 data["consumed"] = True
-                path.write_text(json.dumps(data))
+                path.write_text(json.dumps(data), encoding="utf-8")
             except Exception:
                 pass
 
     def _save_result(self, session_id: str, entry: dict):
         """Persist completed research result to disk."""
         try:
+            path = _research_json_path(session_id)
+            if path is None:
+                logger.error("Refusing to save research result for invalid session_id: %r", session_id)
+                return
             # Extract and cache sources + raw findings
             sources = []
             raw_findings = []
@@ -453,8 +743,25 @@ class ResearchHandler:
                 sources = self._extract_sources(researcher.findings)
                 raw_findings = self._extract_raw_findings(researcher.findings)
             entry["sources"] = sources
+            source_state = ""
+            source_coverage = {}
+            analyzed_urls = []
+            navigation_trace = []
+            action_trace = []
+            if researcher:
+                analyzed_urls = list(getattr(researcher, "analyzed_urls", []) or [])
+                trace = getattr(researcher, "navigation_trace", []) or []
+                navigation_trace = list(trace) if isinstance(trace, list) else []
+                planned = getattr(researcher, "action_trace", []) or []
+                action_trace = list(planned) if isinstance(planned, list) else []
+                try:
+                    source_state = researcher._source_state_summary()
+                    coverage = researcher._source_coverage()
+                    source_coverage = coverage if isinstance(coverage, dict) else {}
+                except Exception:
+                    source_state = ""
+                    source_coverage = {}
 
-            path = RESEARCH_DATA_DIR / f"{session_id}.json"
             data = {
                 "query": entry["query"],
                 "status": entry["status"],
@@ -462,14 +769,20 @@ class ResearchHandler:
                 "raw_report": entry.get("raw_report", ""),
                 "sources": sources,
                 "raw_findings": raw_findings,
+                "analyzed_urls": analyzed_urls,
+                "source_state": source_state,
+                "source_coverage": source_coverage,
+                "navigation_trace": navigation_trace,
+                "action_trace": action_trace,
                 "stats": entry.get("stats"),
                 "category": entry.get("category"),
+                "mode": entry.get("mode") or "research",
                 "started_at": entry["started_at"],
                 "completed_at": time.time(),
                 # SECURITY: stamp owner so route handlers can filter by user.
                 "owner": entry.get("owner", ""),
             }
-            path.write_text(json.dumps(data))
+            path.write_text(json.dumps(data), encoding="utf-8")
             logger.info(f"Research result saved to {path}")
             try:
                 from src.event_bus import fire_event
@@ -481,17 +794,85 @@ class ResearchHandler:
 
     def _get_session_json(self, session_id: str) -> Optional[dict]:
         """Load the saved research JSON for a session, if it exists."""
-        path = RESEARCH_DATA_DIR / f"{session_id}.json"
+        path = _research_json_path(session_id)
+        if path is None:
+            return None
         if path.exists():
             try:
-                return json.loads(path.read_text())
+                return json.loads(path.read_text(encoding="utf-8"))
             except Exception:
                 pass
         return None
 
+    @staticmethod
+    def _format_trace_value(value) -> str:
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        return text.replace("`", "'")
+
+    @staticmethod
+    def _research_diagnostics_markdown(data: dict) -> str:
+        """Collapsed debug section for visual research reports."""
+        if not isinstance(data, dict):
+            return ""
+        action_trace = data.get("action_trace") if isinstance(data.get("action_trace"), list) else []
+        navigation_trace = data.get("navigation_trace") if isinstance(data.get("navigation_trace"), list) else []
+        source_state = str(data.get("source_state") or "").strip()
+        if not action_trace and not navigation_trace and not source_state:
+            return ""
+
+        lines = [
+            "",
+            "---",
+            "",
+            '<details markdown="1">',
+            "<summary>Research trace</summary>",
+            "",
+        ]
+        if action_trace:
+            lines.extend(["### Planned Actions", ""])
+            for item in action_trace[-20:]:
+                if not isinstance(item, dict):
+                    continue
+                round_label = f"Round {item.get('round')}" if item.get("round") else "Round"
+                source = ResearchHandler._format_trace_value(item.get("source") or "planner")
+                tool = ResearchHandler._format_trace_value(item.get("tool") or "tool")
+                requested_by = ResearchHandler._format_trace_value(item.get("requested_by") or "")
+                target = ResearchHandler._format_trace_value(item.get("query") or item.get("url") or "")
+                if item.get("status") == "skipped":
+                    reason = ResearchHandler._format_trace_value(item.get("reason") or "skipped")
+                    lines.append(f"- **{round_label}** `{source}` skipped `{tool}` {target} — {reason}")
+                else:
+                    alias = f" via `{requested_by}`" if requested_by and requested_by != tool else ""
+                    lines.append(f"- **{round_label}** `{source}` -> `{tool}`{alias} {target}")
+            lines.append("")
+        if navigation_trace:
+            lines.extend(["### Navigation", ""])
+            for item in navigation_trace[-20:]:
+                if not isinstance(item, dict):
+                    continue
+                tool = ResearchHandler._format_trace_value(item.get("tool") or "tool")
+                status = ResearchHandler._format_trace_value(item.get("status") or "unknown")
+                target = ResearchHandler._format_trace_value(item.get("query") or item.get("title") or item.get("url") or "")
+                meta = []
+                if item.get("results") is not None:
+                    meta.append(f"{item.get('results')} results")
+                if item.get("source_kind"):
+                    meta.append(ResearchHandler._format_trace_value(item.get("source_kind")))
+                if item.get("source_score") is not None:
+                    meta.append(f"{item.get('source_score')}/100")
+                suffix = f" ({'; '.join(meta)})" if meta else ""
+                lines.append(f"- `{tool}` {target} -> **{status}**{suffix}")
+            lines.append("")
+        if source_state:
+            lines.extend(["### Source State", "", "```text", source_state[:2000], "```", ""])
+        lines.append("</details>")
+        return "\n".join(lines)
+
     def get_report_html(self, session_id: str) -> Optional[str]:
         """Generate the visual HTML report for a session (always fresh from JSON)."""
-        json_path = RESEARCH_DATA_DIR / f"{session_id}.json"
+        json_path = _research_json_path(session_id)
+        if json_path is None:
+            return None
         if not json_path.exists():
             logger.warning(f"No JSON found for visual report: {json_path}")
             return None
@@ -499,8 +880,11 @@ class ResearchHandler:
         try:
             from src.visual_report import generate_visual_report
 
-            data = json.loads(json_path.read_text())
+            data = json.loads(json_path.read_text(encoding="utf-8"))
             report_md = data.get("raw_report") or data.get("result", "")
+            diagnostics = self._research_diagnostics_markdown(data)
+            if diagnostics:
+                report_md = f"{report_md.rstrip()}\n{diagnostics}"
             html_content = generate_visual_report(
                 question=data.get("query", ""),
                 report_markdown=report_md,
@@ -518,16 +902,18 @@ class ResearchHandler:
 
     def hide_image(self, session_id: str, image_url: str) -> bool:
         """Add image_url to the persisted hidden_images list for a research."""
-        path = RESEARCH_DATA_DIR / f"{session_id}.json"
+        path = _research_json_path(session_id)
+        if path is None:
+            return False
         if not path.exists():
             return False
         try:
-            data = json.loads(path.read_text())
+            data = json.loads(path.read_text(encoding="utf-8"))
             hidden = data.get("hidden_images") or []
             if image_url not in hidden:
                 hidden.append(image_url)
                 data["hidden_images"] = hidden
-                path.write_text(json.dumps(data))
+                path.write_text(json.dumps(data), encoding="utf-8")
                 logger.info(f"Hid image {image_url[:80]} for research {session_id}")
             return True
         except Exception as e:
@@ -536,13 +922,15 @@ class ResearchHandler:
 
     def unhide_all_images(self, session_id: str) -> bool:
         """Clear the hidden_images list for a research."""
-        path = RESEARCH_DATA_DIR / f"{session_id}.json"
+        path = _research_json_path(session_id)
+        if path is None:
+            return False
         if not path.exists():
             return False
         try:
-            data = json.loads(path.read_text())
+            data = json.loads(path.read_text(encoding="utf-8"))
             data["hidden_images"] = []
-            path.write_text(json.dumps(data))
+            path.write_text(json.dumps(data), encoding="utf-8")
             logger.info(f"Cleared hidden_images for research {session_id}")
             return True
         except Exception as e:
@@ -568,14 +956,7 @@ class ResearchHandler:
             logger.info(f"Endpoint probe OK: {model}")
         except Exception as e:
             logger.error(f"Probe failed for {model}: {e}")
-            err = str(e)
-            if "401" in err or "API key" in err or "Unauthorized" in err:
-                raise RuntimeError(
-                    f"Model '{model}' requires an API key. Check your endpoint configuration."
-                ) from e
-            raise RuntimeError(
-                f"Cannot reach model '{model}' — check that the endpoint is running and accessible."
-            ) from e
+            raise RuntimeError(_format_probe_failure(model, e)) from e
 
     async def call_research_service(
         self,
@@ -592,6 +973,9 @@ class ResearchHandler:
         max_rounds: int = 20,
         search_provider: str = None,
         category: str = None,
+        extraction_timeout: int = None,
+        extraction_concurrency: int = None,
+        session_id: str = "",
     ) -> str:
         """
         Run iterative deep research using the LLM-in-the-loop DeepResearcher.
@@ -609,6 +993,12 @@ class ResearchHandler:
         Returns:
             Formatted research report with expandable section and summary
         """
+        if max_rounds < 0:
+            raise ValueError("max_rounds must be 0 or greater")
+        allowed_categories = {None, "product", "comparison", "howto", "factcheck"}
+        if category not in allowed_categories:
+            raise ValueError(f"Unsupported research category: {category}")
+
         is_continuation = bool(prior_report)
         logger.info(f"{'Continuing' if is_continuation else 'Starting'} IterResearch Deep Research")
         logger.info(f"Query: {query}")
@@ -617,7 +1007,7 @@ class ResearchHandler:
         if is_continuation:
             logger.info(f"Prior: {len(prior_findings or [])} findings, {len(prior_urls or set())} URLs")
 
-        # Probe the endpoint before committing to a long research run
+        # Probe the endpoint before committing to a long research run.
         if progress_callback:
             progress_callback({"phase": "probing", "model": llm_model})
         await self._probe_endpoint(llm_endpoint, llm_model, llm_headers)
@@ -627,18 +1017,47 @@ class ResearchHandler:
 
             from src.settings import get_setting
             _max_report_tokens = int(get_setting("research_max_tokens", 16384))
+            _extraction_timeout = _bounded_int(
+                extraction_timeout if extraction_timeout is not None else get_setting("research_extraction_timeout_seconds", 90),
+                default=90,
+                minimum=15,
+                maximum=3600,
+            )
+            _extraction_concurrency = _bounded_int(
+                extraction_concurrency if extraction_concurrency is not None else get_setting("research_extraction_concurrency", 3),
+                default=3,
+                minimum=1,
+                maximum=12,
+            )
+            _planning_timeout = _bounded_int(
+                get_setting("research_planning_timeout_seconds", _extraction_timeout),
+                default=_extraction_timeout,
+                minimum=15,
+                maximum=3600,
+            )
+            _query_timeout = _bounded_int(
+                get_setting("research_query_timeout_seconds", _extraction_timeout),
+                default=_extraction_timeout,
+                minimum=15,
+                maximum=3600,
+            )
 
             researcher = DeepResearcher(
                 llm_endpoint=llm_endpoint,
                 llm_model=llm_model,
                 llm_headers=llm_headers,
                 max_rounds=max_rounds,
-                min_rounds=min(3, max_rounds),
+                min_rounds=max(2, max_rounds - 2),
                 max_time=max_time,
                 max_report_tokens=_max_report_tokens,
+                extraction_timeout=_extraction_timeout,
+                planning_timeout=_planning_timeout,
+                query_timeout=_query_timeout,
+                extraction_concurrency=_extraction_concurrency,
                 progress_callback=progress_callback,
                 search_provider=search_provider,
                 category=category,
+                session_id=session_id,
             )
             if _task_entry is not None:
                 _task_entry["researcher"] = researcher
@@ -661,6 +1080,9 @@ class ResearchHandler:
             if _task_entry is not None:
                 _task_entry["raw_report"] = strip_thinking(report)
                 _task_entry["stats"] = stats
+                # Auto classification happens inside DeepResearcher. Keep the
+                # resolved format on the task so it survives every UI path.
+                _task_entry["category"] = researcher.category or category
 
             return self._format_research_report(query, report, stats, elapsed)
 
@@ -678,7 +1100,7 @@ class ResearchHandler:
             try:
                 import asyncio
                 logger.info("Falling back to legacy ResearchOrchestrator...")
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 result = await loop.run_in_executor(
                     None, self._legacy_engine.start_research, query, max_time
                 )

@@ -56,10 +56,11 @@ Use precise language. Show causal relationships explicitly. Quantify uncertainty
         "custom": {
             "name": "Custom",
             "temperature": 1.0,
-            "max_tokens": 0,
+            "max_tokens": 32768,
             "system_prompt": "",
             "inject_prefix": "",
             "inject_suffix": "",
+            "thinking_mode": "",
             "enabled": False,
         }
     }
@@ -75,8 +76,11 @@ Use precise language. Show causal relationships explicitly. Quantify uncertainty
             return self.DEFAULT_PRESETS.copy()
         
         try:
-            with open(self.presets_file, 'r') as f:
+            with open(self.presets_file, 'r', encoding="utf-8") as f:
                 presets = json.load(f)
+            if not isinstance(presets, dict):
+                logger.error("Error loading presets: expected an object")
+                return self.DEFAULT_PRESETS.copy()
             custom = presets.get("custom") if isinstance(presets, dict) else None
             if isinstance(custom, dict) and "enabled" not in custom:
                 legacy_prompt = "You are a helpful, balanced assistant. Match your response style to the user's needs."
@@ -88,10 +92,22 @@ Use precise language. Show causal relationships explicitly. Quantify uncertainty
                     custom["enabled"] = False
                     custom["system_prompt"] = ""
                     custom["temperature"] = 1.0
-                    custom["max_tokens"] = 0
+                    custom["max_tokens"] = self.DEFAULT_PRESETS["custom"]["max_tokens"]
                     custom.setdefault("inject_prefix", "")
                     custom.setdefault("inject_suffix", "")
                     self.save(presets)
+            # Heal a forward-incompatible file the same way the legacy `custom`
+            # migration above does: fill in any built-in presets an older or
+            # partial presets.json is missing, so they reach existing installs
+            # (a missing built-in is otherwise silently absent from the picker
+            # served by GET /api/presets). There is no delete path for the
+            # built-in keys, so this never clobbers an intentional removal.
+            # Defaults first, loaded values win — user edits are preserved.
+            if isinstance(presets, dict) and any(
+                k not in presets for k in self.DEFAULT_PRESETS
+            ):
+                presets = {**self.DEFAULT_PRESETS, **presets}
+                self.save(presets)
             return presets
         except Exception as e:
             logger.error(f"Error loading presets: {e}")
@@ -100,9 +116,12 @@ Use precise language. Show causal relationships explicitly. Quantify uncertainty
     def save(self, presets: Dict[str, Any]) -> bool:
         """Save presets to file"""
         try:
-            os.makedirs(os.path.dirname(self.presets_file), exist_ok=True)
-            with open(self.presets_file, 'w') as f:
-                json.dump(presets, f, indent=2)
+            # Atomic write (tmp file + os.replace) so a crash or serialization
+            # error mid-write can't truncate presets.json and lose every saved
+            # preset. Lazy import keeps this module free of the heavy core
+            # package import graph at load time.
+            from core.atomic_io import atomic_write_json
+            atomic_write_json(self.presets_file, presets, indent=2)
             self.presets = presets
             return True
         except Exception as e:
@@ -122,8 +141,27 @@ Use precise language. Show causal relationships explicitly. Quantify uncertainty
         enabled: bool = True,
         inject_prefix: str = "",
         inject_suffix: str = "",
+        persona_memory: str = "",
+        persona_memory_schema: str = "general",
+        thinking_mode: str = "",
+        show_persona_name: bool = True,
     ) -> bool:
         """Update the custom preset"""
+        persona_memory_schema = persona_memory_schema if persona_memory_schema in {"general", "health"} else "general"
+        current = self.presets.get("custom") if isinstance(self.presets, dict) else {}
+        current_name = ""
+        if isinstance(current, dict):
+            current_name = current.get("character_name") or current.get("name") or ""
+        if not persona_memory and enabled and name:
+            if current_name == name and isinstance(current, dict):
+                persona_memory = current.get("persona_memory", "") or ""
+                persona_memory_schema = current.get("persona_memory_schema", persona_memory_schema) or persona_memory_schema
+            else:
+                for template in self.get_user_templates():
+                    if isinstance(template, dict) and template.get("name") == name:
+                        persona_memory = template.get("persona_memory", "") or ""
+                        persona_memory_schema = template.get("persona_memory_schema", persona_memory_schema) or persona_memory_schema
+                        break
         self.presets["custom"] = {
             "name": name or "Custom",
             "character_name": name,
@@ -132,7 +170,11 @@ Use precise language. Show causal relationships explicitly. Quantify uncertainty
             "system_prompt": system_prompt,
             "inject_prefix": inject_prefix,
             "inject_suffix": inject_suffix,
+            "thinking_mode": thinking_mode if thinking_mode in {"on", "off"} else "",
+            "show_persona_name": bool(show_persona_name),
             "enabled": enabled,
+            "persona_memory": persona_memory if enabled and name else "",
+            "persona_memory_schema": persona_memory_schema if enabled and name else "general",
         }
         return self.save(self.presets)
     
@@ -161,6 +203,30 @@ Use precise language. Show causal relationships explicitly. Quantify uncertainty
         templates = self.presets.get("user_templates", [])
         self.presets["user_templates"] = [t for t in templates if t.get("id") != template_id]
         return self.save(self.presets)
+
+    def update_persona_memory(self, name: str, memory: str) -> bool:
+        """Persist auto-maintained continuity notes for a saved/active persona."""
+        name = (name or "").strip()
+        memory = (memory or "").strip()
+        if not name:
+            return False
+
+        changed = False
+        custom = self.presets.get("custom")
+        if isinstance(custom, dict) and custom.get("character_name") == name:
+            if custom.get("persona_memory", "") != memory:
+                custom["persona_memory"] = memory
+                changed = True
+
+        templates = self.presets.get("user_templates", [])
+        if isinstance(templates, list):
+            for template in templates:
+                if isinstance(template, dict) and template.get("name") == name:
+                    if template.get("persona_memory", "") != memory:
+                        template["persona_memory"] = memory
+                        changed = True
+
+        return self.save(self.presets) if changed else True
 
     def get_group_presets(self) -> list:
         """Get saved group chat presets."""

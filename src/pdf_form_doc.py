@@ -29,7 +29,7 @@ _FRONT_MATTER_RE = re.compile(
 # Freeform annotation bullet — mirrors the JS regex in static/js/document.js.
 # Coords are page percentages (0–100); kind/lh are optional for backward compat.
 _ANNOTATION_RE = re.compile(
-    r'^[ \t]*-\s+(?P<value>.*?)\s*<!--\s*annotation\s+id=(?P<id>[\w-]+)\s+page=(?P<page>\d+)\s+x=(?P<x>[\d.]+)\s+y=(?P<y>[\d.]+)\s+w=(?P<w>[\d.]+)\s+h=(?P<h>[\d.]+)(?:\s+kind=(?P<kind>\w+))?(?:\s+lh=(?P<lh>[\d.]+))?\s*-->[ \t]*$',
+    r'^[ \t]*-\s+(?P<value>.*?)\s*<!--\s*annotation\s+id=(?P<id>[\w-]+)\s+page=(?P<page>\d+)\s+x=(?P<x>[\d.]+)\s+y=(?P<y>[\d.]+)\s+w=(?P<w>[\d.]+)\s+h=(?P<h>[\d.]+)(?:\s+kind=(?P<kind>\w+))?(?:\s+lh=(?P<lh>[\d.]+))?(?:\s+fs=(?P<fs>[\d.]+))?\s*-->[ \t]*$',
     re.MULTILINE,
 )
 
@@ -80,6 +80,7 @@ def parse_markdown_annotations(content: str) -> list[dict]:
                 "h": float(m.group("h")),
                 "kind": m.group("kind") or "text",
                 "line_height": float(m.group("lh")) if m.group("lh") else 1.3,
+                "font_size": float(m.group("fs")) if m.group("fs") else 11.0,
                 "value": value,
             })
         except (ValueError, TypeError) as e:
@@ -126,8 +127,13 @@ def _decode_name(enc: str) -> str:
     """Inverse of _encode_name."""
     import urllib.parse
     return urllib.parse.unquote(enc or "")
-_TEXT_VALUE_RE = re.compile(r'\*\*[^*]+:\*\*\s*(?P<value>.*)$')
-_CHOICE_VALUE_RE = re.compile(r'\*\*[^*]+\*\*\s*\[[^\]]*\]\s*:\s*(?P<value>.*)$')
+# Label segment is non-greedy (.+?) so labels containing '*' — the near-universal
+# required-field marker, e.g. "Email *" — are tolerated, while still splitting at
+# the FIRST ':**' / '**[' so a value that itself contains ':**' is preserved.
+# (The old [^*]+ refused to match any label with an asterisk and silently
+# dropped that field's value on export.)
+_TEXT_VALUE_RE = re.compile(r'\*\*.+?:\*\*\s*(?P<value>.*)$')
+_CHOICE_VALUE_RE = re.compile(r'\*\*.+?\*\*\s*\[[^\]]*\]\s*:\s*(?P<value>.*)$')
 _CHECKBOX_VALUE_RE = re.compile(r'^\s*\[(?P<state>[xX ])\]')
 
 _PLACEHOLDERS = {"_(empty)_", "_(not selected)_", "_(empty)_.", "_(unsigned)_"}
@@ -142,7 +148,7 @@ def save_field_sidecar(pdf_path: str, fields: list[dict[str, Any]]) -> str:
     """Persist the field schema next to its source PDF. Returns the sidecar path."""
     path = sidecar_path(pdf_path)
     try:
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(fields, f, indent=2)
     except Exception as e:
         logger.warning(f"Failed to write field sidecar {path}: {e}")
@@ -155,7 +161,7 @@ def load_field_sidecar(pdf_path: str) -> Optional[list[dict[str, Any]]]:
     if not os.path.exists(path):
         return None
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except Exception as e:
         logger.warning(f"Failed to read field sidecar {path}: {e}")
@@ -167,9 +173,18 @@ def find_source_upload_id(content: str) -> Optional[str]:
 
     Matches both the form-source marker (`pdf_form_source`) used for fillable
     PDFs and the plain marker (`pdf_source`) used for any imported PDF.
+    Rejects malformed ids (path traversal, wrong shape) before any lookup.
     """
+    from src.upload_handler import is_valid_upload_id
+
     m = _FRONT_MATTER_RE.search(content or "") or _PLAIN_FRONT_MATTER_RE.search(content or "")
-    return m.group("upload_id") if m else None
+    if not m:
+        return None
+    upload_id = m.group("upload_id")
+    if not is_valid_upload_id(upload_id):
+        logger.warning("Ignoring invalid pdf_source upload_id in document content: %r", upload_id)
+        return None
+    return upload_id
 
 
 def render_plain_pdf_markdown(upload_id: str, title: str, body_text: Optional[str] = None) -> str:
@@ -205,7 +220,7 @@ def create_plain_pdf_document(
     pages without form-field overlays.
     """
     from src.database import SessionLocal, Document, DocumentVersion, Session as DbSession
-    from src.tool_implementations import set_active_document
+    from src.agent_tools.document_tools import set_active_document
 
     content = render_plain_pdf_markdown(upload_id, title, body_text)
     db = SessionLocal()
@@ -388,7 +403,7 @@ def create_form_markdown_document(
     inside the content, which the export route looks for.
     """
     from src.database import SessionLocal, Document, DocumentVersion, Session as DbSession
-    from src.tool_implementations import set_active_document
+    from src.agent_tools.document_tools import set_active_document
 
     content = render_form_as_markdown(fields, upload_id, title, intro_text=intro_text)
     db = SessionLocal()

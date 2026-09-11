@@ -9,6 +9,7 @@ from src.constants import (
     SESSIONS_FILE, DEFAULT_HOST, OPENAI_API_KEY
 )
 from src.memory import MemoryManager
+from src.memory_provider import MemoryProviderRegistry, NativeMemoryProvider
 from services.memory.skills import SkillsManager
 from core.session_manager import SessionManager
 from core.models import set_session_manager
@@ -20,6 +21,7 @@ from src.model_discovery import ModelDiscovery
 from src.chat_handler import ChatHandler
 from src.research_handler import ResearchHandler
 from src.upload_handler import UploadHandler
+from src.tool_utils import set_upload_handler
 from src.search import update_search_config
 
 logger = logging.getLogger(__name__)
@@ -48,6 +50,8 @@ def initialize_managers(base_dir: str, rag_manager=None) -> Dict[str, Any]:
     session_manager = SessionManager(SESSIONS_FILE)
     set_session_manager(session_manager)  # Enable Session.add_message() persistence
     upload_handler = UploadHandler(base_dir, UPLOAD_DIR)
+    session_manager.upload_handler = upload_handler
+    set_upload_handler(upload_handler)
     personal_docs_manager = PersonalDocsManager(PERSONAL_DIR, rag_manager)
     api_key_manager = APIKeyManager(DATA_DIR)
     preset_manager = PresetManager(DATA_DIR)
@@ -67,11 +71,17 @@ def initialize_managers(base_dir: str, rag_manager=None) -> Dict[str, Any]:
                     logger.info(f"Rebuilt memory vector index from {len(existing)} existing entries")
             logger.info("MemoryVectorStore initialized")
         else:
+            # Keep the unhealthy object (do NOT reset to None): consumers gate on
+            # `.healthy`, and service_health.chromadb_health() needs a present
+            # object to report DEGRADED/DOWN instead of DISABLED ("not configured").
             logger.warning("MemoryVectorStore DEGRADED: ChromaDB vector memory unavailable")
-            memory_vector = None
     except Exception as e:
         logger.warning(f"MemoryVectorStore DEGRADED: {e}")
         memory_vector = None
+
+    memory_provider_registry = MemoryProviderRegistry([
+        NativeMemoryProvider(memory_manager, memory_vector),
+    ])
 
     # Initialize processors
     chat_processor = ChatProcessor(memory_manager, personal_docs_manager, memory_vector=memory_vector, skills_manager=skills_manager)
@@ -99,6 +109,7 @@ def initialize_managers(base_dir: str, rag_manager=None) -> Dict[str, Any]:
     return {
         "memory_manager": memory_manager,
         "memory_vector": memory_vector,
+        "memory_provider_registry": memory_provider_registry,
         "skills_manager": skills_manager,
         "session_manager": session_manager,
         "upload_handler": upload_handler,

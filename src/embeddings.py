@@ -13,10 +13,25 @@ Set EMBEDDING_URL in .env, e.g.:
 """
 
 import os
+
+from src.constants import FASTEMBED_CACHE_DIR, EMBEDDING_ENDPOINT_FILE
+
+# Windows: force HuggingFace/fastembed to COPY model files rather than symlink
+# them. On a network-share/UNC cache dir Windows can't follow HF's symlinks
+# ([WinError 1463] "symbolic link cannot be followed"), so ONNX fails to load the
+# model and semantic memory dies. huggingface_hub reads this flag at import time,
+# so it must be set before huggingface_hub is first imported — hence module-top.
+# (app.py sets the same guard for the server entrypoint.)
+if os.name == "nt":
+    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
 import logging
 import numpy as np
 import httpx
 from typing import List, Optional
+
+from src.runtime_paths import get_app_root
 
 logger = logging.getLogger(__name__)
 
@@ -27,18 +42,21 @@ _DEFAULT_FASTEMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 class EmbeddingClient:
     """Drop-in replacement for SentenceTransformer.encode() using an HTTP API."""
 
-    def __init__(self, url: Optional[str] = None, model: Optional[str] = None):
+    def __init__(self, url: Optional[str] = None, model: Optional[str] = None, api_key: Optional[str] = None):
         self.url = url or os.getenv(
             "EMBEDDING_URL",
             f"http://{os.getenv('LLM_HOST', 'localhost')}:11434/v1/embeddings",
         )
         self.model = model or os.getenv("EMBEDDING_MODEL", _DEFAULT_MODEL)
+        self.api_key = api_key or os.getenv("EMBEDDING_API_KEY")
         self._dim: Optional[int] = None
         # Short connect timeout so a DOWN embedding endpoint (e.g. Ollama not
         # running on :11434) fast-fails to the local FastEmbed fallback instead
         # of stalling startup ~30s per probe. Read stays generous for a real
         # endpoint (embedding a short string returns in well under a second).
         self._client = httpx.Client(timeout=httpx.Timeout(connect=3.0, read=10.0, write=5.0, pool=3.0))
+        self._batch_size = max(1, int(os.getenv("EMBEDDING_BATCH_SIZE", "8")))
+        self._max_chars = max(200, int(os.getenv("EMBEDDING_MAX_CHARS", "900")))
 
     def get_sentence_embedding_dimension(self) -> int:
         """Probe the endpoint for embedding dimension if not yet known."""
@@ -57,22 +75,10 @@ class EmbeddingClient:
         if not texts:
             return np.array([], dtype="float32")
 
-        # Batch in chunks of 64 to avoid oversized requests
         all_vecs = []
-        for i in range(0, len(texts), 64):
-            batch = texts[i : i + 64]
-            resp = self._client.post(
-                self.url,
-                json={"input": batch, "model": self.model},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-
-            # OpenAI format: {"data": [{"embedding": [...], "index": 0}, ...]}
-            embeddings = data.get("data", [])
-            embeddings.sort(key=lambda e: e.get("index", 0))
-            for emb in embeddings:
-                all_vecs.append(emb["embedding"])
+        for i in range(0, len(texts), self._batch_size):
+            batch = texts[i : i + self._batch_size]
+            all_vecs.extend(self._embed_batch(batch))
 
         vecs = np.array(all_vecs, dtype="float32")
 
@@ -85,6 +91,42 @@ class EmbeddingClient:
             self._dim = vecs.shape[1]
 
         return vecs
+
+    def _embed_batch(self, batch: List[str]) -> List[List[float]]:
+        try:
+            return self._post_embeddings(batch)
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status != 400:
+                raise
+            if len(batch) > 1:
+                vecs = []
+                for text in batch:
+                    vecs.extend(self._embed_batch([text]))
+                return vecs
+            text = batch[0]
+            trimmed = text[: self._max_chars]
+            if trimmed != text:
+                logger.warning(
+                    "Embedding input exceeded endpoint context; retrying with %d chars",
+                    len(trimmed),
+                )
+                return self._post_embeddings([trimmed])
+            raise
+
+    def _post_embeddings(self, batch: List[str]) -> List[List[float]]:
+        resp = self._client.post(
+            self.url,
+            headers={"Authorization": f"Bearer {self.api_key}"} if self.api_key else {},
+            json={"input": batch, "model": self.model},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        # OpenAI format: {"data": [{"embedding": [...], "index": 0}, ...]}
+        embeddings = data.get("data", [])
+        embeddings.sort(key=lambda e: e.get("index", 0))
+        return [emb["embedding"] for emb in embeddings]
 
 
 class FastEmbedClient:
@@ -104,11 +146,37 @@ class FastEmbedClient:
         # Persistent cache under data/ so the model survives reboots and so
         # the download lands exactly where the admin panel's _is_downloaded()
         # check looks (both default to this same path).
-        cache_dir = os.getenv("FASTEMBED_CACHE_PATH") or os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "data", "fastembed_cache",
-        )
+        cache_dir = FASTEMBED_CACHE_DIR
         os.makedirs(cache_dir, exist_ok=True)
+        # Windows self-heal: the HuggingFace-hub cache stores model files as
+        # symlinks (snapshots/<rev>/model.onnx -> ../../blobs/<hash>). On a
+        # network-share / UNC data dir Windows refuses to follow them
+        # ([WinError 1463] "symbolic link cannot be followed because its type is
+        # disabled"), and a cache copied between machines can carry dead symlinks
+        # too. Either way fastembed tries to load a broken symlink and fails
+        # *without* re-downloading, leaving semantic memory degraded. Detect a
+        # broken-symlink model in the cache and drop the contaminated hub dir so
+        # fastembed re-fetches (it falls back to its CDN tarball of real files,
+        # which load fine). Best-effort; only ever removes a verifiably dead link.
+        if os.name == "nt":
+            try:
+                import glob, shutil
+                for _onnx in glob.glob(os.path.join(cache_dir, "**", "*.onnx"), recursive=True):
+                    if os.path.islink(_onnx) and not os.path.exists(_onnx):
+                        _root = _onnx
+                        while os.path.basename(_root) and not os.path.basename(_root).startswith("models--"):
+                            _parent = os.path.dirname(_root)
+                            if _parent == _root:
+                                break
+                            _root = _parent
+                        if os.path.basename(_root).startswith("models--"):
+                            logger.warning(
+                                "Embedding cache has a broken symlink (%s); clearing %s "
+                                "so fastembed re-downloads real files", _onnx, _root,
+                            )
+                            shutil.rmtree(_root, ignore_errors=True)
+            except Exception as _e:
+                logger.debug("embedding cache symlink-heal skipped: %s", _e)
         kwargs = {"model_name": self.model, "cache_dir": cache_dir}
         self._embedding = TextEmbedding(**kwargs)
         self._dim: Optional[int] = None
@@ -146,13 +214,10 @@ class FastEmbedClient:
 def _load_persisted_endpoint() -> dict:
     """Load the custom embedding endpoint saved from the admin panel."""
     try:
-        endpoint_file = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "data", "embedding_endpoint.json",
-        )
+        endpoint_file = EMBEDDING_ENDPOINT_FILE
         if os.path.exists(endpoint_file):
             import json
-            data = json.loads(open(endpoint_file).read())
+            data = json.loads(open(endpoint_file, encoding="utf-8").read())
             if data.get("url"):
                 return data
     except Exception:
@@ -182,11 +247,14 @@ def get_embedding_client():
     if persisted.get("url"):
         url = persisted["url"]
         model = persisted.get("model", "")
+        api_key = persisted.get("api_key", "")
         # Also set in env so other code sees it
         os.environ["EMBEDDING_URL"] = url
         if model:
             os.environ["EMBEDDING_MODEL"] = model
-
+        if api_key:
+            from src.secret_storage import decrypt
+            os.environ["EMBEDDING_API_KEY"] = decrypt(api_key)
     # Try the HTTP embedding API — unless we already found it down this process
     # (avoids paying the connect timeout again on every RAG/memory/tool probe).
     if not _http_embed_down:

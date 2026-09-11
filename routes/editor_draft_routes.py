@@ -26,6 +26,7 @@ from pydantic import BaseModel
 
 from core.database import EditorDraft, SessionLocal
 from src.auth_helpers import get_current_user
+from src.upload_limits import EDITOR_DRAFT_MAX_BYTES
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,24 @@ def _summary(d: EditorDraft) -> Dict[str, Any]:
     }
 
 
+def _load_payload(raw: Optional[str]) -> Dict[str, Any]:
+    try:
+        payload = json.loads(raw) if raw else {}
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _dump_payload(payload: Dict[str, Any]) -> str:
+    raw = json.dumps(payload or {}, separators=(",", ":"))
+    if len(raw.encode("utf-8")) > EDITOR_DRAFT_MAX_BYTES:
+        raise HTTPException(
+            413,
+            f"Editor draft exceeds the {EDITOR_DRAFT_MAX_BYTES // (1024 * 1024)} MB safety limit",
+        )
+    return raw
+
+
 def setup_editor_draft_routes() -> APIRouter:
     router = APIRouter(tags=["editor-drafts"])
 
@@ -93,13 +112,9 @@ def setup_editor_draft_routes() -> APIRouter:
             ).first()
             if not d or not _owns(d, user):
                 raise HTTPException(404, "Draft not found")
-            try:
-                payload = json.loads(d.payload) if d.payload else {}
-            except Exception:
-                payload = {}
             return {
                 **_summary(d),
-                "payload": payload,
+                "payload": _load_payload(d.payload),
             }
         finally:
             db.close()
@@ -116,13 +131,15 @@ def setup_editor_draft_routes() -> APIRouter:
                 source_image_id=body.source_image_id,
                 width=body.width,
                 height=body.height,
-                payload=json.dumps(body.payload or {}),
+                payload=_dump_payload(body.payload),
                 thumbnail=body.thumbnail,
             )
             db.add(d)
             db.commit()
             db.refresh(d)
             return _summary(d)
+        except HTTPException:
+            raise
         except Exception as e:
             db.rollback()
             logger.warning(f"editor-draft create failed: {e}")
@@ -147,7 +164,7 @@ def setup_editor_draft_routes() -> APIRouter:
             if body.height is not None:
                 d.height = body.height
             if body.payload is not None:
-                d.payload = json.dumps(body.payload)
+                d.payload = _dump_payload(body.payload)
             if body.thumbnail is not None:
                 d.thumbnail = body.thumbnail
             db.commit()

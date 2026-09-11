@@ -25,10 +25,12 @@
  *   }
  */
 
-import { previewZoneAt, clearPreview, snapModalToZone } from './tileManager.js';
+import { previewZoneAt, clearPreview, snapModalToZone } from './tileManager.js?v=20260910responsivebounds1';
 import { suspendDock, resumeDock, clearRightDock, applyEdgeDock } from './modalSnap.js';
+import { dismissOrRemove } from './escMenuStack.js';
+import { nextToolWindowZ } from './toolWindowZOrder.js';
 
-const _state = new Map(); // id -> { restoreFn, closeFn, railBtnId, isMinimized }
+const _state = new Map(); // id -> { restoreFn, closeFn, railBtnId, isMinimized, restoreMinHeight }
 
 const _rememberedDockKey = (id) => `odysseus-modal-remembered-dock-${id}`;
 function _rememberDock(id, side) {
@@ -62,7 +64,14 @@ function _applyRememberedDock(id) {
 // those statics and bump on every bring-to-front.
 let _modalTopZ = 300;
 function _bringToFront(modal) {
-  if (modal) modal.style.setProperty('z-index', String(++_modalTopZ), 'important');
+  if (!modal) return;
+  const z = nextToolWindowZ({
+    exclude: modal,
+    current: getComputedStyle(modal).zIndex,
+    floor: _modalTopZ,
+  });
+  _modalTopZ = Math.max(_modalTopZ, z);
+  modal.style.setProperty('z-index', String(z), 'important');
 }
 
 function _emitModalOpened(id, modal) {
@@ -71,6 +80,39 @@ function _emitModalOpened(id, modal) {
       detail: { id, modal },
     }));
   } catch (_) {}
+}
+
+function _captureRestoreHeight(modal, state) {
+  if (!modal || !state) return;
+  const content = modal.querySelector('.modal-content');
+  if (!content) return;
+  if (modal.id === 'email-lib-modal'
+      && (modal.classList.contains('modal-left-docked')
+          || modal.classList.contains('email-snap-left')
+          || document.body.classList.contains('email-doc-split-active'))) {
+    delete state.restoreMinHeight;
+    return;
+  }
+  const rect = content.getBoundingClientRect();
+  if (!rect || rect.height < 120) return;
+  const maxHeight = Math.max(180, window.innerHeight - 24);
+  const minHeight = modal.id === 'email-lib-modal' && window.innerWidth > 768
+    ? Math.min(560, maxHeight)
+    : 0;
+  state.restoreMinHeight = `${Math.round(Math.max(minHeight, Math.min(rect.height, maxHeight)))}px`;
+}
+
+function _applyRestoreHeight(modal, state) {
+  if (!modal || !state?.restoreMinHeight) return;
+  const content = modal.querySelector('.modal-content');
+  if (!content) return;
+  const maxHeight = Math.max(180, window.innerHeight - 24);
+  const requested = parseInt(state.restoreMinHeight, 10);
+  const minHeight = modal.id === 'email-lib-modal' && window.innerWidth > 768
+    ? Math.min(560, maxHeight)
+    : 0;
+  const height = Number.isFinite(requested) ? Math.max(minHeight, Math.min(requested, maxHeight)) : null;
+  if (height) content.style.minHeight = `${height}px`;
 }
 
 function _setBadge(btnIds, on) {
@@ -93,7 +135,7 @@ const _LABELS = {
   // Full SVG markup (not a single path-d) — the rounded-lobe brain needs
   // three sub-paths, which the dock renderer supports when the icon string
   // contains '<'.
-  'memory-modal':      { label: 'Brain',     icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/><path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/></svg>' },
+  'memory-modal':      { label: 'Memory',    icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/><path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/></svg>' },
   'notes-panel':       { label: 'Notes',     icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3h10l4 4v14H5z"/><path d="M15 3v5h5"/><path d="M8 17.5 15.5 10l2.5 2.5L10.5 20H8z"/></svg>' },
   'email-lib-modal':   { label: 'Email',     icon: 'M2 4h20v16H2zM22 7l-9.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7' },
   // The Prompt window (characters / inject / group). Syringe = "prompt" icon,
@@ -101,7 +143,7 @@ const _LABELS = {
   'custom-preset-modal': { label: 'Prompt',  icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m18 2 4 4"/><path d="m17 7 3-3"/><path d="M19 9 8.7 19.3c-1 1-2.5 1-3.4 0l-.6-.6c-1-1-1-2.5 0-3.4L15 5"/><path d="m9 11 4 4"/><path d="m5 19-3 3"/><path d="m14 4 6 6"/></svg>' },
   'research-overlay':  { label: 'Research',  icon: 'M3 11a8 8 0 1 0 16 0a8 8 0 1 0-16 0M21 21l-4.35-4.35M11 8L11 14M8 11L14 11' },
   'theme-modal':       { label: 'Theme',     icon: 'M12 2a10 10 0 1 0 10 10c0-1-1-2-2-2h-2a2 2 0 0 1 0-4h1a2 2 0 0 0 0-4 10 10 0 0 0-7-2zM7.5 12a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3zM12 7.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3zM16.5 12a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3z' },
-  'compare-model-overlay': { label: 'Compare',  icon: 'M8 3v18M16 3v18M3 8h5M16 16h5' },
+  'compare-model-overlay': { label: 'Compare',  icon: 'M4.5 4h5A1.5 1.5 0 0 1 11 5.5v13A1.5 1.5 0 0 1 9.5 20h-5A1.5 1.5 0 0 1 3 18.5v-13A1.5 1.5 0 0 1 4.5 4ZM15.5 4h5A1.5 1.5 0 0 1 22 5.5v13a1.5 1.5 0 0 1-1.5 1.5h-5a1.5 1.5 0 0 1-1.5-1.5v-13A1.5 1.5 0 0 1 15.5 4ZM10 8h4M10 16h4' },
   'settings-modal':    { label: 'Settings',  icon: 'M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9c.4.4.62.94.6 1.51V11a2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z' },
   'ge-shortcuts-modal':{ label: 'Shortcuts', icon: 'M2 6h20v12H2zM6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 14h10' },
   // Virtual id — the doc editor pane isn't a modal, but it minimizes to a
@@ -359,7 +401,7 @@ function _renderDock() {
       chip.style.setProperty('position', 'fixed', 'important');
       chip.style.setProperty('left', `${pos.left}px`, 'important');
       chip.style.setProperty('top', `${pos.top}px`, 'important');
-      chip.style.setProperty('z-index', '999', 'important');
+      chip.style.setProperty('z-index', '10020', 'important');
       document.body.appendChild(chip);
     } else {
       dock.appendChild(chip);
@@ -411,6 +453,14 @@ function _trashBurst() {
   if (!z) return;
   z.classList.add('dropping');
   setTimeout(() => { z.classList.remove('dropping'); }, 360);
+}
+
+// The close target grows with proximity instead of jumping to one fixed size
+// when the dragged chip enters the capture radius.
+function _setTrashZoneProximity(z, distance, radius) {
+  if (!z) return;
+  const pull = Math.max(0, Math.min(1, 1 - (distance / radius)));
+  z.style.setProperty('--trash-zone-scale', (1 + pull * 0.24).toFixed(3));
 }
 
 // Place the X on the opposite vertical half from the chip so the user always
@@ -574,6 +624,7 @@ function _stepChain(state, trashZone, captureRadius) {
     const dist = Math.hypot(hcx - tzcx, hcy - tzcy);
     // Trash zone is shown for the whole drag; only .engaged tracks proximity.
     const inZone = dist < captureRadius;
+    _setTrashZoneProximity(trashZone, dist, captureRadius);
     if (inZone !== state.overTrash) {
       state.overTrash = inZone;
       trashZone.classList.toggle('engaged', inZone);
@@ -622,6 +673,7 @@ function _wireChipDrag(chip, dock) {
     if (onTouch) {
       const isFree = _chipPositions.has(chip.dataset.modalId);
       trashZone = _ensureTrashZone();
+      trashZone.style.setProperty('--trash-zone-scale', '1');
       overTrash = false;
       // Decide drag mode purely by chip count, not by whether this chip is
       // currently dock-resident or free. As long as there are 2+ chips, the
@@ -783,6 +835,7 @@ function _wireChipDrag(chip, dock) {
       const tzcy = tz.top + tz.height / 2;
       const dist = Math.hypot(e.clientX - tzcx, e.clientY - tzcy);
       const inZone = dist < CAPTURE_RADIUS;
+      _setTrashZoneProximity(trashZone, dist, CAPTURE_RADIUS);
       // Trash X stays visible for the entire drag; only .engaged tracks
       // when the chip is close enough to capture.
       let tx = e.clientX - (chipStartLeft + chip.offsetWidth / 2);
@@ -799,7 +852,7 @@ function _wireChipDrag(chip, dock) {
       // inline styles set via .style on some Safari versions.
       chip.style.setProperty('transition', 'none', 'important');
       chip.style.setProperty('transform', `translate(${tx}px, ${ty}px) scale(${inZone ? 1.12 : 1.05})`, 'important');
-      chip.style.setProperty('z-index', '10000', 'important');
+      chip.style.setProperty('z-index', '10030', 'important');
       chip.style.setProperty('position', 'fixed', 'important');
       chip.style.setProperty('left', `${chipStartLeft}px`, 'important');
       chip.style.setProperty('top', `${chipStartTop}px`, 'important');
@@ -815,7 +868,7 @@ function _wireChipDrag(chip, dock) {
     if (dragMode === 'reorder') {
       chip.style.transition = 'none';
       chip.style.transform = `translate(${dx}px, ${dy}px) scale(1.05)`;
-      chip.style.zIndex = '1000';
+      chip.style.zIndex = '10030';
 
       // Find sibling under cursor and swap
       const siblings = [...dock.querySelectorAll('.minimized-dock-chip:not(.dragging)')];
@@ -848,6 +901,7 @@ function _wireChipDrag(chip, dock) {
         const dockCy = newTop + dock.offsetHeight / 2;
         const dist = Math.hypot(dockCx - tzcx, dockCy - tzcy);
         const inZone = dist < CAPTURE_RADIUS;
+        _setTrashZoneProximity(trashZone, dist, CAPTURE_RADIUS);
         // Trash X stays visible for the entire drag — only .engaged
         // tracks proximity to the capture point.
         if (inZone) {
@@ -904,6 +958,7 @@ function _wireChipDrag(chip, dock) {
           if (tz) {
             const dx = (tz.left + tz.width / 2) - (l.x + l.width / 2);
             const dy = (tz.top + tz.height / 2) - (l.y + l.height / 2);
+            l.chip.classList.add('chip-trashing');
             l.chip.style.transition = 'transform 0.32s cubic-bezier(0.45, 0, 0.25, 1), opacity 0.3s ease-in, left 0.32s cubic-bezier(0.45, 0, 0.25, 1), top 0.32s cubic-bezier(0.45, 0, 0.25, 1)';
             // Whirlpool: spin + shrink so the chip swirls into the X.
             l.chip.style.transform = 'scale(0.15) rotate(720deg)';
@@ -967,6 +1022,7 @@ function _wireChipDrag(chip, dock) {
         // `!important`, so the close animation needs setProperty(...important)
         // too or the styles don't apply and the chip just snaps.
         const cur = chip.style.transform || 'translate(0,0)';
+        chip.classList.add('chip-trashing');
         chip.style.setProperty('transition', 'transform 0.32s cubic-bezier(0.45, 0, 0.25, 1), opacity 0.3s ease-in', 'important');
         // Whirlpool: spin + shrink as the chip swirls into the X.
         chip.style.setProperty('transform', `${cur} scale(0.15) rotate(720deg)`, 'important');
@@ -1109,6 +1165,7 @@ export function register(id, { restoreFn, closeFn, railBtnId, sidebarBtnId, labe
     closeFn:   closeFn   || (() => {}),
     btnIds,
     isMinimized: false,
+    restoreMinHeight: '',
   });
   // Auto-stack: whichever modal becomes visible last sits on top of any
   // already-open modals. The various tool open() functions (gallery,
@@ -1188,10 +1245,13 @@ export function minimize(id) {
   // and let the chip drive restore/close via the registered functions.
   const modal = document.getElementById(id);
   if (modal) {
+    _captureRestoreHeight(modal, s);
     // If this window is edge-docked (right/left), SUSPEND the dock: release
     // the body push so the chat returns to full width while the window is
     // minimized, but keep the dock so restoring the chip snaps it back in.
-    if (modal.classList.contains('modal-right-docked') || modal.classList.contains('modal-left-docked')) {
+    if (modal.classList.contains('modal-right-docked')
+        || modal.classList.contains('modal-left-docked')
+        || modal.classList.contains('email-snap-left')) {
       try { suspendDock(modal); } catch (e) { console.warn('suspendDock on minimize failed', e); }
     }
     modal.classList.add('hidden');
@@ -1218,6 +1278,7 @@ export function restore(id) {
   if (modal) {
     modal.classList.remove('hidden', 'modal-minimized');
     modal.style.display = '';
+    _applyRestoreHeight(modal, s);
     // Surface above any already-open tool window — restoring from the dock
     // should bring this tool to the front, not leave it stuck behind one with
     // a higher static z-index.
@@ -1424,10 +1485,29 @@ const _SWIPE_DOWN_MINIMIZES = new Set([
   'cookbook-modal',
   'calendar-modal',
   'email-lib-modal',
+  'theme-modal',
 ]);
 // Same idea but matched by id prefix — so dynamically-created modals
 // (per-email reader tabs) survive swipe-down too.
 const _SWIPE_DOWN_MINIMIZES_PREFIX = ['email-reader-'];
+
+function _clearEmailSplitAfterMinimize() {
+  document.body.classList.remove('email-doc-split-active', 'email-front');
+  document.documentElement.style.removeProperty('--email-doc-split-left-x');
+  document.documentElement.style.removeProperty('--email-doc-split-email-w');
+  document.documentElement.style.removeProperty('--email-doc-split-right-x');
+  const docPane = document.getElementById('doc-editor-pane');
+  if (docPane) {
+    [
+      'position', 'left', 'right', 'top', 'bottom', 'width', 'max-width',
+      'height', 'z-index', 'transform',
+    ].forEach(prop => docPane.style.removeProperty(prop));
+  }
+  const divider = document.getElementById('doc-divider');
+  if (divider) divider.style.display = '';
+  requestAnimationFrame(() => window.dispatchEvent(new Event('resize')));
+  setTimeout(() => window.dispatchEvent(new Event('resize')), 80);
+}
 
 // Re-route swipe-dismiss to minimize-rather-than-close — but only for the
 // allowlisted tools above. For every other modal, return early so the
@@ -1440,7 +1520,7 @@ window.addEventListener('modal-dismissed', (e) => {
   if (id === 'cookbook-modal') {
     document.querySelectorAll(
       '.cookbook-task-dropdown, .cookbook-gpu-split-menu, .hwfit-cached-dropdown, .cookbook-saved-menu, .cookbook-dep-menu'
-    ).forEach(d => d.remove());
+    ).forEach(dismissOrRemove);
   }
 });
 
@@ -1455,7 +1535,16 @@ window.addEventListener('modal-dismissed', (e) => {
   s.isMinimized = true;
   _setBadge(s.btnIds, true);
   const modal = document.getElementById(id);
-  if (modal) modal.classList.add('modal-minimized');
+  if (modal) {
+    const isEmailModal = id === 'email-lib-modal' || id.startsWith('email-reader-');
+    if (modal.classList.contains('modal-right-docked')
+        || modal.classList.contains('modal-left-docked')
+        || modal.classList.contains('email-snap-left')) {
+      try { suspendDock(modal); } catch (err) { console.warn('suspendDock on dismissed failed', err); }
+    }
+    if (isEmailModal) _clearEmailSplitAfterMinimize();
+    modal.classList.add('modal-minimized');
+  }
   _ensureDock();
   _renderDock();
   // Stop legacy listeners that reset internal `_open` state

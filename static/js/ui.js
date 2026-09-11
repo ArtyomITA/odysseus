@@ -4,14 +4,247 @@
  * UI utilities for toasts, modals, scrolling, and user feedback
  */
 
-import themeModule from './theme.js';
+import themeModule from './theme.js?v=20260909effectspeed1';
+import * as Modals from './modalManager.js';
+import spinnerModule from './spinner.js';
+import { registerMenuDismiss, dismissTopEscapeLayer, dismissOrRemove } from './escMenuStack.js';
+import { nextToolWindowZ, topToolWindowZ } from './toolWindowZOrder.js';
 
 let toastEl = null;
 let autoScrollEnabled = true;
+let hoveredToggleCard = null;
+let hoveredToggleWindow = null;
+let hoveredDockChip = null;
+let _lastPointerClientX = null;
+let _lastPointerClientY = null;
 
 // Smooth scroll state
 let _scrollRafId = null;
 let _scrollBox = null;
+
+function _isTextEditingTarget(target) {
+  const el = target && target.nodeType === 1 ? target : target?.parentElement;
+  return !!(el && el.closest('input, textarea, select, [contenteditable="true"], [contenteditable=""]'));
+}
+
+function _targetEl(target) {
+  return target && target.nodeType === 1 ? target : target?.parentElement || null;
+}
+
+function _positionToastForOpenPanel(el) {
+  if (!el) return;
+  const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+  const panel = [...document.querySelectorAll('.notes-pane')]
+    .filter((candidate) => {
+      if (!document.contains(candidate)) return false;
+      const style = getComputedStyle(candidate);
+      if (style.display === 'none' || style.visibility === 'hidden') return false;
+      const rect = candidate.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && rect.right > 0 && rect.left < vw;
+    })
+    .sort((a, b) => b.getBoundingClientRect().left - a.getBoundingClientRect().left)[0];
+
+  el.classList.remove('toast-panel-offset');
+  el.style.left = '';
+  el.style.right = '';
+  el.style.maxWidth = '';
+  if (!panel) return;
+
+  const rect = panel.getBoundingClientRect();
+  // There needs to be room for a toast on the panel's left. On narrow/mobile
+  // layouts the panel can occupy the whole width, so retain the normal edge
+  // position instead of forcing the toast underneath the panel.
+  const gap = 8;
+  const availableWidth = rect.left - (gap * 2);
+  if (availableWidth < 220) return;
+  el.style.left = 'auto';
+  el.style.right = `${Math.max(12, vw - rect.left + gap)}px`;
+  el.style.maxWidth = `${Math.min(420, availableWidth)}px`;
+  el.classList.add('toast-panel-offset');
+}
+
+const SPACE_CARD_SELECTOR = [
+  '#email-lib-modal .doclib-card',
+  '#doclib-modal .doclib-card',
+  '#doclib-modal .doclib-chat-row',
+  '#memory-modal .doclib-card',
+  '#tasks-modal .task-card',
+  '#tasks-modal .task-log-row',
+  '#research-overlay [data-job-id]',
+  '#cookbook-modal .doclib-card',
+  '.email-reader-tab-modal .doclib-card',
+  '.email-window-modal .doclib-card',
+].join(', ');
+
+const SPACE_BLOCKED_SELECTOR = [
+  'button',
+  'a',
+  'input',
+  'textarea',
+  'select',
+  '[contenteditable="true"]',
+  '[contenteditable=""]',
+  '.recipient-chip',
+  '.doclib-card-dropdown',
+  '.email-card-dropdown',
+  '.task-log-row-actions',
+  '.modal-header',
+].join(', ');
+
+function _visibleModalForSpace(win) {
+  const modal = win?.closest?.('.modal[id]');
+  if (!modal || modal.classList.contains('hidden') || modal.classList.contains('modal-minimized')) return null;
+  return modal;
+}
+
+function _isSpaceVisible(el) {
+  if (!el || !document.contains(el)) return false;
+  if (el.closest?.('.modal.hidden, .modal.modal-minimized, [hidden]')) return false;
+  return true;
+}
+
+function _spaceWindowId(win) {
+  if (!win || !document.contains(win)) return null;
+  const modal = _visibleModalForSpace(win);
+  if (modal && Modals.isRegistered(modal.id)) return modal.id;
+  if (win.closest?.('.doc-editor-pane') && Modals.isRegistered('doc-panel') && !Modals.isMinimized('doc-panel')) return 'doc-panel';
+  return null;
+}
+
+function _windowAtPointer() {
+  if (_lastPointerClientX == null || _lastPointerClientY == null) return null;
+  const x = _lastPointerClientX;
+  const y = _lastPointerClientY;
+  const candidates = [
+    ...document.querySelectorAll('.modal:not(.hidden):not(.modal-minimized) .modal-content'),
+    ...document.querySelectorAll('.doc-editor-pane'),
+  ].filter(el => {
+    if (!document.contains(el)) return false;
+    const r = el.getBoundingClientRect();
+    return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+  });
+  if (!candidates.length) return null;
+  return candidates.reduce((top, el) => {
+    const mz = parseInt(getComputedStyle(el.closest('.modal') || el).zIndex, 10) || 0;
+    const tz = parseInt(getComputedStyle(top.closest('.modal') || top).zIndex, 10) || 0;
+    return mz >= tz ? el : top;
+  });
+}
+
+function _containsPointer(el) {
+  if (!el || _lastPointerClientX == null || _lastPointerClientY == null) return false;
+  const r = el.getBoundingClientRect();
+  return _lastPointerClientX >= r.left && _lastPointerClientX <= r.right
+    && _lastPointerClientY >= r.top && _lastPointerClientY <= r.bottom;
+}
+
+function _closeHoveredWindow() {
+  let win = _windowAtPointer();
+  if (!win) {
+    try {
+      const underPointer = document.elementFromPoint(_lastPointerClientX, _lastPointerClientY);
+      win = underPointer?.closest?.('.modal:not(.hidden):not(.modal-minimized) .modal-content, .doc-editor-pane') || null;
+    } catch {}
+  }
+  if (!win) win = hoveredToggleWindow;
+  if (!win || !document.contains(win)) return false;
+  const modalForWin = win.closest?.('.modal[id]');
+  if (modalForWin?.id === 'email-lib-modal') {
+    const closeBtn = document.getElementById('email-lib-close') || modalForWin.querySelector('.close-btn');
+    if (closeBtn) {
+      try { closeBtn.click(); return true; } catch {}
+    }
+    try { modalForWin.remove(); return true; } catch {}
+  }
+  const id = _spaceWindowId(win);
+  if (id && Modals.isRegistered(id)) {
+    Modals.close(id);
+    return true;
+  }
+  const modal = _visibleModalForSpace(win);
+  if (!modal) return false;
+  const closeBtn = modal.querySelector('.close-btn, .modal-close, .modal-close-btn, [data-action="close"]');
+  if (closeBtn) {
+    try { closeBtn.click(); return true; } catch {}
+  }
+  try { modal.classList.add('hidden'); return true; } catch {}
+  return false;
+}
+
+function _spaceIsBlocked(e, surface) {
+  const target = _targetEl(e.target);
+  if (!target) return false;
+  if (_isTextEditingTarget(target)) return !surface || surface.contains(target);
+  const blocked = target.closest?.(SPACE_BLOCKED_SELECTOR);
+  return !!(blocked && (!surface || surface.contains(blocked)));
+}
+
+function _activateSpaceCard(card) {
+  if (!card || !document.contains(card)) return false;
+  if (card.matches('#tasks-modal .task-card')) {
+    const titleRow = card.querySelector('.memory-item-title')?.closest('div');
+    if (titleRow) {
+      titleRow.click();
+      return true;
+    }
+  }
+  card.dataset.spaceToggle = '1';
+  card.click();
+  setTimeout(() => {
+    try { delete card.dataset.spaceToggle; } catch {}
+  }, 0);
+  return true;
+}
+
+function _initHoverCardSpaceToggle() {
+  if (document._odysseusHoverCardSpaceToggle) return;
+  document._odysseusHoverCardSpaceToggle = true;
+  document.addEventListener('pointerover', (e) => {
+    _lastPointerClientX = e.clientX;
+    _lastPointerClientY = e.clientY;
+    const chip = e.target?.closest?.('.minimized-dock-chip[data-modal-id]');
+    if (chip) hoveredDockChip = chip;
+    const card = e.target?.closest?.(SPACE_CARD_SELECTOR);
+    if (card) hoveredToggleCard = card;
+    const win = e.target?.closest?.('.modal:not(.hidden):not(.modal-minimized) .modal-content, .doc-editor-pane');
+    if (win) hoveredToggleWindow = win;
+  }, true);
+  document.addEventListener('pointermove', (e) => {
+    _lastPointerClientX = e.clientX;
+    _lastPointerClientY = e.clientY;
+  }, true);
+  document.addEventListener('pointerout', (e) => {
+    const next = e.relatedTarget;
+    if (hoveredDockChip && (!next || !hoveredDockChip.contains(next))) hoveredDockChip = null;
+    if (hoveredToggleCard && (!next || !hoveredToggleCard.contains(next))) hoveredToggleCard = null;
+    if (hoveredToggleWindow && (!next || !hoveredToggleWindow.contains(next))) hoveredToggleWindow = null;
+  }, true);
+  document.addEventListener('keydown', (e) => {
+    if (e.code !== 'Space' || e.repeat) return;
+    if (hoveredToggleCard && _isSpaceVisible(hoveredToggleCard)) {
+      if (_spaceIsBlocked(e, hoveredToggleCard)) return;
+      e.preventDefault();
+      _activateSpaceCard(hoveredToggleCard);
+      return;
+    }
+    if (hoveredDockChip && document.contains(hoveredDockChip)) {
+      if (_spaceIsBlocked(e, hoveredDockChip)) return;
+      const id = hoveredDockChip.dataset.modalId;
+      if (id && Modals.isRegistered(id)) {
+        e.preventDefault();
+        Modals.restore(id);
+      }
+      return;
+    }
+    const id = _spaceWindowId(hoveredToggleWindow);
+    if (!id) return;
+    if (_spaceIsBlocked(e, hoveredToggleWindow)) return;
+    e.preventDefault();
+    Modals.minimize(id);
+  }, true);
+}
+
+_initHoverCardSpaceToggle();
 
 /**
  * Copy text to clipboard
@@ -80,6 +313,7 @@ function _wireToastSwipe(el) {
       setTimeout(() => {
         el.classList.remove('show');
         el.classList.add('exiting');
+        el.style.pointerEvents = '';
         el.style.transform = '';
         el.style.opacity = '';
       }, 180);
@@ -97,98 +331,116 @@ function _wireToastSwipe(el) {
  * Show success toast message
  */
 export function showToast(msg, durationOrOpts) {
+  fetch('/api/tasks/notification-logs', {
+    method: 'POST', credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ body: String(msg || ''), status: 'success' }),
+  }).catch(() => {});
   if (!toastEl) {
     toastEl = document.getElementById('toast');
   }
   _wireToastSwipe(toastEl);
   toastEl.textContent = '';
   toastEl.classList.remove('error');
+  toastEl.classList.remove('toast-ai-reply-progress', 'toast-ai-reply-result', 'toast-sending', 'toast-message-sent');
 
-  let duration = 1200, actionLabel = null, onAction = null, actionHint = null, actionIcon = null;
+  let duration = 1200, actionLabel = null, onAction = null, actionHint = null, actionIcon = null, leadingIcon = null, toastClass = null, aiReplyProgress = false, aiReplyResult = false;
   if (typeof durationOrOpts === 'object' && durationOrOpts) {
     duration = durationOrOpts.duration || 5000;
     actionLabel = durationOrOpts.action;
     onAction = durationOrOpts.onAction;
     actionHint = durationOrOpts.actionHint || null;
     actionIcon = durationOrOpts.actionIcon || null;
+    leadingIcon = durationOrOpts.leadingIcon || null;
+    toastClass = durationOrOpts.toastClass || null;
+    aiReplyProgress = !!durationOrOpts.aiReplyProgress;
+    aiReplyResult = !!durationOrOpts.aiReplyResult;
   } else if (typeof durationOrOpts === 'number') {
     duration = durationOrOpts;
   }
+  if (aiReplyProgress) toastEl.classList.add('toast-ai-reply-progress');
+  if (aiReplyResult) toastEl.classList.add('toast-ai-reply-result');
+  if (toastClass) toastEl.classList.add(toastClass);
 
   const textSpan = document.createElement('span');
+  textSpan.className = 'toast-message';
+  if (leadingIcon === 'check') {
+    const icon = document.createElement('span');
+    icon.className = 'toast-checkmark';
+    icon.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>';
+    toastEl.appendChild(icon);
+  } else if (leadingIcon === 'spinner') {
+    const wp = spinnerModule.createWhirlpool(14);
+    const icon = wp.element;
+    icon.classList.add('toast-whirlpool');
+    icon.style.cssText = 'width:14px;height:14px;margin:0 8px 0 0;display:inline-flex;align-items:center;justify-content:center;flex:0 0 auto;';
+    toastEl.appendChild(icon);
+  }
   textSpan.textContent = msg;
   toastEl.appendChild(textSpan);
 
-  if (actionLabel && onAction) {
-    // Wrap the action in a small column so we can stack a Ctrl-Z-style hint
-    // directly under the button.
-    const stack = document.createElement('span');
-    stack.style.cssText = 'display:inline-flex;flex-direction:column;align-items:center;gap:1px;margin-left:10px;line-height:1;';
+  const actionGroup = document.createElement('span');
+  actionGroup.className = 'toast-actions';
 
+  if (actionLabel && onAction) {
     const btn = document.createElement('button');
-    // If the caller supplied an SVG icon, prepend it. We trust the icon string
-    // (only set internally) — never accept caller-controlled HTML otherwise.
+    btn.type = 'button';
+    btn.className = 'toast-action-btn';
     if (actionIcon) {
-      btn.innerHTML = `<span style="display:inline-flex;align-items:center;gap:5px;">${actionIcon}<span></span></span>`;
-      btn.querySelector('span span').textContent = actionLabel;
+      const icon = document.createElement('span');
+      icon.className = 'toast-action-icon';
+      icon.innerHTML = actionIcon;
+      btn.appendChild(icon);
+      const label = document.createElement('span');
+      label.textContent = actionLabel;
+      btn.appendChild(label);
     } else {
-      btn.textContent = actionLabel;
+      const label = document.createElement('span');
+      label.textContent = actionLabel;
+      btn.appendChild(label);
     }
-    // The toast itself is `pointer-events: none` so it doesn't block clicks
-    // beneath it. With an action button we need to flip both the toast AND
-    // the button so the user can actually click Undo. The flag is reset on
-    // the next plain showToast / showError call (those overwrite textContent
-    // which strips the button + we clear inline style at the top below).
-    btn.style.cssText = 'padding:2px 10px;border:1px solid var(--fg);border-radius:4px;background:none;color:var(--fg);cursor:pointer;font-size:12px;pointer-events:auto;display:inline-flex;align-items:center;';
+    if (actionHint && window.innerWidth > 768) {
+      const hint = document.createElement('kbd');
+      hint.className = 'toast-action-hint';
+      hint.textContent = actionHint;
+      btn.appendChild(hint);
+    }
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
       e.preventDefault();
       toastEl.classList.remove('show');
+      toastEl.style.pointerEvents = '';
       onAction();
     });
-    stack.appendChild(btn);
-
-    // Keyboard-shortcut hints (Ctrl+Z / ⌘Z) are meaningless on touch devices —
-    // skip them on mobile so the toast just shows the Undo button.
-    if (actionHint && window.innerWidth > 768) {
-      const hint = document.createElement('span');
-      hint.textContent = actionHint;
-      hint.style.cssText = 'font-size:9px;opacity:0.55;letter-spacing:0.4px;text-transform:uppercase;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;margin-top:1px;pointer-events:none;';
-      stack.appendChild(hint);
-    }
-
-    toastEl.appendChild(stack);
-
-    // Small × to dismiss the toast without taking the action. Useful when
-    // the user already acted (or just doesn't want the banner sitting there).
-    const closeBtn = document.createElement('button');
-    closeBtn.type = 'button';
-    closeBtn.setAttribute('aria-label', 'Dismiss');
-    closeBtn.title = 'Dismiss';
-    closeBtn.textContent = '×';
-    closeBtn.style.cssText = 'margin-left:8px;padding:0;width:20px;height:20px;line-height:1;border:none;background:none;color:var(--fg);opacity:0.55;cursor:pointer;font-size:18px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;pointer-events:auto;';
-    closeBtn.addEventListener('mouseenter', () => { closeBtn.style.opacity = '1'; });
-    closeBtn.addEventListener('mouseleave', () => { closeBtn.style.opacity = '0.55'; });
-    closeBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      e.preventDefault();
-      clearTimeout(toastEl._hideTimer);
-      toastEl.classList.add('exiting');
-      toastEl.classList.remove('show');
-    });
-    toastEl.appendChild(closeBtn);
-
+    actionGroup.appendChild(btn);
     toastEl.style.pointerEvents = 'auto';
   } else {
-    // No action — restore the default non-blocking behavior.
     toastEl.style.pointerEvents = '';
   }
 
+  // Close button for all toasts — dismiss without waiting for timeout.
+  const closeBtn = document.createElement('button');
+  closeBtn.type = 'button';
+  closeBtn.className = 'toast-close-btn';
+  closeBtn.setAttribute('aria-label', 'Dismiss');
+  closeBtn.title = 'Dismiss';
+  closeBtn.textContent = '×';
+  closeBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    e.preventDefault();
+    clearTimeout(toastEl._hideTimer);
+    toastEl.classList.add('exiting');
+    toastEl.classList.remove('show');
+    toastEl.style.pointerEvents = '';
+  });
+  actionGroup.appendChild(closeBtn);
+  toastEl.appendChild(actionGroup);
+
   // Pin to top-right via CSS — clear any legacy inline overrides so the
   // slide-in-from-right / slide-out-to-left transition can run cleanly.
-  toastEl.style.left = '';
   toastEl.style.transform = '';
   toastEl.classList.remove('exiting');
+  _positionToastForOpenPanel(toastEl);
   toastEl.classList.add('show');
   clearTimeout(toastEl._hideTimer);
   toastEl._hideTimer = setTimeout(() => {
@@ -210,21 +462,59 @@ export function showToast(msg, durationOrOpts) {
  * Show error toast message
  */
 export function showError(msg) {
+  fetch('/api/tasks/notification-logs', {
+    method: 'POST', credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ body: String(msg || ''), status: 'error' }),
+  }).catch(() => {});
   if (!toastEl) {
     toastEl = document.getElementById('toast');
   }
   _wireToastSwipe(toastEl);
-  toastEl.textContent = msg;
+  toastEl.textContent = '';
   toastEl.classList.add('error');
-  toastEl.style.left = '';
+  toastEl.style.pointerEvents = '';
   toastEl.style.transform = '';
   toastEl.classList.remove('exiting');
+  _positionToastForOpenPanel(toastEl);
   toastEl.classList.add('show');
   clearTimeout(toastEl._hideTimer);
+
+  const icon = document.createElement('span');
+  icon.className = 'toast-error-icon';
+  icon.setAttribute('aria-hidden', 'true');
+  icon.textContent = '!';
+  toastEl.appendChild(icon);
+  const textSpan = document.createElement('span');
+  textSpan.className = 'toast-message';
+  textSpan.textContent = msg;
+  toastEl.appendChild(textSpan);
+
+  const actionGroup = document.createElement('span');
+  actionGroup.className = 'toast-actions';
+
+  const closeBtn = document.createElement('button');
+  closeBtn.type = 'button';
+  closeBtn.className = 'toast-close-btn';
+  closeBtn.setAttribute('aria-label', 'Dismiss');
+  closeBtn.title = 'Dismiss';
+  closeBtn.textContent = '×';
+  closeBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    e.preventDefault();
+    clearTimeout(toastEl._hideTimer);
+    toastEl.classList.add('exiting');
+    toastEl.classList.remove('show');
+    toastEl.style.pointerEvents = '';
+  });
+  actionGroup.appendChild(closeBtn);
+  toastEl.appendChild(actionGroup);
+
   toastEl._hideTimer = setTimeout(() => {
     toastEl.classList.add('exiting');
     toastEl.classList.remove('show');
-  }, 3000);
+    toastEl.style.pointerEvents = '';
+  }, 6000);
 }
 
 /**
@@ -234,7 +524,7 @@ export function showError(msg) {
 let _scrollThrottleTimer = null;
 export function scrollHistory() {
   if (!autoScrollEnabled) return;
-  if (!_scrollBox) {
+  if (!_scrollBox || !_scrollBox.isConnected) {
     _scrollBox = document.getElementById('chat-history');
   }
   // Throttle: only start a new scroll animation every 500ms
@@ -243,6 +533,51 @@ export function scrollHistory() {
   if (!_scrollRafId) {
     _scrollRafId = requestAnimationFrame(_smoothScrollStep);
   }
+}
+
+/**
+ * Capture and restore chat scroll around a synchronous terminal render.
+ *
+ * The streamed and persisted versions of a response can have different
+ * heights, especially in the narrow chat column beside an open document.
+ * Cancel the old smooth-scroll target and keep the viewport anchored while
+ * that DOM is replaced so completion cannot produce a rubber-band jump.
+ */
+export function captureHistoryScroll() {
+  const box = document.getElementById('chat-history');
+  if (!box) return null;
+  const maxScrollTop = Math.max(0, box.scrollHeight - box.clientHeight);
+  return {
+    box,
+    scrollTop: box.scrollTop,
+    stickToBottom: maxScrollTop - box.scrollTop <= 120,
+  };
+}
+
+export function restoreHistoryScroll(snapshot) {
+  const box = snapshot?.box;
+  if (!box || !box.isConnected) return;
+  if (_scrollRafId) {
+    cancelAnimationFrame(_scrollRafId);
+    _scrollRafId = null;
+  }
+  if (_scrollThrottleTimer) {
+    clearTimeout(_scrollThrottleTimer);
+    _scrollThrottleTimer = null;
+  }
+  _scrollBox = box;
+  const apply = () => {
+    if (!box.isConnected) return;
+    box.scrollTop = snapshot.stickToBottom
+      ? Math.max(0, box.scrollHeight - box.clientHeight)
+      : snapshot.scrollTop;
+  };
+  apply();
+  // Footer metrics and highlighted code settle on the following frames.
+  requestAnimationFrame(() => {
+    apply();
+    requestAnimationFrame(apply);
+  });
 }
 
 function _smoothScrollStep() {
@@ -355,9 +690,11 @@ export function el(id) {
 
 /**
  * Styled confirm dialog — replaces native browser confirm().
- * Returns a Promise<boolean>.
+ * Returns a Promise<boolean|'alternate'>. Existing two-button callers only
+ * receive true/false; callers that pass alternateText can detect the third
+ * action via the string 'alternate'.
  */
-export function styledConfirm(message, { confirmText = 'Confirm', cancelText = 'Cancel', danger = false } = {}) {
+export function styledConfirm(message, { confirmText = 'Confirm', cancelText = 'Cancel', alternateText = '', title = 'Confirm', danger = false } = {}) {
   return new Promise(resolve => {
     // Reuse or create the modal
     let overlay = document.getElementById('styled-confirm-overlay');
@@ -366,11 +703,12 @@ export function styledConfirm(message, { confirmText = 'Confirm', cancelText = '
       overlay.id = 'styled-confirm-overlay';
       overlay.className = 'modal';
       overlay.innerHTML =
-        '<div class="modal-content styled-confirm-box">' +
-          '<div class="modal-header"><h4>Confirm</h4></div>' +
+        '<div class="modal-content styled-confirm-box" role="dialog" aria-modal="true" aria-labelledby="styled-confirm-title" aria-describedby="styled-confirm-msg">' +
+          '<div class="modal-header"><h4 id="styled-confirm-title">Confirm</h4></div>' +
           '<div class="modal-body"><p id="styled-confirm-msg"></p></div>' +
           '<div class="modal-footer">' +
             '<button id="styled-confirm-cancel"></button>' +
+            '<button id="styled-confirm-alt" style="display:none;"></button>' +
             '<button id="styled-confirm-ok"></button>' +
           '</div>' +
         '</div>';
@@ -378,15 +716,33 @@ export function styledConfirm(message, { confirmText = 'Confirm', cancelText = '
     }
 
     const msgEl = document.getElementById('styled-confirm-msg');
+    const titleEl = document.getElementById('styled-confirm-title');
     const okBtn = document.getElementById('styled-confirm-ok');
     const cancelBtn = document.getElementById('styled-confirm-cancel');
+    let altBtn = document.getElementById('styled-confirm-alt');
+    if (!altBtn) {
+      altBtn = document.createElement('button');
+      altBtn.id = 'styled-confirm-alt';
+      okBtn.parentNode.insertBefore(altBtn, okBtn);
+    }
 
+    if (titleEl) titleEl.textContent = title || 'Confirm';
     msgEl.textContent = message;
-    okBtn.textContent = confirmText;
-    cancelBtn.textContent = cancelText;
+    // Use the affirmative label consistently for generic confirmations.
+    okBtn.textContent = confirmText === 'OK' ? 'Yes' : confirmText;
+    cancelBtn.textContent = '';
+    const cancelLabel = document.createElement('span');
+    cancelLabel.className = 'styled-confirm-cancel-label';
+    cancelLabel.textContent = cancelText;
+    cancelBtn.appendChild(cancelLabel);
+    altBtn.textContent = alternateText || '';
     okBtn.className = danger ? 'confirm-btn confirm-btn-danger' : 'confirm-btn confirm-btn-primary';
     cancelBtn.className = 'confirm-btn confirm-btn-secondary';
+    altBtn.className = 'confirm-btn confirm-btn-secondary';
+    altBtn.style.display = alternateText ? '' : 'none';
 
+    // Remember what had focus so we can restore it when the dialog closes.
+    const _prevFocus = document.activeElement;
     overlay.classList.remove('hidden');
     overlay.style.display = '';
 
@@ -395,28 +751,40 @@ export function styledConfirm(message, { confirmText = 'Confirm', cancelText = '
       overlay.style.display = 'none';
       okBtn.removeEventListener('click', onOk);
       cancelBtn.removeEventListener('click', onCancel);
+      altBtn.removeEventListener('click', onAlt);
       overlay.removeEventListener('click', onBackdrop);
       document.removeEventListener('keydown', onKey);
+      try { _prevFocus && _prevFocus.focus && _prevFocus.focus(); } catch {}
       resolve(result);
     }
     function onOk() { cleanup(true); }
+    function onAlt() { cleanup('alternate'); }
     function onCancel() { cleanup(false); }
     function onBackdrop(e) { if (e.target === overlay) cleanup(false); }
     function onKey(e) {
       if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
         e.preventDefault();
-        const active = document.activeElement;
-        if (active === okBtn) cancelBtn.focus();
-        else okBtn.focus();
+        const f = alternateText ? [cancelBtn, altBtn, okBtn] : [cancelBtn, okBtn];
+        const i = f.indexOf(document.activeElement);
+        const dir = e.key === 'ArrowRight' ? 1 : -1;
+        f[(i + dir + f.length) % f.length].focus();
       } else if (e.key === 'Escape') {
         e.preventDefault();
         e.stopPropagation();
         e.stopImmediatePropagation();
         cleanup(false);
+      } else if (e.key === 'Tab') {
+        // Trap focus inside the dialog so Tab can't wander to the page behind.
+        e.preventDefault();
+        const f = alternateText ? [cancelBtn, altBtn, okBtn] : [cancelBtn, okBtn];
+        const i = f.indexOf(document.activeElement);
+        const n = e.shiftKey ? (i <= 0 ? f.length - 1 : i - 1) : (i >= f.length - 1 ? 0 : i + 1);
+        f[n].focus();
       }
     }
 
     okBtn.addEventListener('click', onOk);
+    altBtn.addEventListener('click', onAlt);
     cancelBtn.addEventListener('click', onCancel);
     overlay.addEventListener('click', onBackdrop);
     document.addEventListener('keydown', onKey);
@@ -443,7 +811,7 @@ export function styledPrompt(message, {
       overlay.id = 'styled-prompt-overlay';
       overlay.className = 'modal';
       overlay.innerHTML =
-        '<div class="modal-content styled-confirm-box styled-prompt-box">' +
+        '<div class="modal-content styled-confirm-box styled-prompt-box" role="dialog" aria-modal="true" aria-labelledby="styled-prompt-title" aria-describedby="styled-prompt-msg">' +
           '<div class="modal-header"><h4 id="styled-prompt-title"></h4></div>' +
           '<div class="modal-body">' +
             '<p id="styled-prompt-msg"></p>' +
@@ -472,6 +840,8 @@ export function styledPrompt(message, {
     okBtn.textContent = confirmText;
     cancelBtn.textContent = cancelText;
 
+    // Remember what had focus so we can restore it when the dialog closes.
+    const _prevFocus = document.activeElement;
     overlay.classList.remove('hidden');
     overlay.style.display = '';
 
@@ -483,6 +853,7 @@ export function styledPrompt(message, {
       overlay.removeEventListener('click', onBackdrop);
       document.removeEventListener('keydown', onKey);
       input.removeEventListener('keydown', onInputKey);
+      try { _prevFocus && _prevFocus.focus && _prevFocus.focus(); } catch {}
       resolve(result);
     }
     function onOk() { cleanup((input.value || '').trim()); }
@@ -494,6 +865,13 @@ export function styledPrompt(message, {
         e.stopPropagation();
         e.stopImmediatePropagation();
         cleanup(null);
+      } else if (e.key === 'Tab') {
+        // Trap focus inside the dialog (input → Cancel → OK → input …).
+        e.preventDefault();
+        const f = [input, cancelBtn, okBtn];
+        const i = f.indexOf(document.activeElement);
+        const n = e.shiftKey ? (i <= 0 ? f.length - 1 : i - 1) : (i >= f.length - 1 ? 0 : i + 1);
+        f[n].focus();
       }
     }
     function onInputKey(e) {
@@ -516,14 +894,15 @@ export function styledPrompt(message, {
   });
 }
 
+// Lookup table for esc(); hoisted out of the replace callback so it is
+// allocated once rather than per matched character.
+const _ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 /**
  * HTML-escape a string to prevent XSS.
  * Canonical implementation — other modules should use uiModule.esc() instead of local copies.
  */
 export function esc(s) {
-  return (s || '').replace(/[&<>"']/g, function(m) {
-    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m];
-  });
+  return (s || '').replace(/[&<>"']/g, (m) => _ESC_MAP[m]);
 }
 
 // ── Mobile: suppress synthetic click/mousedown on backdrop ──
@@ -556,7 +935,7 @@ function _initScrollDismiss() {
   if (chatHistory) {
     chatHistory.addEventListener('scroll', () => {
       chatHistory.querySelectorAll('.dropdown.show').forEach(d => d.classList.remove('show'));
-      document.querySelectorAll('.ctx-popup').forEach(p => p.remove());
+      document.querySelectorAll('.ctx-popup').forEach(dismissOrRemove);
     }, { passive: true });
   } else {
     // Retry once if element doesn't exist yet
@@ -602,6 +981,8 @@ const uiModule = {
   styledPrompt,
   scrollHistory,
   scrollHistoryInstant,
+  captureHistoryScroll,
+  restoreHistoryScroll,
   setAutoScroll,
   getAutoScroll,
   autoResize,
@@ -609,7 +990,8 @@ const uiModule = {
   el,
   esc,
   isTouchInsideModal,
-  emptyStateIcon
+  emptyStateIcon,
+  registerMenuDismiss
 };
 
 export default uiModule;
@@ -670,7 +1052,9 @@ if ('ontouchstart' in window) {
       '.email-card-dropdown, .hwfit-cached-dropdown, .cookbook-saved-menu, .cookbook-dep-menu'
     ).forEach(d => {
       if (d._anchor) d._anchor.classList.remove('cookbook-menu-active', 'reader-more-active');
-      d.remove();
+      // Registered menus tear down through their own dismiss (releasing the
+      // Escape-stack entry); unregistered ones (email/dep) just get removed.
+      dismissOrRemove(d);
     });
   }
 
@@ -851,14 +1235,22 @@ if ('ontouchstart' in window) {
 
 // ---- Bring modal to front on click ----
 {
-  let topModalZ = 250;
+  const raiseModalToFront = (modal, floor = 250) => {
+    const z = nextToolWindowZ({
+      exclude: modal,
+      current: getComputedStyle(modal).zIndex,
+      floor,
+    });
+    modal.style.setProperty('z-index', String(z), 'important');
+    return z;
+  };
+
   document.addEventListener('mousedown', (e) => {
     const modalContent = e.target.closest('.modal-content');
     if (!modalContent) return;
     const modal = modalContent.closest('.modal');
     if (!modal) return;
-    topModalZ += 1;
-    modal.style.zIndex = topModalZ;
+    raiseModalToFront(modal);
   });
 
   // Backdrop tap to close — delegated for all modals
@@ -953,9 +1345,15 @@ if (!window._odyEscExpandGuard) {
     // Re-entry guard: setting style.zIndex itself fires the observer that
     // calls us back. Skip if this element is already pinned to the top
     // (matches the current counter) so we don't spin into an infinite loop.
-    const cur = parseInt(m.style.zIndex, 10) || 0;
-    if (cur === _zCounter) return;
-    m.style.zIndex = String(++_zCounter);
+    const cur = parseInt(getComputedStyle(m).zIndex, 10) || 0;
+    if (cur === _zCounter && cur > topToolWindowZ({ exclude: m })) return;
+    const z = nextToolWindowZ({
+      exclude: m,
+      current: cur,
+      floor: _zCounter,
+    });
+    _zCounter = Math.max(_zCounter, z);
+    if (z !== cur) m.style.setProperty('z-index', String(z), 'important');
   };
   new MutationObserver((muts) => {
     for (const m of muts) {
@@ -976,8 +1374,6 @@ if (!window._odyEscExpandGuard) {
 
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape' || e.defaultPrevented) return;
-    const t = e.target;
-    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
 
     // Find the single thing to close, in priority order. The first hit wins.
     // Important: if a thinking block is open we MUST handle it ourselves and
@@ -985,7 +1381,68 @@ if (!window._odyEscExpandGuard) {
     // (the live-stream chat rebuilds thinking DOM mid-stream so the header
     // can briefly be absent). Toggling the `expanded` class directly is the
     // fallback so ESC never bypasses the thinking block to hit a modal.
-    const expanded = document.querySelector('.doclib-card-expanded');
+    // Transient ad-hoc menus (dropdowns / context popups) live outside the
+    // .modal system and register a dismiss callback in escMenuStack. Close the
+    // most-recently-opened one first — so a menu opened over a modal dismisses
+    // before the modal — and do it BEFORE the text-input guard below, since a
+    // menu may own the focused input (e.g. a search dropdown).
+    if (dismissTopEscapeLayer()) {
+      e.stopImmediatePropagation(); e.preventDefault();
+      return;
+    }
+    // The event editor is an inner Calendar layer. Cancel it through the
+    // form's existing button before hovered-window handling can close the
+    // entire Calendar modal.
+    const calendarModal = document.getElementById('calendar-modal');
+    const calendarEventForm = calendarModal?.querySelector('.cal-form');
+    if (calendarEventForm && _isVisible(calendarModal)) {
+      e.stopImmediatePropagation(); e.preventDefault();
+      try {
+        (calendarEventForm.querySelector('#cal-f-cancel, #cal-form-mobile-cancel'))?.click();
+      } catch {}
+      return;
+    }
+    // Selection mode is rendered as a visible bulk bar in several modules.
+    // Keep it as an inner layer even where the module predates the shared
+    // registry, so Escape cancels selection instead of closing the library.
+    const selectionBars = [...document.querySelectorAll(
+      '.memory-bulk-bar:not(.hidden), .session-bulk-bar:not(.hidden)',
+    )]
+      .filter(bar => _isVisible(bar));
+    const selectionBar = selectionBars[selectionBars.length - 1];
+    let selectionCancel = selectionBar?.querySelector(
+      'button[id*="cancel"], button[title*="Cancel"], .memory-bulk-cancel',
+    );
+    // A few older library panes use the Select toggle itself as the cancel
+    // control and do not render a separate button in the bulk bar.
+    if (!selectionCancel && selectionBar) {
+      selectionCancel = [
+        '#doclib-select-btn', '#doclib-chats-select-btn',
+        '#doclib-arc-select-btn', '#doclib-research-select-btn',
+        '#memory-select-btn', '#notes-select-btn', '#skills-select-btn',
+        '#tasks-select-btn', '#session-select-btn', '#lib-select-btn',
+        '#archive-select-btn', '#email-lib-select-btn',
+      ].map(selector => document.querySelector(selector))
+        .find(button => button && _isVisible(button) && /^cancel$/i.test(button.textContent.trim()));
+    }
+    if (selectionCancel) {
+      e.stopImmediatePropagation(); e.preventDefault();
+      try { selectionCancel.click(); } catch {}
+      return;
+    }
+    // Bulk selection is an inner Gallery layer, so cancel it before the
+    // generic modal handler gets a chance to close the Gallery.
+    if (document.getElementById('gallery-modal') && window.__galleryCancelSelection?.()) {
+      e.stopImmediatePropagation(); e.preventDefault();
+      return;
+    }
+    const t = e.target;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+    // Registered card layers handle the normal path. Keep a narrow fallback
+    // for older/rebuilt rows whose module has not wired the helper yet.
+    const expanded = document.querySelector(
+      '.doclib-card-expanded, .task-card.expanded, .task-log-row.expanded',
+    );
     const think = document.querySelector('.thinking-content.expanded');
     if (expanded) {
       e.stopImmediatePropagation(); e.preventDefault();
@@ -1000,6 +1457,13 @@ if (!window._odyEscExpandGuard) {
         // No header found — collapse the content directly.
         try { think.classList.remove('expanded'); } catch {}
       }
+      return;
+    }
+    // Only close the hovered outer window after its inner layers have had a
+    // chance to handle Escape. In particular, an expanded library card must
+    // collapse on the first press rather than losing the whole library.
+    if (_closeHoveredWindow()) {
+      e.stopImmediatePropagation(); e.preventDefault();
       return;
     }
     const galleryEditor = document.getElementById('gallery-editor-container');

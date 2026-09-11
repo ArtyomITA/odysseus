@@ -1,12 +1,14 @@
 // static/js/group.js
 // Group Chat — multi-model conversations (parallel or round-robin)
 
-import uiModule from './ui.js';
+import uiModule from './ui.js?v=20260908weekhoverfix1';
 import markdownModule from './markdown.js';
-import chatRenderer from './chatRenderer.js';
+import chatRenderer from './chatRenderer.js?v=20260910streamlinks2';
 import spinnerModule from './spinner.js';
 import { providerLogo } from './providers.js';
-import { PROMPT_TEMPLATES, getAllPresets } from './presets.js';
+import { PROMPT_TEMPLATES, getUserTemplates } from './presets.js?v=20260908personaname1';
+import { sortModelObjects } from './modelSort.js';
+import Storage from './storage.js';
 
 let API_BASE = '';
 let _active = false;
@@ -55,8 +57,8 @@ function _initGroupTab() {
         result.push({ mid, display: display.split('/').pop(), url: item.url, endpointId: item.endpoint_id });
       });
     });
-    _modelsCache = result;
-    return result;
+    _modelsCache = sortModelObjects(result);
+    return _modelsCache;
   }
 
   function _render() {
@@ -80,20 +82,23 @@ function _initGroupTab() {
   }
 
   addBtn.addEventListener('click', async () => {
-    const models = await _getModels();
-    const characters = _getCharacterList();
+    const [models, characters] = await Promise.all([_getModels(), _getCharacterList()]);
 
     const picker = document.createElement('div');
     picker.style.cssText = 'display:flex;gap:4px;align-items:center;';
 
     const charSel = document.createElement('select');
     charSel.className = 'preset-input';
+    // add an identifier that this is a character selection
+    charSel.dataset.selectionType = "character"
     charSel.style.cssText = 'font-size:11px;flex:1;height:26px;';
     charSel.innerHTML = '<option value="">Empty...</option>' +
       characters.map(c => '<option value="' + c.id + '">' + uiModule.esc(c.name) + '</option>').join('');
 
     const modelSel = document.createElement('select');
     modelSel.className = 'preset-input';
+    // add an identifier that this is a model selection
+    modelSel.dataset.selectionType = "model"
     modelSel.style.cssText = 'font-size:11px;flex:1;height:26px;';
     modelSel.innerHTML = '<option value="">Model…</option>' +
       models.map(m => '<option value="' + m.mid + '">' + uiModule.esc(m.display) + '</option>').join('');
@@ -195,14 +200,66 @@ function _initGroupTab() {
   });
 
   const groupTab = document.querySelector('.preset-tab[data-chartab="group"]');
+  // whenever a user navigates to the Group tab
   if (groupTab) groupTab.addEventListener('click', () => {
     _modelsCache = null;
     if (startBtn) startBtn.textContent = 'Start Group';
     _loadGroupPresets();
-    if (_groupParticipants.length === 0) {
+
+    const isGroupTabUnInitialized =
+      _groupParticipants.length === 0 && participantsEl.children.length === 0;
+
+    if (isGroupTabUnInitialized) {
       setTimeout(() => addBtn.click(), 100);
+    } else {
+      // queue this asynchronously since repopulating the selection drop-downs
+      // do not need to be visible right away; it can be safely delayed before
+      // the next event loop
+      queueMicrotask(() => {
+        repopulateExistingSelections();
+      })
     }
   });
+
+  async function repopulateExistingSelections() {
+    const EMPTY = "";
+
+    const characterSelections = participantsEl.querySelectorAll("select.preset-input[data-selection-type=character]");
+    const modelSelections = participantsEl.querySelectorAll("select.preset-input[data-selection-type=model]");
+
+    if (characterSelections.length !== 0) {
+      const characters = await _getCharacterList();
+
+      characterSelections.forEach((characterSelection) => {
+
+        const chosenCharacter = characterSelection.value;
+        const isChosenCharacterExisting = chosenCharacter !== EMPTY
+          && characters.findIndex((char) => char.id === chosenCharacter) !== -1;
+
+        characterSelection.innerHTML = '<option value="">Empty...</option>' +
+          characters.map(c => '<option value="' + c.id + '">' + uiModule.esc(c.name) + '</option>').join('');
+        if (isChosenCharacterExisting) {
+          characterSelection.value = chosenCharacter;
+        }
+      });
+    }
+
+    if (modelSelections.length !== 0) {
+      const models = await _getModels();
+
+      modelSelections.forEach((modelSelection) => {
+        const chosenModel = modelSelection.value;
+        const isChosenModelExisting = chosenModel !== EMPTY
+          && models.findIndex((model) => model.mid === chosenModel) !== -1;
+
+        modelSelection.innerHTML = '<option value="">Model…</option>' +
+          models.map(m => '<option value="' + m.mid + '">' + uiModule.esc(m.display) + '</option>').join('');
+        if (isChosenModelExisting) {
+          modelSelection.value = chosenModel;
+        }
+      });
+    }
+  }
 
   // Load and render saved group presets
   async function _loadGroupPresets() {
@@ -243,13 +300,12 @@ function _initGroupTab() {
         chip.title = (g.participants || []).map(p => p.characterName || p.modelDisplay || '?').join(', ');
         chip.addEventListener('click', async () => {
           // Load preset participants
-          const models = await _getModels();
+          const [models, chars] = await Promise.all([_getModels(), _getCharacterList()]);
           _groupParticipants.length = 0;
           (g.participants || []).forEach(p => {
             const model = models.find(m => m.mid === p.modelId) || models[0];
             const entry = { model: model || null, character: null };
             if (p.characterId) {
-              const chars = _getCharacterList();
               entry.character = chars.find(c => c.id === p.characterId) || null;
             }
             if (entry.model) _groupParticipants.push(entry);
@@ -283,35 +339,38 @@ function _initGroupTab() {
   });
 }
 
-function _getCharacterList() {
+async function _getCharacterList() {
   // Built-in characters from PROMPT_TEMPLATES
   const chars = PROMPT_TEMPLATES.filter(t => t.isCharacter).map(t => ({
     id: t.id, name: t.name, prompt: t.prompt,
   }));
-  // User-created characters from presets
+  // Load user templates and wait for them before returning.
+  // The endpoint returns a JSON array directly (not {templates:[...]}).
+  // All user templates are personas by definition — no isCharacter filter needed.
   try {
-    const allPresets = getAllPresets();
-    if (allPresets && allPresets.custom && allPresets.custom.character_name) {
-      chars.push({
-        id: 'custom',
-        name: allPresets.custom.character_name,
-        prompt: allPresets.custom.system_prompt || allPresets.custom.prompt || '',
-      });
-    }
+    const r = await fetch(API_BASE + '/api/presets/templates', { credentials: 'same-origin' });
+    const data = await r.json();
+    const templates = Array.isArray(data) ? data : (data.templates || []);
+
+    templates.forEach(t => {
+      if (t.id && t.name && !chars.find(c => c.id === t.id)) {
+        chars.push({ id: t.id, name: t.name, prompt: t.system_prompt || t.prompt || '' });
+      }
+    });
   } catch (e) {}
-  // Also try loading user templates
-  try {
-    fetch(API_BASE + '/api/presets/templates', { credentials: 'same-origin' })
-      .then(r => r.json())
-      .then(data => {
-        (data.templates || []).forEach(t => {
-          if (t.isCharacter && !chars.find(c => c.id === t.id)) {
-            chars.push({ id: t.id, name: t.name, prompt: t.prompt || '' });
-          }
-        });
-      })
-      .catch(() => {});
-  } catch (e) {}
+
+  // Also merge in-memory templates from presets.js — these may include
+  // newly created characters whose async save-to-API hasn't completed yet.
+  const memTemplates = getUserTemplates();
+
+  if (Array.isArray(memTemplates)) {
+    memTemplates.forEach(t => {
+      if (t.id && t.name && !chars.find(c => c.id === t.id)) {
+        chars.push({ id: t.id, name: t.name, prompt: t.system_prompt || t.prompt || '' });
+      }
+    });
+  }
+
   return chars;
 }
 
@@ -412,8 +471,8 @@ export async function showModelPicker() {
           result.push({ mid, display: display.split('/').pop(), url: item.url, endpointId: item.endpoint_id, epName: item.endpoint_name || '' });
         });
       });
-      _cachedModels = result;
-      return result;
+      _cachedModels = sortModelObjects(result);
+      return _cachedModels;
     }
 
     async function render(filter) {
@@ -474,7 +533,7 @@ export async function showModelPicker() {
       body.appendChild(stepTitle);
 
       // Build character options
-      const characters = _getCharacterList();
+      const characters = await _getCharacterList();
       const assignments = {}; // mid -> {characterId, characterName, characterPrompt}
 
       for (const m of picked) {
@@ -487,10 +546,11 @@ export async function showModelPicker() {
         `;
         const sel = document.createElement('select');
         sel.style.cssText = 'font-size:11px;padding:3px 6px;border-radius:4px;border:1px solid var(--border);background:var(--bg);color:var(--fg);max-width:140px;';
-        sel.innerHTML = '<option value="">No character</option>';
+        let optsHtml = '<option value="">No character</option>';
         characters.forEach(c => {
-          sel.innerHTML += `<option value="${c.id}">${uiModule.esc(c.name)}</option>`;
+          optsHtml += `<option value="${c.id}">${uiModule.esc(c.name)}</option>`;
         });
+        sel.innerHTML = optsHtml;
         sel.addEventListener('change', () => {
           if (sel.value) {
             const ch = characters.find(c => c.id === sel.value);
@@ -549,7 +609,8 @@ export async function startGroup(models, parentSessionId) {
     _parentSessionId = pdata.id;
     // Register as group session for sidebar icon
     try {
-      const gids = JSON.parse(localStorage.getItem('odysseus-group-sessions') || '[]');
+      const storedGroupSessions = Storage.getJSON('odysseus-group-sessions', []);
+      const gids = Array.isArray(storedGroupSessions) ? storedGroupSessions : [];
       if (!gids.includes(_parentSessionId)) { gids.push(_parentSessionId); localStorage.setItem('odysseus-group-sessions', JSON.stringify(gids)); }
     } catch (e) {}
   } catch (e) {
@@ -674,7 +735,7 @@ function _createGroupBubble(model, box) {
   // Role label — use character name if assigned, otherwise model name
   const roleLabel = model._groupName || (model.character ? model.character.characterName : chatRenderer.shortModel(model.mid));
   const roleTs = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  wrap.innerHTML = `<div class="role">${roleLabel} <span class="role-timestamp">${roleTs}</span></div><div class="body"></div>`;
+  wrap.innerHTML = `<div class="role">${uiModule.esc(roleLabel)} <span class="role-timestamp">${roleTs}</span></div><div class="body"></div>`;
   chatRenderer.applyModelColor(wrap.querySelector('.role'), model.mid);
 
   // Spinner — identical to chat.js line 3062
@@ -858,11 +919,14 @@ async function _streamToHolder(modelIdx, sessionId, msg, holderEl, abortCtrl) {
           }
           // Generated image
           else if (json.type === 'generated_image' && json.url) {
-            const img = document.createElement('img');
-            img.src = json.url;
-            img.style.cssText = 'max-width:100%;border-radius:8px;margin:8px 0;';
-            img.loading = 'lazy';
-            bodyEl.appendChild(img);
+            const safeImageUrl = chatRenderer.safeDisplayImageSrc(json.url);
+            if (safeImageUrl) {
+              const img = document.createElement('img');
+              img.src = safeImageUrl;
+              img.style.cssText = 'max-width:100%;border-radius:8px;margin:8px 0;';
+              img.loading = 'lazy';
+              bodyEl.appendChild(img);
+            }
           }
           // Error
           else if (json.error) {

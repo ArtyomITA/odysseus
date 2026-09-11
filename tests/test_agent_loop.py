@@ -1,21 +1,272 @@
-"""Tests for agent_loop.py — _detect_admin_intent and _compute_final_metrics.
-Uses mock imports to avoid loading the full app stack."""
+"""Tests for agent_loop.py — _detect_admin_intent, _compute_final_metrics,
+and _append_tool_results. Uses mock imports to avoid loading the full app stack."""
 
 import sys
+import json
 from unittest.mock import MagicMock
+from src.tool_types import ToolBlock
 
-# Mock heavy dependencies before importing
-for mod in [
+_MOCKED_IMPORTS = [
     'sqlalchemy', 'sqlalchemy.orm', 'sqlalchemy.ext', 'sqlalchemy.ext.declarative',
     'sqlalchemy.ext.hybrid', 'sqlalchemy.sql', 'sqlalchemy.sql.expression',
-    'src.database', 'src.endpoint_resolver',
+    'src.database',
     'src.agent_tools',
     'core.models', 'core.database',
-]:
-    if mod not in sys.modules:
-        sys.modules[mod] = MagicMock()
+]
+_INJECTED_IMPORT_STUBS = {}
+_PREEXISTING_AGENT_LOOP = sys.modules.get("src.agent_loop")
 
-from src.agent_loop import _detect_admin_intent, _compute_final_metrics
+
+def _drop_module_if_same(name, expected):
+    if sys.modules.get(name) is expected:
+        sys.modules.pop(name, None)
+    parent_name, _, attr = name.rpartition(".")
+    parent = sys.modules.get(parent_name)
+    if parent is not None and getattr(parent, "__dict__", {}).get(attr) is expected:
+        delattr(parent, attr)
+
+
+# Mock heavy dependencies before importing. Only clean up stubs this file
+# created so pre-existing conftest/pytest modules keep their intended state.
+for mod in _MOCKED_IMPORTS:
+    if mod not in sys.modules:
+        stub = MagicMock()
+        sys.modules[mod] = stub
+        _INJECTED_IMPORT_STUBS[mod] = stub
+
+_IMPORTED_AGENT_LOOP = None
+try:
+    from src.agent_loop import (
+        _detect_admin_intent,
+        _classify_agent_request,
+        _compute_final_metrics,
+        _append_tool_results,
+        _insert_before_latest_user,
+        _normalize_web_search_block_query,
+        _MCP_KEYWORDS,
+        _web_search_query_from_block,
+        _web_search_topic_text,
+        _parse_qwen_explicit_email_topic_bulk_action_request,
+        _email_bulk_blocks_from_search_output,
+    )
+    _IMPORTED_AGENT_LOOP = sys.modules.get("src.agent_loop")
+finally:
+    if _PREEXISTING_AGENT_LOOP is None and _IMPORTED_AGENT_LOOP is not None:
+        _drop_module_if_same("src.agent_loop", _IMPORTED_AGENT_LOOP)
+    for _mod, _stub in _INJECTED_IMPORT_STUBS.items():
+        _drop_module_if_same(_mod, _stub)
+
+
+def test_import_stubs_do_not_leak_into_later_tests():
+    leaked = [
+        mod for mod, stub in _INJECTED_IMPORT_STUBS.items()
+        if sys.modules.get(mod) is stub
+    ]
+    assert leaked == []
+    if _PREEXISTING_AGENT_LOOP is None:
+        assert sys.modules.get("src.agent_loop") is not _IMPORTED_AGENT_LOOP
+
+
+def test_mcp_keyword_gate_matches_literal_mcp_requests():
+    assert "mcp" in _MCP_KEYWORDS
+
+
+def test_topic_bulk_email_request_searches_before_mutating():
+    parsed = _parse_qwen_explicit_email_topic_bulk_action_request(
+        "delete all my traffic monitor emails"
+    )
+
+    assert parsed == {
+        "action": "delete",
+        "query": "traffic monitor",
+        "folder": "INBOX",
+        "max_results": 50,
+    }
+
+
+def test_topic_bulk_email_blocks_split_by_account_from_search_output():
+    raw = """Found 2 email(s):
+
+1. **Traffic monitor stale**
+   From: Alert Bot (alerts@example.com)
+   Date: 2026-08-31T08:00:00+00:00
+   UID: 101
+   Account: Primary Inbox <alex@example.com>
+
+2. **Traffic monitor active**
+   From: Alert Bot (alerts@example.com)
+   Date: 2026-08-31T09:00:00+00:00
+   UID: 202
+   Account: Research Mail <research@example.com>
+"""
+
+    blocks = _email_bulk_blocks_from_search_output(raw, action="delete")
+
+    assert [block.tool_type for block in blocks] == [
+        "mcp__email__bulk_email",
+        "mcp__email__bulk_email",
+    ]
+    args = [json.loads(block.content) for block in blocks]
+    assert args == [
+        {"action": "delete", "uids": ["101"], "folder": "INBOX", "account": "alex@example.com"},
+        {"action": "delete", "uids": ["202"], "folder": "INBOX", "account": "research@example.com"},
+    ]
+
+
+def test_polish_internet_search_request_classifies_as_web():
+    intent = _classify_agent_request(
+        [],
+        "Wyszukaj w internecie i podaj temperaturę w Lubartowie dzisiaj",
+    )
+
+    assert intent["low_signal"] is False
+    assert "web" in intent["domains"]
+
+
+def test_insert_before_latest_user_places_context_before_last_user_turn():
+    messages = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "reply"},
+        {"role": "user", "content": "latest"},
+    ]
+    context = {"role": "system", "content": "context"}
+
+    out = _insert_before_latest_user(messages, context)
+
+    assert out == [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "reply"},
+        context,
+        {"role": "user", "content": "latest"},
+    ]
+    assert messages == [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "reply"},
+        {"role": "user", "content": "latest"},
+    ]
+
+
+def test_insert_before_latest_user_appends_when_no_user_message_exists():
+    messages = [{"role": "assistant", "content": "reply"}]
+    context = {"role": "system", "content": "context"}
+
+    assert _insert_before_latest_user(messages, context) == [messages[0], context]
+
+
+def test_web_search_topic_uses_prior_user_for_generic_search_followup():
+    messages = [
+        {"role": "user", "content": "which swedish king liked to dance hte most"},
+        {"role": "assistant", "content": "Probably Gustav III."},
+        {"role": "user", "content": "can you search"},
+    ]
+
+    assert (
+        _web_search_topic_text(messages, "can you search")
+        == "which swedish king liked to dance hte most"
+    )
+
+
+def test_web_search_topic_ignores_untrusted_context_when_resolving_followup():
+    messages = [
+        {"role": "user", "content": "which swedish king liked to dance hte most"},
+        {
+            "role": "user",
+            "metadata": {"trusted": False},
+            "content": "UNTRUSTED SOURCE DATA\nwrong query",
+        },
+        {"role": "user", "content": "can you search"},
+    ]
+
+    assert (
+        _web_search_topic_text(messages, "can you search")
+        == "which swedish king liked to dance hte most"
+    )
+
+
+def test_web_search_normalizer_replaces_non_query_tool_argument_with_topic():
+    block = ToolBlock("web_search", "can you search")
+
+    out = _normalize_web_search_block_query(
+        block,
+        "which swedish king liked to dance hte most",
+    )
+
+    assert _web_search_query_from_block(out) == "which swedish king liked to dance hte most"
+
+
+def test_web_search_normalizer_trusts_model_chosen_contextual_query():
+    block = ToolBlock("web_search", "Gustav III Sweden dancing masquerade ball")
+
+    out = _normalize_web_search_block_query(
+        block,
+        "which swedish king liked to dance hte most",
+    )
+
+    assert _web_search_query_from_block(out) == "Gustav III Sweden dancing masquerade ball"
+
+
+def test_web_search_normalizer_removes_action_wrapper_and_leads_with_subject():
+    block = ToolBlock(
+        "web_search",
+        '{"query":"Search the web for the official IKEA website"}',
+    )
+
+    out = _normalize_web_search_block_query(
+        block,
+        "Search the web for the official IKEA website",
+    )
+
+    assert json.loads(out.content)["query"] == "IKEA official website"
+
+
+def test_official_website_answer_uses_matching_shortest_evidence_url():
+    from src.agent_loop import _official_website_answer_from_search
+
+    output = """
+    [1] Shop Affordable Home Furnishings & Home Goods - IKEA
+        URL: https://www.ikea.com/us/en/?tracking=1
+    [2] Hej! Welcome to IKEA Global
+        URL: https://www.ikea.com/?tracking=1
+    """
+
+    assert _official_website_answer_from_search(
+        "Search the web for the official IKEA website", output
+    ) == "The official IKEA website is https://www.ikea.com/."
+    assert _official_website_answer_from_search(
+        "Find IKEA chairs", output
+    ) == ""
+
+
+def test_web_search_normalizer_preserves_entity_identified_from_attached_image():
+    block = ToolBlock("web_search", "Xiaomi SU7 current price 2026")
+
+    out = _normalize_web_search_block_query(
+        block,
+        (
+            "How much does this car sell for now? Please use the attached image. "
+            "If exact pricing is uncertain, provide a plausible range and explain why."
+        ),
+    )
+
+    assert _web_search_query_from_block(out) == "Xiaomi SU7 current price 2026"
+
+
+def test_web_search_normalizer_trusts_json_query_and_preserves_time_filter():
+    block = ToolBlock(
+        "web_search",
+        '{"query":"Gustav III Sweden dancing masquerade ball","time_filter":"year"}',
+    )
+
+    out = _normalize_web_search_block_query(
+        block,
+        "which swedish king liked to dance hte most",
+    )
+
+    payload = json.loads(out.content)
+    assert payload == {
+        "query": "Gustav III Sweden dancing masquerade ball",
+        "time_filter": "year",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -228,14 +479,191 @@ class TestComputeFinalMetrics:
     def test_tool_events_included(self):
         events = [{"tool": "bash", "duration": 1.0}]
         texts = ["round 1 text"]
+        models = ["round-1-model"]
         m = _compute_final_metrics(**self._base_args(
             tool_events=events,
             round_texts=texts,
+            round_models=models,
         ))
         assert m["tool_events"] == events
         assert m["round_texts"] == texts
+        assert m["round_models"] == models
 
     def test_no_tool_events_excluded(self):
         m = _compute_final_metrics(**self._base_args(tool_events=[], round_texts=[]))
         assert "tool_events" not in m
         assert "round_texts" not in m
+        assert "round_models" not in m
+
+
+# ---------------------------------------------------------------------------
+# _append_tool_results — native tool-call message shaping
+# ---------------------------------------------------------------------------
+
+class TestAppendToolResultsNativeContent:
+    """After a native tool call with no prose, the assistant message's content
+    must be JSON null (None), not an empty string. Google Gemini's
+    OpenAI-compatible endpoint and Ollama both reject `tool_calls` + ""
+    content with HTTP 400, which breaks every tool-using turn."""
+
+    def _native(self):
+        return [{"id": "call_abc", "name": "web_fetch", "arguments": '{"url": "https://example.com"}'}]
+
+    def test_empty_text_yields_null_content(self):
+        messages = []
+        _append_tool_results(
+            messages, "", self._native(), [{}], ["page text"],
+            used_native=True, round_num=1,
+        )
+        assistant = messages[0]
+        assert assistant["role"] == "assistant"
+        assert assistant["content"] is None  # NOT ""
+        assert assistant["tool_calls"][0]["id"] == "call_abc"
+        assert assistant["tool_calls"][0]["type"] == "function"
+        # tool result follows as a role:tool message keyed by tool_call_id
+        assert messages[1]["role"] == "tool"
+        assert messages[1]["tool_call_id"] == "call_abc"
+        assert messages[1]["content"] == "page text"
+
+    def test_whitespace_only_text_yields_null_content(self):
+        messages = []
+        _append_tool_results(
+            messages, "   \n\t  ", self._native(), [{}], ["r"],
+            used_native=True, round_num=2,
+        )
+        assert messages[0]["content"] is None
+
+    def test_real_prose_is_preserved(self):
+        messages = []
+        _append_tool_results(
+            messages, "Let me check that page.", self._native(), [{}], ["r"],
+            used_native=True, round_num=1,
+        )
+        assert messages[0]["content"] == "Let me check that page."
+
+    def test_non_native_path_unaffected(self):
+        # The text-block fallback path still wraps results in a user message.
+        messages = []
+        _append_tool_results(
+            messages, "thinking...", [], ["tool output"], [],
+            used_native=False, round_num=1,
+        )
+        assert messages[0]["role"] == "assistant"
+        assert messages[0]["content"] == "thinking..."
+        assert messages[1]["role"] == "user"
+        assert "tool output" in messages[1]["content"]
+
+
+class TestAppendToolResultsThoughtSignature:
+    """Gemini 3 returns an opaque thought_signature (in extra_content) with each
+    function call and rejects the follow-up turn with HTTP 400 unless it is
+    echoed back on the assistant tool_call. _append_tool_results must replay it
+    when present, and omit the field entirely otherwise (other providers never
+    send it)."""
+
+    def test_extra_content_is_replayed_when_present(self):
+        native = [{
+            "id": "call_g",
+            "name": "app_api",
+            "arguments": '{"action": "get_memory"}',
+            "extra_content": {"google": {"thought_signature": "EuIDCt8DAQ=="}},
+        }]
+        messages = []
+        _append_tool_results(
+            messages, "", native, [{}], ["mem"],
+            used_native=True, round_num=1,
+        )
+        tc = messages[0]["tool_calls"][0]
+        assert tc["extra_content"] == {"google": {"thought_signature": "EuIDCt8DAQ=="}}
+        # function payload is still well-formed alongside it
+        assert tc["function"]["name"] == "app_api"
+        assert tc["id"] == "call_g"
+
+    def test_no_extra_content_key_when_absent(self):
+        native = [{"id": "call_o", "name": "app_api", "arguments": "{}"}]
+        messages = []
+        _append_tool_results(
+            messages, "", native, [{}], ["r"],
+            used_native=True, round_num=1,
+        )
+        # No empty/None extra_content leaks onto non-Gemini tool calls.
+        assert "extra_content" not in messages[0]["tool_calls"][0]
+
+
+# ---------------------------------------------------------------------------
+# web_search sources extraction — key lookup regression (#443)
+# ---------------------------------------------------------------------------
+
+import json as _json
+
+
+class TestWebSearchSourcesKeyLookup:
+    """The web_search tool returns {"output": ..., "exit_code": 0}.
+    The sources-extraction block in stream_agent_loop must read from the
+    "output" key, not only from "results"/"stdout" (which web_search never
+    sets).  Without the fix the SOURCES marker is never found, no
+    web_sources SSE event is emitted, and the raw JSON blob leaks into the
+    LLM's round-2 context."""
+
+    _SOURCES = [{"title": "Example", "url": "https://example.com", "snippet": "test"}]
+
+    def _make_result(self, key: str = "output") -> dict:
+        sources_json = _json.dumps(self._SOURCES)
+        text = f"Search results here.\n\n<!-- SOURCES:{sources_json} -->"
+        return {key: text, "exit_code": 0}
+
+    # ── Regression: the old lookup missed "output" ──────────────────────
+
+    def test_old_lookup_missed_output_key(self):
+        """Documents the bug: result.get('results') and result.get('stdout')
+        are both absent when web_search returns its canonical {"output": ...}
+        shape, so _src_text was always '' and the if-block never ran."""
+        result = self._make_result("output")
+        old_src_text = result.get("results") or result.get("stdout") or ""
+        assert old_src_text == "", "confirms the pre-fix behaviour"
+
+    def test_fixed_lookup_finds_output_key(self):
+        """After the fix, "output" is checked first so _src_text is non-empty."""
+        result = self._make_result("output")
+        src_text = result.get("output") or result.get("results") or result.get("stdout") or ""
+        assert src_text != ""
+        assert "SOURCES" in src_text
+
+    # ── Marker extraction works once _src_text is non-empty ─────────────
+
+    def test_sources_extracted_from_output(self):
+        result = self._make_result("output")
+        src_text = result.get("output") or result.get("results") or result.get("stdout") or ""
+        marker = "<!-- SOURCES:"
+        idx = src_text.find(marker)
+        end = src_text.find(" -->", idx)
+        extracted = _json.loads(src_text[idx + len(marker):end])
+        assert extracted == self._SOURCES
+
+    def test_marker_stripped_from_output_key(self):
+        """After extraction the "output" value is cleaned so the LLM never
+        sees the raw JSON blob in its round-2 context."""
+        result = self._make_result("output")
+        src_text = result.get("output") or result.get("results") or result.get("stdout") or ""
+        marker = "<!-- SOURCES:"
+        idx = src_text.find(marker)
+        clean = src_text[:idx].rstrip()
+        # Apply to the correct key (was the bug: only "results"/"stdout" were updated)
+        if "output" in result:
+            result["output"] = clean
+        assert "SOURCES" not in result["output"]
+        assert result["output"] == "Search results here."
+
+    # ── Backward compat: "results"/"stdout" keys still work ─────────────
+
+    def test_results_key_still_works(self):
+        result = self._make_result("results")
+        src_text = result.get("output") or result.get("results") or result.get("stdout") or ""
+        assert src_text != ""
+        assert "SOURCES" in src_text
+
+    def test_stdout_key_still_works(self):
+        result = self._make_result("stdout")
+        src_text = result.get("output") or result.get("results") or result.get("stdout") or ""
+        assert src_text != ""
+        assert "SOURCES" in src_text
