@@ -951,6 +951,7 @@ async function _streamToHolder(modelIdx, sessionId, msg, holderEl, abortCtrl) {
     );
     if (window.hljs) holderEl.querySelectorAll('pre code').forEach(b => window.hljs.highlightElement(b));
     if (markdownModule.renderMermaid) markdownModule.renderMermaid(holderEl);
+    window.OdysseusCharts?.renderCharts(holderEl);
     holderEl.appendChild(chatRenderer.createMsgFooter(holderEl));
   } else if (!bodyEl.querySelector('.agent-tool-event') && !bodyEl.querySelector('img')) {
     bodyEl.innerHTML = '<i style="opacity:0.5;">[No response]</i>';

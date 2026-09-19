@@ -1,4 +1,5 @@
 # src/chat_processor.py
+import os
 import logging
 import math
 import re
@@ -309,6 +310,14 @@ class ChatProcessor:
 
         # Memory: core pinned facts + relevant pinned/extended recall.
         self._last_used_memories = []  # track what was injected
+        # Onda 4 / E08d (27 ago 2026): con ODYSSEUS_MEMORY_TAIL=1 i blocchi di
+        # memoria NON vanno nel preface (in testa, prima della storia: il loro
+        # contenuto cambia a ogni turno e rompe il prefisso KV subito dopo il
+        # system, misurato cache_n fisso a 8,4k) ma in coda, davanti all'ultimo
+        # messaggio utente, e vengono persistiti col turno (replay fedele).
+        self._last_memory_messages = []
+        _mem_tail = os.getenv("ODYSSEUS_MEMORY_TAIL", "0") == "1"
+        _mem_sink = self._last_memory_messages if _mem_tail else preface
         if use_memory:
             mem_entries = self.memory_manager.load(owner=owner)
 
@@ -319,7 +328,7 @@ class ChatProcessor:
             selected_pinned = self._select_pinned_memories(message, pinned)
             if selected_pinned:
                 pinned_text = "\n- ".join([m["text"] for m in selected_pinned])
-                preface.append(untrusted_context_message(
+                _mem_sink.append(untrusted_context_message(
                     "saved memory: pinned context",
                     (
                         "Pinned memory context. Some pinned memories are only "
@@ -336,7 +345,7 @@ class ChatProcessor:
                 relevant = self._hybrid_retrieve(message, extended, k=remaining_memory_slots)
                 if relevant:
                     ext_text = "\n".join([f"- {m['text']}" for m in relevant])
-                    preface.append(untrusted_context_message(
+                    _mem_sink.append(untrusted_context_message(
                         "saved memory: retrieved context",
                         (
                             "Memory context. Do not reference unless the user asks "

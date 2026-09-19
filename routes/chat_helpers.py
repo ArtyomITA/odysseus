@@ -225,62 +225,47 @@ def needs_auto_name(name: str) -> bool:
     return False
 
 
-async def auto_name_session(session_manager, sess):
-    """Generate a short title for a session from its first user message."""
-    try:
-        from src.llm_core import llm_call_async
-        from src.task_endpoint import resolve_task_endpoint
+def deterministic_session_title(value: Any, *, max_words: int = 8, max_chars: int = 72) -> str:
+    """Build a stable, local title from the first user message.
 
+    Session naming is navigation metadata, not a reasoning task.  Keeping it
+    deterministic removes a full local-model request while retaining the UI
+    feature and producing the same title after a restart.
+    """
+    if isinstance(value, list):
+        value = next(
+            (
+                item.get("text", "")
+                for item in value
+                if isinstance(item, dict) and item.get("type") == "text"
+            ),
+            "",
+        )
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or ""))
+    text = re.sub(r"\s+", " ", text).strip(" \t\r\n\"'`*_#>:;,.!?")
+    if not text:
+        return "New chat"
+    title = " ".join(text.split()[:max(1, int(max_words))])
+    if len(title) > max_chars:
+        title = title[:max_chars].rstrip(" \t\r\n\"'`*_#>:;,.!?")
+    return title or "New chat"
+
+
+async def auto_name_session(session_manager, sess):
+    """Name a session locally from its first user message."""
+    try:
         # Find first user message
-        first_msg = ""
+        first_msg: Any = ""
         for msg in sess.history:
             if msg.role == "user":
-                content = msg.content
-                if isinstance(content, list):
-                    content = next(
-                        (i.get("text", "") for i in content if isinstance(i, dict) and i.get("type") == "text"),
-                        "",
-                    )
-                first_msg = str(content)[:500]
+                first_msg = msg.content
                 break
 
         if not first_msg:
             return
-
-        owner = getattr(sess, "owner", None)
-        t_url, t_model, t_headers = resolve_task_endpoint(
-            sess.endpoint_url, sess.model, sess.headers, owner=owner
-        )
-        if not t_model:
-            logger.debug("[auto-name] No model provided, skipping")
-            return
-
-        # max_tokens big enough that reasoning models (Minimax M2,
-        # DeepSeek R1, QwQ, etc.) have headroom for <think>…</think>
-        # plus the actual title — 200 used to clip them mid-reasoning
-        # so strip_think left an empty string and no rename happened.
-        # Timeout matches: 60s gives slow local reasoners room to finish.
-        title = await llm_call_async(
-            t_url,
-            t_model,
-            [
-                {"role": "system", "content": "Generate a short title (3-6 words, no quotes) for a conversation that starts with this message. Reply with ONLY the title, nothing else. Do NOT include any thinking, reasoning, or explanation — just the title."},
-                {"role": "user", "content": first_msg},
-            ],
-            temperature=0.3,
-            max_tokens=4096,
-            headers=t_headers,
-            timeout=60,
-        )
-
-        title = title.strip().strip('"\'').strip()
-        # Strip <think>/<thinking> blocks (closed, dangling, or stray tags)
-        # via the central helper.
-        from src.text_helpers import strip_think
-        title = strip_think(title, prose=False, prompt_echo=False)
-        if title and len(title) < 80:
-            session_manager.update_session_name(sess.id, title)
-            logger.info(f"Auto-named session {sess.id}: {title}")
+        title = deterministic_session_title(first_msg)
+        session_manager.update_session_name(sess.id, title)
+        logger.info("Auto-named session %s locally: %s", sess.id, title)
 
     except Exception as e:
         import traceback
@@ -808,7 +793,28 @@ async def build_chat_context(
     # Build messages. In Nobody/incognito mode, never read saved session
     # history: the session id may be a temporary wrapper or, in buggy clients, a
     # stale normal session id. Only the ephemeral incognito transcript is safe.
-    messages = preface + (_incognito_messages(session_id) if incognito else sess.get_context_messages())
+    # Real history, tool calls included. get_context_messages() returns prose
+    # only (ChatMessage has no tool_calls field), so past turns where the model
+    # used a tool replay as if it had answered from its own knowledge — few-shot
+    # priming to stop calling tools. get_llm_messages() rebuilds the calls from
+    # metadata["tool_events"]. getattr keeps duck-typed sessions (tests, group
+    # wrappers) working on the old path.
+    if incognito:
+        _storia = _incognito_messages(session_id)
+    else:
+        _con_tool = getattr(sess, "get_llm_messages", None)
+        _storia = _con_tool() if callable(_con_tool) else sess.get_context_messages()
+    messages = preface + _storia
+    # Onda 4 / E08d: memorie in coda (vedi chat_processor), marcate _pre per
+    # la persistenza del turno (agent_loop._history_tail_for_persist).
+    _mem_tail_msgs = list(getattr(chat_processor, "_last_memory_messages", None) or [])
+    if _mem_tail_msgs and not incognito:
+        for _mm in _mem_tail_msgs:
+            _mm["_pre"] = True
+        if messages and messages[-1].get("role") == "user":
+            messages[len(messages) - 1:len(messages) - 1] = _mem_tail_msgs
+        else:
+            messages.extend(_mem_tail_msgs)
 
     # Current date/time — injected as a standalone *user*-role context message
     # placed immediately before the latest user turn, NOT folded into the

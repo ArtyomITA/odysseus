@@ -5,6 +5,9 @@ Pure data models — no database logic, no side effects.
 These are simple datacontainers. All persistence is handled by SessionManager.
 """
 
+import copy
+import json
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Any, Optional, TYPE_CHECKING
 
@@ -121,6 +124,120 @@ class Session:
             for msg in self.history
             if (msg.metadata or {}).get("source") != "slash"
         ]
+
+    def get_llm_messages(
+        self,
+        tool_output_chars: int = 1500,
+        tool_output_chars_old: int = 300,
+        recenti: int = 2,
+    ) -> List[Dict[str, Any]]:
+        """History for the chat completion, *including* the tool calls the
+        assistant actually made in earlier turns.
+
+        ``get_context_messages`` returns prose only — ``ChatMessage`` has no
+        ``tool_calls`` field, so a turn where the model called a tool replays
+        as if it had answered out of its own knowledge. Over a few turns that
+        is few-shot priming to *not* call tools. Measured on Ling-3.0-tiny,
+        same conversation and same final question, 8 repetitions each:
+        prose history 0/8 calls and 5 fabricated answers; this one 6/8 calls
+        and 1 fabrication.
+
+        Every production harness keeps this in history (Claude Code, Codex,
+        OpenHands, Qwen-Agent — see ricerche/harness-agentici-ciclo-multistep.md).
+        The data is already persisted in ``metadata["tool_events"]`` (tool
+        name, arguments, output), so this rebuilds the spec-correct
+        assistant ``tool_calls`` + ``role:"tool"`` pair from it — no schema
+        change, and the other ``get_context_messages`` callers (memory and
+        skill extraction, compaction, bg_monitor, session_tools) are untouched.
+
+        Older tool outputs are truncated harder than recent ones: what the
+        model imitates is the *shape* of the exchange, not the payload.
+        ``_sanitize_llm_messages`` repairs any adjacency the context trim breaks.
+        """
+        visible = [
+            msg for msg in self.history
+            if (msg.metadata or {}).get("source") != "slash"
+        ]
+        used_tools = [
+            i for i, msg in enumerate(visible)
+            if msg.role == "assistant" and (msg.metadata or {}).get("tool_events")
+        ]
+        fresh = set(used_tools[-recenti:]) if recenti > 0 else set()
+
+        # Onda 4 / E08c "replay fedele" (27 ago 2026): con ODYSSEUS_HISTORY_REPLAY=1
+        # ogni turno viene ripetuto BYTE-IDENTICO a come fu inviato: il messaggio di
+        # contesto data/ora che precedeva l'utente (metadata["datetime_ctx"]) e la coda
+        # dei messaggi del turno (metadata["llm_tail"]: assistant+tool_calls, tool,
+        # nudge, risposta) salvata da agent_loop. Misurato senza: cache_n fisso a 8429
+        # (solo system+tools) e riprocesso di 7-14k token a ogni turno, perche' il
+        # contesto data/ora "si sposta" davanti all'ultimo messaggio utente e la storia
+        # ricostruita non coincide con quella in cache.
+        replay = os.getenv("ODYSSEUS_HISTORY_REPLAY", "0") == "1"
+        out: List[Dict[str, Any]] = []
+        for i, msg in enumerate(visible):
+            meta = msg.metadata or {}
+            if replay and msg.role == "user":
+                nxt = visible[i + 1] if i + 1 < len(visible) else None
+                nmeta = (nxt.metadata or {}) if (nxt is not None and nxt.role == "assistant") else {}
+                pre = nmeta.get("llm_pre")
+                if isinstance(pre, list) and pre:
+                    out.extend(copy.deepcopy(m) for m in pre if isinstance(m, dict) and m.get("role"))
+                elif isinstance(nmeta.get("datetime_ctx"), str) and nmeta.get("datetime_ctx"):
+                    out.append({"role": "user", "content": nmeta["datetime_ctx"]})
+                um = msg.to_dict()
+                if isinstance(nmeta.get("llm_user_sent"), str) and nmeta.get("llm_user_sent"):
+                    um["content"] = nmeta["llm_user_sent"]   # testo come fu inviato (note in coda incluse)
+                out.append(um)
+                continue
+            if replay and msg.role == "assistant" and isinstance(meta.get("llm_tail"), list) and meta.get("llm_tail"):
+                tail = copy.deepcopy(meta["llm_tail"])
+                out.extend(m for m in tail if isinstance(m, dict) and m.get("role"))
+                last = tail[-1] if isinstance(tail[-1], dict) else {}
+                gia = (last.get("role") == "assistant" and not last.get("tool_calls")
+                       and str(last.get("content") or "").strip())
+                if not gia:
+                    out.append({"role": "assistant", "content": msg.content})
+                continue
+            events = meta.get("tool_events") or []
+            if msg.role == "assistant" and isinstance(events, list):
+                limit = tool_output_chars if i in fresh else tool_output_chars_old
+                for j, ev in enumerate(events):
+                    if not isinstance(ev, dict):
+                        continue
+                    name = ev.get("tool")
+                    if not name:
+                        continue
+                    args = ev.get("command")
+                    if not isinstance(args, str):
+                        try:
+                            args = json.dumps(args or {}, ensure_ascii=False)
+                        except Exception:
+                            args = "{}"
+                    call_id = f"call_{i}_{j}"
+                    out.append({
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": str(name), "arguments": args},
+                        }],
+                    })
+                    output = ev.get("output")
+                    if not isinstance(output, str):
+                        try:
+                            output = json.dumps(output, ensure_ascii=False)
+                        except Exception:
+                            output = str(output)
+                    if len(output) > limit:
+                        output = output[:limit] + "\n…[output troncato]"
+                    out.append({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": output,
+                    })
+            out.append(msg.to_dict())
+        return out
 
     def get(self, key: str, default=None):
         """Dict-like access for compatibility."""

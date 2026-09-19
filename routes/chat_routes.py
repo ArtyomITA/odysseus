@@ -112,21 +112,33 @@ _WEB_FOLLOWUP_RE = re.compile(
     r"^\s*(?:(?:can|could|would|will)\s+you\s+)?"
     r"(?:check|try\s+again|look(?:\s+now|\s+it\s+up)?|search(?:\s+now|\s+online|\s+it)?|"
     r"do\s+it|again|approved|approve(?:d)?|yes|ok(?:ay)?|proceed|go\s+ahead|"
-    r"send(?:\s+it)?|submit(?:\s+it)?|email(?:\s+them|\s+it)?)\??\s*$",
+    r"send(?:\s+it)?|submit(?:\s+it)?|email(?:\s+them|\s+it)?|"
+    r"controlla|riprova|prova\s+di\s+nuovo|cerca(?:lo)?|fallo|ancora|"
+    r"approvat[oa]|s[iì]|procedi|continua|vai\s+avanti|"
+    r"invia(?:lo)?|il\s+secondo|la\s+seconda|quello|quella)\??\s*$",
     re.I,
 )
 _RECENT_WEB_CONTEXT_RE = re.compile(
     r"\b(?:weather|forecast|rain|raining|hourly|news|headlines|rate|exchange|currency|"
-    r"price|current|latest|search|look\s+up|online)\b",
+    r"price|current|latest|search|look\s+up|online|"
+    r"meteo|previsioni|pioggia|notizie|prezzo|quotazione|cerca|attuale|ultim[eo])\b",
     re.I,
 )
 _RECENT_BROWSER_CONTEXT_RE = re.compile(
-    r"\b(?:browser|browse|open\s+(?:the\s+)?(?:site|page|url|link)|click|"
+    r"\b(?:browser|browserizza|browse|naviga|navigare|apri\s+(?:il\s+|la\s+)?(?:sito|pagina|url|link)|"
+    r"youtube|chrome|firefox|https?://|www\.|(?:[a-z0-9-]+\.)+(?:com|net|org|it|io|ai)|"
+    r"vai\s+su|clicca|compila|digita|scrivi\s+(?:nel|sul)\s+(?:browser|campo)|"
+    r"open\s+(?:the\s+)?(?:site|page|url|link)|click|"
     r"fill(?:\s+out)?|submit|send\s+(?:the\s+)?form|contact\s+form|web\s*form|"
     r"form\s+submission|playwright|automation)\b",
     re.I,
 )
-_BROWSER_MCP_TOOLS = {
+from src.browser_tooling_constants import (
+    BROWSER_CORE_TOOL_NAMES,
+    explicit_browser_unsafe_request,
+)
+
+_BROWSER_MCP_TOOLS = set(BROWSER_CORE_TOOL_NAMES) | {"builtin_browser",
     "mcp__builtin_browser__browser_navigate",
     "mcp__builtin_browser__browser_snapshot",
     "mcp__builtin_browser__browser_click",
@@ -734,6 +746,56 @@ def setup_chat_routes(
         incognito = str(form_data.get("incognito", "")).lower() == "true"
         plan_mode = str(form_data.get("plan_mode") or (body or {}).get("plan_mode") or "").lower() == "true"
         chat_mode = str(form_data.get("mode", "")).lower()  # 'chat' or 'agent'
+        # Vergilius: the ShadowBroker workspace is open, so this turn is about
+        # what is on that map. Narrowing the toolset is not a token saving —
+        # it stops a 9B from reaching for PowerShell or the browser when the
+        # question was "what is happening in Ukraine". Same reasoning as
+        # trimming Windows-MCP: fewer similar candidates, fewer wrong picks.
+        osint_mode = str(
+            form_data.get("osint_mode") or (body or {}).get("osint_mode") or ""
+        ).lower() == "true"
+        # Vergilius: profilo Financial, sottoinsieme di Intelligence. Restringe
+        # ancora di piu': tre strumenti di finanza piu' mappa, notizie e testo.
+        # Con dieci strumenti OSINT davanti, un 9B a cui si chiede "come va la
+        # difesa" chiama `osint_militare` — che parla di aerei, non di titoli.
+        financial_mode = str(
+            form_data.get("financial_mode") or (body or {}).get("financial_mode") or ""
+        ).lower() == "true"
+        if financial_mode:
+            osint_mode = True  # eredita l'escalation e il prompt di Intelligence
+        # Vergilius: nel profilo "vergilius-chat" ShadowBroker non esiste:
+        # Intelligence/Financial vengono ignorate anche se il client le manda
+        # (la UI le nasconde, ma un localStorage vecchio potrebbe riproporle).
+        if os.getenv("ODYSSEUS_STARTUP_PROFILE", "").lower() == "vergilius-chat":
+            osint_mode = False
+            financial_mode = False
+        # Vergilius: modalita' Vista (occhi). Holo descrive schermo/allegati al
+        # posto del cervello cieco; forza i tool vista_* + Windows-MCP + browser
+        # e appende REGOLE_VISTA. Indipendente da Intelligence: si possono
+        # accendere insieme (tool set = unione).
+        vista_mode = str(
+            form_data.get("vista_mode") or (body or {}).get("vista_mode") or ""
+        ).lower() == "true"
+        # Con la vista accesa, Computer e Browser scelgono QUALI tool di azione
+        # forzare oltre agli occhi (i soli occhi = descrivere schermo/allegati).
+        computer_mode = vista_mode and str(
+            form_data.get("computer_mode") or (body or {}).get("computer_mode") or ""
+        ).lower() == "true"
+        browser_mode = vista_mode and str(
+            form_data.get("browser_mode") or (body or {}).get("browser_mode") or ""
+        ).lower() == "true"
+        # Security capability derived strictly from the raw typed request,
+        # before attachment OCR/captions can be added to model-visible text.
+        _allow_browser_unsafe = (
+            explicit_browser_unsafe_request(message)
+            if isinstance(message, str)
+            else False
+        )
+        try:
+            from src.vista.client import get_vista as _get_vista
+            _get_vista().imposta_attiva(vista_mode)
+        except Exception:
+            pass
         # Workspace: confine the agent's file/shell tools to this folder.
         workspace, workspace_rejected = _resolve_request_workspace(
             request, form_data.get("workspace")
@@ -763,8 +825,11 @@ def setup_chat_routes(
                 _msg_l,
             ))
             _explicit_browser_intent = bool(re.search(
-                r"\b(browser|browse|open\s+(?:the\s+)?(?:site|page|url|link)|"
-                r"click|fill(?:\s+out)?|submit|send\s+(?:the\s+)?form|"
+                r"\b(browser|browse|naviga(?:re)?|vai\s+su|"
+                r"apri\s+(?:(?:il|la|un|una)\s+)?(?:sito|pagina|url|link)|"
+                r"clicca|compila|digita|invia\s+(?:il\s+)?modulo|"
+                r"open\s+(?:the\s+)?(?:site|page|url|link)|click|"
+                r"fill(?:\s+out)?|submit|send\s+(?:the\s+)?form|"
                 r"contact\s+form|web\s*form|form\s+submission)\b",
                 _msg_l,
             ))
@@ -782,6 +847,15 @@ def setup_chat_routes(
         # shell disabled).
         auto_escalated = False
         _tool_intent = _classify_tool_intent(message) if isinstance(message, str) else None
+        # Keep the light-escalation browser gate on the same shared classifier
+        # as chat->agent promotion. A second regex had drifted and classified
+        # "apri YouTube" as browser above, then disabled every browser schema.
+        if _tool_intent and _tool_intent.category == "browser":
+            _explicit_browser_intent = True
+            _allow_browser_for_web_turn = True
+        elif _tool_intent and _tool_intent.category == "web":
+            _explicit_web_intent = True
+            _allow_browser_for_web_turn = True
         _workspace_agent_intent = False
         if chat_mode == "chat" and _tool_intent and _tool_intent.needs_tools:
             chat_mode = "agent"
@@ -802,6 +876,19 @@ def setup_chat_routes(
             chat_mode = "agent"
             auto_escalated = True
             logger.info("chat→agent auto-escalation: explicit web intent")
+        elif chat_mode == "chat" and osint_mode:
+            # Vergilius: in modalità Intelligence la risposta viene per forza da
+            # uno strumento. In "chat" gli strumenti non esistono proprio — il
+            # modello puo' solo *parlare* di search_web senza mai eseguirlo — e
+            # l'utente riceve un'affermazione inventata al posto dei dati.
+            chat_mode = "agent"
+            auto_escalated = True
+            logger.info("chat→agent auto-escalation: modalità Intelligence attiva")
+        elif chat_mode == "chat" and vista_mode:
+            # Vergilius: gli occhi sono tool; in "chat" non esistono.
+            chat_mode = "agent"
+            auto_escalated = True
+            logger.info("chat→agent auto-escalation: modalità Vista attiva")
         active_doc_id = form_data.get("active_doc_id", "").strip()
         logger.info(f"[doc-inject] chat_mode={chat_mode}, active_doc_id={active_doc_id!r}")
 
@@ -1095,9 +1182,27 @@ def setup_chat_routes(
         if allow_bash is not None and str(allow_bash).lower() != "true":
             disabled_tools.add("bash")
         _explicit_web_intent = _explicit_web_intent or bool(_tool_intent and _tool_intent.category == "web")
+        # Contextual follow-ups are detected only after loading the session.
+        # Recompute here, immediately before the light-escalation denylist, so
+        # terse Italian turns such as "il secondo" keep browser access.
+        _allow_browser_for_web_turn = bool(
+            _explicit_browser_intent
+            or _explicit_web_intent
+            or _search_enabled
+        )
         if is_web_search_explicitly_denied(allow_web_search) or not _search_enabled:
             disabled_tools.update(WEB_TOOL_NAMES)
-        if _explicit_web_intent:
+        # Onda 4 / E06 (27 ago 2026): con il set di tool congelato per sessione
+        # (ODYSSEUS_TOOLSET_FREEZE=1) questa lista di esclusione per INTENTO
+        # non si applica: cambia da un turno all'altro (turni "web" contro turni
+        # "personali") e sposta 5-11 schemi dentro e fuori dal prompt, cioe'
+        # rompe il prefisso KV a ogni turno (misurato: dump-B4/B5). Restano
+        # intatte le esclusioni di sicurezza: privilegi utente, incognito,
+        # email attiva, disabled globali, plan mode. Il toggle web per
+        # impostazione (sopra) resta.
+        import os as _os_e06
+        _e06_freeze = _os_e06.getenv("ODYSSEUS_TOOLSET_FREEZE", "0") == "1"
+        if _explicit_web_intent and not _e06_freeze:
             # A direct lookup/search request should not drift into personal
             # tools or shell fallbacks. It can only use web_search/web_fetch
             # when the request's explicit web setting enabled them.
@@ -1184,6 +1289,16 @@ def setup_chat_routes(
             })
             if not _allow_browser_for_web_turn:
                 disabled_tools.update(_BROWSER_MCP_TOOLS)
+
+        # Holo is profile/mode dependent. Its handlers are registered globally
+        # for schema discovery, so explicitly hide and block them unless Vista
+        # is active; the handler also fails closed as a second layer.
+        if not vista_mode:
+            try:
+                from src.agent_tools import VISTA_TOOL_NAMES
+                disabled_tools.update(VISTA_TOOL_NAMES)
+            except Exception:
+                pass
 
         # Disable document tools in compare sessions — they break the pane UI
         if sess.name and sess.name.startswith("[CMP]"):
@@ -1388,6 +1503,59 @@ def setup_chat_routes(
                     return
 
             messages = _ensure_current_request_is_latest_user(ctx.messages, message)
+
+            # Vergilius: le regole del profilo attivo.
+            #
+            # Erano scritte in `schemi.py` e non arrivavano da nessuna parte: il
+            # modello non le ha mai viste. Vanno in coda al prompt di sistema e
+            # non in un messaggio nuovo, perche' un messaggio in piu' cambia il
+            # prefisso e con esso la cache — che su questo hardware costa 32
+            # volte un turno normale.
+            if osint_mode:
+                try:
+                    from src.shadowbroker.schemi import REGOLE_OSINT, REGOLE_FINANCE
+                    _regole = REGOLE_FINANCE if financial_mode else REGOLE_OSINT
+                    for _m in messages:
+                        if _m.get("role") == "system":
+                            _m["content"] = f"{_m.get('content', '')}\n\n{_regole}"
+                            break
+                    else:
+                        messages.insert(0, {"role": "system", "content": _regole})
+                except Exception as _e:
+                    logger.warning("[osint-mode] regole non iniettate: %s", _e)
+                # Memoria delle tracce: l'esempio va in coda al MESSAGGIO
+                # UTENTE, mai nel system — il system e' il prefisso della
+                # cache KV (32x qui) e deve restare identico fra i turni;
+                # la coda cambia comunque a ogni domanda.
+                try:
+                    from src.tracce_agente import suggerisci
+                    _guida = suggerisci(message) if os.getenv("ODYSSEUS_TRACE_HINT", "1") == "1" else None
+                    if _guida:
+                        for _m in reversed(messages):
+                            if _m.get("role") == "user":
+                                _m["content"] = (
+                                    f"{_m.get('content', '')}\n\n"
+                                    f"[nota di sistema: per domanda simile ha "
+                                    f"funzionato: {_guida}. Guida se "
+                                    f"pertinente, non copia cieca.]"
+                                )
+                                break
+                except Exception as _e:
+                    logger.debug("[osint-mode] traccia non suggerita: %s", _e)
+
+            # Vergilius: regole degli occhi, stesso posto (coda del system) e
+            # stessa ragione (prefisso KV). Dopo le OSINT se entrambe accese.
+            if vista_mode:
+                try:
+                    from src.vista.schemi import REGOLE_VISTA
+                    for _m in messages:
+                        if _m.get("role") == "system":
+                            _m["content"] = f"{_m.get('content', '')}\n\n{REGOLE_VISTA}"
+                            break
+                    else:
+                        messages.insert(0, {"role": "system", "content": REGOLE_VISTA})
+                except Exception as _e:
+                    logger.warning("[vista-mode] regole non iniettate: %s", _e)
 
             # Auto-compact notification
             if ctx.was_compacted:
@@ -1693,6 +1861,79 @@ def setup_chat_routes(
                     elif _explicit_browser_intent:
                         _forced_tools = set(_BROWSER_MCP_TOOLS)
 
+                    # Vergilius: modalità Intelligence — i soli strumenti OSINT
+                    # più l'indispensabile. Serve `disabled_tools` oltre a
+                    # `forced_tools` perché il selezionatore semantico può
+                    # comunque far emergere uno strumento simile.
+                    #
+                    # NOTA: si usa un nome NUOVO, non si riassegna
+                    # `disabled_tools`. Quella variabile arriva dallo scope
+                    # esterno; riassegnarla qui la rendeva locale a tutta questa
+                    # funzione, e con la modalità spenta il ramo non veniva
+                    # eseguito — quindi la lettura più sotto sollevava
+                    # UnboundLocalError e la chat rispondeva "Error 500".
+                    _disabled_finale = disabled_tools
+                    if osint_mode:
+                        try:
+                            from src.agent_tools import (
+                                OSINT_TOOL_NAMES, FINANCE_TOOL_NAMES, TOOL_HANDLERS,
+                            )
+                            from src.tool_index import ALWAYS_AVAILABLE
+                            # Il profilo finanziario e' piu' stretto di quello
+                            # OSINT, non un'aggiunta: sette strumenti invece di
+                            # tredici. Meno candidati simili, meno scelte sbagliate.
+                            _etichetta = "financial" if financial_mode else "osint"
+                            _osint = set(FINANCE_TOOL_NAMES if financial_mode else OSINT_TOOL_NAMES)
+                            if _osint:
+                                _forced_tools = _osint | set(ALWAYS_AVAILABLE)
+                                _disabled_finale = set(disabled_tools or set())
+                                _disabled_finale |= (
+                                    set(TOOL_HANDLERS) - _osint - set(ALWAYS_AVAILABLE)
+                                )
+                                logger.info(
+                                    "[%s-mode] %d strumenti + %d sempre disponibili; "
+                                    "%d disattivati",
+                                    _etichetta, len(_osint), len(ALWAYS_AVAILABLE),
+                                    len(_disabled_finale),
+                                )
+                        except Exception as _e:
+                            logger.warning("[osint-mode] non applicabile: %s", _e)
+
+                    # Vergilius: modalita' Vista. Forza vista_* + i tool di
+                    # controllo PC (Windows-MCP) + browser (Playwright MCP), e li
+                    # toglie dai disattivati se Intelligence li aveva spenti:
+                    # le due modalita' si sommano. I nomi MCP sono qualificati
+                    # (`mcp__<server>__<Tool>`): si prendono dal manager vivo,
+                    # mai a mano, cosi' un server rinominato non li perde.
+                    if vista_mode:
+                        try:
+                            from src.agent_tools import VISTA_TOOL_NAMES
+                            from src.tool_index import ALWAYS_AVAILABLE
+                            _vista = set(VISTA_TOOL_NAMES)
+                            _pc = set()
+                            try:
+                                from src.tool_utils import get_mcp_manager as _gmm
+                                _mm = _gmm()
+                                if browser_mode:
+                                    _pc.update(BROWSER_CORE_TOOL_NAMES)
+                                for _t in (_mm.get_all_tools() if _mm else []):
+                                    _qn = _t.get("qualified_name") or ""
+                                    _nudo = _t.get("name") or _qn.rsplit("__", 1)[-1]
+                                    if computer_mode and _nudo in (
+                                        "Snapshot", "Screenshot", "Click", "Type", "Scroll",
+                                        "Shortcut", "Wait", "WaitFor", "App", "Scrape", "Clipboard",
+                                    ):
+                                        _pc.add(_qn)
+                            except Exception as _e2:
+                                logger.debug("[vista-mode] tool MCP non enumerati: %s", _e2)
+                            _forzati = _vista | _pc | set(ALWAYS_AVAILABLE)
+                            _forced_tools = set(_forced_tools or ()) | _forzati
+                            if _disabled_finale:
+                                _disabled_finale = set(_disabled_finale) - _forzati
+                            logger.info("[vista-mode] %d occhi + %d tool PC/browser forzati", len(_vista), len(_pc))
+                        except Exception as _e:
+                            logger.warning("[vista-mode] non applicabile: %s", _e)
+
                     async for chunk in stream_agent_loop(
                         sess.endpoint_url,
                         sess.model,
@@ -1707,7 +1948,7 @@ def setup_chat_routes(
                         active_document=active_doc,
                         active_email=active_email_ctx,
                         session_id=session,
-                        disabled_tools=disabled_tools if disabled_tools else None,
+                        disabled_tools=_disabled_finale if _disabled_finale else None,
                         tool_policy=tool_policy,
                         owner=_user,
                         fallbacks=_fallback_candidates,
@@ -1716,6 +1957,7 @@ def setup_chat_routes(
                         workspace=workspace or None,
                         forced_tools=_forced_tools,
                         uploaded_files=ctx.uploaded_files,
+                        allow_browser_unsafe=_allow_browser_unsafe,
                     ):
                         if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
                             try:

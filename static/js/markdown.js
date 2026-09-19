@@ -440,7 +440,7 @@ export function svgifyEmoji(html, opts) {
 }
 /**
  * Generic collapsible section that reuses the thinking-dropdown styling and its
- * delegated toggle (any `.thinking-header[data-thinking-id]`). The label drives
+ * delegated toggle (any `.thinking-header` inside a `.thinking-section`). The label drives
  * the "View <label>" / "Hide <label>" text via data-label. Used e.g. for the
  * vision-model image description on a user's photo message.
  */
@@ -490,6 +490,7 @@ export function mdToHtml(src, opts) {
   const codeBlocks = [];
   const inlineCodeBlocks = [];
   const mermaidBlocks = [];
+  const chartBlocks = [];
   let s = (src ?? '');
 
   // Extract fenced code blocks before any markdown/HTML preservation passes.
@@ -510,6 +511,20 @@ export function mdToHtml(src, opts) {
       const raw = cleaned.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
       const placeholder = `___MERMAID_BLOCK_${mermaidBlocks.length}___`;
       mermaidBlocks.push(`<div class="mermaid-container"><pre class="mermaid" id="${mermaidId}">${escapeHtml(raw)}</pre></div>`);
+      return placeholder;
+    }
+
+    // Chart specs: rendered by TRUSTED client code (charts.js) — the model
+    // supplies data only, never code. The raw JSON travels in a
+    // <script type="application/json"> child; '<' is escaped as backslash-u003c
+    // inside the JSON text so a '</script>' sequence can never break out. The visible
+    // <pre> fallback shows until OdysseusCharts.renderCharts runs, and stays
+    // (as a plain code block) if the spec is invalid.
+    if (lang && lang.toLowerCase() === 'chart') {
+      const raw = cleaned.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+      const safeJson = raw.replace(/</g, '\\u003c');
+      const placeholder = `___CHART_BLOCK_${chartBlocks.length}___`;
+      chartBlocks.push(`<div class="chart-container"><script type="application/json">${safeJson}</script><pre class="chart-fallback"><code data-lang="chart">${escapeHtml(raw)}</code></pre></div>`);
       return placeholder;
     }
 
@@ -534,7 +549,7 @@ export function mdToHtml(src, opts) {
   // ___ALLOWED_HTML_ placeholder — corrupting the command. The old inline-code
   // pass ran after those passes, too late to protect it.
   s = s.replace(/`([^`]+?)`/g, (match, code) => {
-    if (code.startsWith('___CODE_BLOCK_') || code.startsWith('___MERMAID_BLOCK_')) return match;
+    if (code.startsWith('___CODE_BLOCK_') || code.startsWith('___MERMAID_BLOCK_') || code.startsWith('___CHART_BLOCK_')) return match;
     const placeholder = `___INLINE_CODE_${inlineCodeBlocks.length}___`;
     inlineCodeBlocks.push(`<code>${escapeHtml(code)}</code>`);
     return placeholder;
@@ -746,11 +761,11 @@ export function mdToHtml(src, opts) {
     `<blockquote>${m.trim().replace(/<\/?bq>/g, (t) => t === '<bq>' ? '<p>' : '</p>')}</blockquote>`);
 
   // Paragraphs - but NOT for code block placeholders or allowed HTML
-  s = s.replace(/^(?!<h\d|<ul>|<ol>|<li|<oli>|<\/li>|<pre>|<blockquote>|<bq>|<hr>|___CODE_BLOCK_|___ALLOWED_HTML_|___MATH_BLOCK_|___MERMAID_BLOCK_)([^\n]+)$/gm, '<p>$1</p>');
+  s = s.replace(/^(?!<h\d|<ul>|<ol>|<li|<oli>|<\/li>|<pre>|<blockquote>|<bq>|<hr>|___CODE_BLOCK_|___ALLOWED_HTML_|___MATH_BLOCK_|___MERMAID_BLOCK_|___CHART_BLOCK_)([^\n]+)$/gm, '<p>$1</p>');
 
   // Line breaks within paragraphs
   s = s.replace(/<p>([\s\S]*?)<\/p>/g, (match, content) => {
-    if (content.includes('___CODE_BLOCK_') || content.includes('___ALLOWED_HTML_') || content.includes('___MATH_BLOCK_') || content.includes('___MERMAID_BLOCK_')) return match;
+    if (content.includes('___CODE_BLOCK_') || content.includes('___ALLOWED_HTML_') || content.includes('___MATH_BLOCK_') || content.includes('___MERMAID_BLOCK_') || content.includes('___CHART_BLOCK_')) return match;
     const withLineBreaks = content.replace(/\n{2,}/g, '</p><p>').replace(/\n/g, '<br>');
     return `<p>${withLineBreaks}</p>`;
   });
@@ -771,6 +786,12 @@ export function mdToHtml(src, opts) {
   // Restore mermaid diagram blocks
   mermaidBlocks.forEach((block, index) => {
     s = s.replace(`___MERMAID_BLOCK_${index}___`, block);
+  });
+
+  // Restore chart blocks (function replacer: the JSON spec may contain `$&`
+  // and friends, which string replacements would expand)
+  chartBlocks.forEach((block, index) => {
+    s = s.replace(`___CHART_BLOCK_${index}___`, () => block);
   });
 
   // CRITICAL: Restore code blocks at the end
@@ -890,9 +911,9 @@ function _hashThinkingContent(el) {
   return String(h);
 }
 function _setThinkingExpanded(content, toggle, header, expanded) {
-  if (!content || !toggle) return;
+  if (!content) return;
   content.classList.toggle('expanded', expanded);
-  toggle.classList.toggle('expanded', expanded);
+  if (toggle) toggle.classList.toggle('expanded', expanded);
   const label_el = header?.querySelector('.thinking-header-left span');
   if (label_el) {
     const label = label_el.dataset.label || 'thinking process';
@@ -900,14 +921,21 @@ function _setThinkingExpanded(content, toggle, header, expanded) {
   }
 }
 
-// Delegated click handler for thinking toggle (CSP-safe, no inline onclick)
+// Delegated click handler for thinking toggle (CSP-safe, no inline onclick).
+// Bound once on document and keyed on the .thinking-header CLASS — not on ids
+// or per-node listeners — so sections re-created by innerHTML re-renders during
+// streaming stay clickable (a direct listener would be orphaned with the old
+// node). Content/toggle are resolved relative to the header's own
+// .thinking-section: the Date.now-generated ids can collide across messages
+// rendered in the same millisecond, and live-streamed markup may not have
+// them assigned yet.
 document.addEventListener('click', function(e) {
-  const header = e.target.closest('.thinking-header[data-thinking-id]');
+  const header = e.target.closest('.thinking-header');
   if (!header) return;
-  const id = header.dataset.thinkingId;
-  const content = document.getElementById(id);
-  const toggle = document.getElementById(id + '-toggle');
-  if (!content || !toggle) return;
+  const section = header.closest('.thinking-section');
+  const content = section && section.querySelector('.thinking-content');
+  if (!content) return;
+  const toggle = header.querySelector('.thinking-toggle') || section.querySelector('.thinking-toggle');
 
   const willExpand = !content.classList.contains('expanded');
   _setThinkingExpanded(content, toggle, header, willExpand);
@@ -940,9 +968,8 @@ document.addEventListener('click', function(e) {
       if (content.classList.contains('expanded')) continue;
       const hash = _hashThinkingContent(content);
       if (!hash || !set.has(hash)) continue;
-      const header = sec.querySelector('.thinking-header[data-thinking-id]');
-      const id = header?.dataset.thinkingId;
-      const toggle = id ? document.getElementById(id + '-toggle') : null;
+      const header = sec.querySelector('.thinking-header');
+      const toggle = sec.querySelector('.thinking-toggle');
       _setThinkingExpanded(content, toggle, header, true);
     }
   };

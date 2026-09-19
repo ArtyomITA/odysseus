@@ -26,6 +26,11 @@ _REQUIRED_NATIVE_TOOL_ARGS = {
     "write_file": ("path",),
     "edit_file": ("path",),
     "apply_patch": ("patch_text", "patchText", "patch"),
+    "browser_open": ("url",),
+    "browser_find": ("text",),
+    "browser_click": ("ref",),
+    "browser_type": ("ref", "text"),
+    "browser_more": ("category",),
 }
 
 # ---------------------------------------------------------------------------
@@ -1294,6 +1299,33 @@ FUNCTION_TOOL_SCHEMAS = [
         }
     },
 ]
+
+# Stable, strict browser adapter schemas.  Raw Playwright schemas are disclosed
+# only by browser_more for an uncommon specialist category.
+try:
+    from src.agent_tools.browser_tools import BROWSER_TOOL_SCHEMAS as _BROWSER_SCHEMAS
+    FUNCTION_TOOL_SCHEMAS.extend(_BROWSER_SCHEMAS)
+except Exception as _e:  # pragma: no cover
+    logger.warning("Browser adapter schemas not loaded: %s", _e)
+
+# Vergilius: strumenti OSINT (ShadowBroker). Tenuti in un modulo a parte perche'
+# sono nostri e non vanno persi a ogni aggiornamento da monte.
+try:
+    from src.shadowbroker.schemi import (
+        OSINT_TOOL_SCHEMAS as _OSINT_SCHEMAS,
+        FINANCE_TOOL_SCHEMAS as _FIN_SCHEMAS,
+    )
+    FUNCTION_TOOL_SCHEMAS.extend(_OSINT_SCHEMAS)
+    FUNCTION_TOOL_SCHEMAS.extend(_FIN_SCHEMAS)
+except Exception as _e:  # pragma: no cover
+    logger.warning("Schemi OSINT non caricati: %s", _e)
+
+# Vergilius: gli occhi (vista_*). Stesso modulo separato, stesso motivo.
+try:
+    from src.vista.schemi import VISTA_TOOL_SCHEMAS as _VISTA_SCHEMAS
+    FUNCTION_TOOL_SCHEMAS.extend(_VISTA_SCHEMAS)
+except Exception as _e:  # pragma: no cover
+    logger.warning("Schemi vista non caricati: %s", _e)
 
 
 # ---------------------------------------------------------------------------

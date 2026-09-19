@@ -19,6 +19,28 @@ INTERNAL_TOOL_HEADER = "X-Odysseus-Internal-Token"
 INTERNAL_TOOL_USER = "internal-tool"
 
 
+# Vergilius: the ShadowBroker dashboard is embedded as an iframe in the chat
+# area, and it runs on its own port — a different origin as far as CSP is
+# concerned, so `frame-src 'self'` alone blocks it with no visible error beyond a
+# console line. Read from the environment rather than hardcoded so moving the
+# port stays a config change.
+#
+# Deliberately narrow: only this one origin, only `frame-src`. Nothing here
+# loosens script, connect, or frame-ancestors.
+def _shadowbroker_frame_src() -> str:
+    url = (os.getenv("SHADOWBROKER_URL") or "http://127.0.0.1:3000").strip().rstrip("/")
+    if not url.startswith(("http://", "https://")):
+        return ""
+    origins = {url}
+    # 127.0.0.1 and localhost are distinct origins to a browser, and which one
+    # ends up in the iframe src depends on how the user reached Odysseus.
+    if "127.0.0.1" in url:
+        origins.add(url.replace("127.0.0.1", "localhost"))
+    elif "localhost" in url:
+        origins.add(url.replace("localhost", "127.0.0.1"))
+    return " " + " ".join(sorted(origins))
+
+
 def is_cors_preflight(method: str, headers) -> bool:
     """True for a genuine CORS preflight: an OPTIONS request carrying the
     Access-Control-Request-Method header. Such requests are credential-less by
@@ -120,7 +142,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
                 "img-src 'self' data: blob: https:; "
                 "media-src 'self' blob:; "
                 "connect-src 'self'; "
-                "frame-src 'self'; "
+                f"frame-src 'self'{_shadowbroker_frame_src()}; "
                 "frame-ancestors 'none'"
             )
         return response

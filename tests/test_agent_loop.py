@@ -74,6 +74,33 @@ def test_polish_internet_search_request_classifies_as_web():
     assert "web" in intent["domains"]
 
 
+def test_italian_requests_are_not_dropped_as_low_signal():
+    cases = {
+        "Apri YouTube e leggi la pagina": "browser",
+        "Cerca su internet le ultime notizie": "web",
+        "Controlla la posta non letta": "email",
+        "Aggiungi una riunione al calendario": "notes_calendar_tasks",
+        "Apri il pannello impostazioni": "ui",
+        "Leggi il file di log del server": "files",
+    }
+    for text, expected_domain in cases.items():
+        intent = _classify_agent_request([], text)
+        assert intent["low_signal"] is False, text
+        assert expected_domain in intent["domains"], text
+
+
+def test_italian_terse_reply_inherits_recent_actionable_context():
+    messages = [
+        {"role": "user", "content": "Apri YouTube nel browser"},
+        {"role": "assistant", "content": "Vuoi che continui e legga la pagina?"},
+        {"role": "user", "content": "Sì, fallo."},
+    ]
+    intent = _classify_agent_request(messages, "Sì, fallo.")
+    assert intent["continuation"] is True
+    assert intent["low_signal"] is False
+    assert "browser" in intent["domains"]
+
+
 def test_insert_before_latest_user_places_context_before_last_user_turn():
     messages = [
         {"role": "user", "content": "first"},

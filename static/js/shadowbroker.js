@@ -1,0 +1,585 @@
+// static/js/shadowbroker.js
+//
+// Vergilius: ShadowBroker as an Odysseus workspace.
+//
+// ShadowBroker is a separate Next.js app (localhost:3000) talking to its own
+// FastAPI backend (localhost:8000). It is embedded rather than ported: it is
+// ~1100 files of React + MapLibre, and rewriting the map layer inside Odysseus
+// would buy nothing.
+//
+// Two things had to be arranged for the frame to work at all:
+//   * ShadowBroker's `X-Frame-Options: DENY` / `frame-ancestors 'none'` are now
+//     driven by SHADOWBROKER_FRAME_ANCESTORS (frontend/src/proxy.ts).
+//   * Odysseus' CSP `frame-src 'self'` had to learn the ShadowBroker origin
+//     (core/middleware.py).
+//
+// The panel covers the chat area only. The avatar dock is position:fixed on
+// <body>, so it keeps floating above without any special handling — which is
+// the whole point: the map changes, the assistant stays.
+
+const API_BASE = window.location.origin;
+
+let _config = null;      // {url, enabled} from /api/shadowbroker/config
+let _frame = null;       // the <iframe>, created once and kept alive
+let _open = false;
+let _probeTimer = null;
+
+function _els() {
+  return {
+    panel: document.getElementById('shadowbroker-panel'),
+    body: document.getElementById('sb-panel-body'),
+    status: document.getElementById('sb-panel-status'),
+    closeBtn: document.getElementById('sb-panel-close'),
+    externalBtn: document.getElementById('sb-open-external'),
+    railBtn: document.getElementById('rail-shadowbroker'),
+    toolBtn: document.getElementById('tool-shadowbroker-btn'),
+  };
+}
+
+async function _loadConfig() {
+  if (_config) return _config;
+  try {
+    const res = await fetch(`${API_BASE}/api/shadowbroker/config`, { credentials: 'same-origin' });
+    if (res.ok) _config = await res.json();
+  } catch (_) { /* fall through to the default below */ }
+  if (!_config || !_config.url) _config = { url: 'http://127.0.0.1:3000', enabled: false };
+  return _config;
+}
+
+function _setStatus(text, kind) {
+  const { status } = _els();
+  if (!status) return;
+  status.textContent = text;
+  status.className = 'sb-panel-status' + (kind ? ' sb-status-' + kind : '');
+}
+
+/**
+ * Is the dashboard actually up?
+ *
+ * Cross-origin means we cannot read the iframe's load result, and a `fetch` to
+ * localhost:3000 is blocked by Odysseus' own `connect-src 'self'`. So the probe
+ * runs server-side, where neither restriction applies.
+ */
+async function _probe() {
+  try {
+    const res = await fetch(`${API_BASE}/api/shadowbroker/probe`, { credentials: 'same-origin' });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (_) {
+    return null;
+  }
+}
+
+function _renderOffline(cfg) {
+  const { body } = _els();
+  if (!body) return;
+  body.innerHTML = '';
+  const box = document.createElement('div');
+  box.className = 'sb-offline';
+
+  const title = document.createElement('div');
+  title.className = 'sb-offline-title';
+  title.textContent = 'ShadowBroker non risponde';
+  box.appendChild(title);
+
+  const desc = document.createElement('div');
+  desc.className = 'sb-offline-desc';
+  desc.textContent = `Nessuna risposta da ${cfg.url}. I due servizi vanno avviati a parte:`;
+  box.appendChild(desc);
+
+  const pre = document.createElement('pre');
+  pre.className = 'sb-offline-cmd';
+  pre.textContent =
+    'cd d:\\assistenteeee\\shadowbroker\\backend\n'
+    + 'venv\\Scripts\\python.exe main.py\n\n'
+    + 'cd d:\\assistenteeee\\shadowbroker\\frontend\n'
+    + 'npm run dev:frontend';
+  box.appendChild(pre);
+
+  // ▶ lancia i due comandi qui sopra al posto dell'operatore. L'avvio è
+  // detached lato server: sopravvive anche a un riavvio di Odysseus.
+  const avvia = document.createElement('button');
+  avvia.type = 'button';
+  avvia.className = 'sb-offline-retry';
+  avvia.style.marginRight = '8px';
+  avvia.textContent = '▶ Avvia ShadowBroker';
+  avvia.addEventListener('click', async () => {
+    avvia.disabled = true;
+    avvia.textContent = 'avvio in corso…';
+    try {
+      await fetch(`${API_BASE}/api/shadowbroker/start`, {
+        method: 'POST', credentials: 'same-origin',
+      });
+    } catch (_) { /* si vede dal poll */ }
+    // Next dev alla prima compilazione può metterci anche un minuto: si
+    // sonda finché risponde, con un tetto per non girare per sempre.
+    const inizio = Date.now();
+    const timer = setInterval(async () => {
+      const h = await _probe();
+      if (h && h.frontend) {
+        clearInterval(timer);
+        _frame = null;
+        _mount();
+      } else if (Date.now() - inizio > 120000) {
+        clearInterval(timer);
+        avvia.disabled = false;
+        avvia.textContent = '▶ Avvia ShadowBroker';
+        _setStatus('avvio fallito: guarda avvio-backend.log / avvio-frontend.log', 'bad');
+      } else {
+        _setStatus('avvio in corso…');
+      }
+    }, 3000);
+  });
+  box.appendChild(avvia);
+
+  const retry = document.createElement('button');
+  retry.type = 'button';
+  retry.className = 'sb-offline-retry';
+  retry.textContent = 'Riprova';
+  retry.addEventListener('click', () => { _frame = null; _mount(); });
+  box.appendChild(retry);
+
+  body.appendChild(box);
+}
+
+async function _mount() {
+  const cfg = await _loadConfig();
+  const { body } = _els();
+  if (!body) return;
+
+  // Already mounted — the iframe survives close/reopen on purpose.
+  if (_frame && _frame.isConnected) {
+    _setStatus('collegato', 'ok');
+    return;
+  }
+
+  _setStatus('connessione…');
+  body.innerHTML = '';
+
+  const health = await _probe();
+  if (!health || !health.frontend) {
+    _setStatus('non raggiungibile', 'bad');
+    _renderOffline(cfg);
+    return;
+  }
+
+  const frame = document.createElement('iframe');
+  frame.className = 'sb-frame';
+  frame.src = cfg.url;
+  frame.title = 'ShadowBroker';
+  // No `sandbox` attribute: the dashboard needs same-origin storage, workers,
+  // and WebGL, and sandboxing it to a null origin breaks MapLibre outright.
+  // The trust boundary here is that both apps are ours on loopback.
+  frame.setAttribute('allow', 'fullscreen; clipboard-read; clipboard-write');
+  frame.addEventListener('load', () => {
+    if (!health.backend) {
+      _setStatus('mappa attiva, backend giù', 'warn');
+      return;
+    }
+    // `load` scatta quando arriva il documento, ma MapLibre ci mette altri
+    // 15-20 secondi a scaricare le tessere e a disegnare i 45 livelli. Senza
+    // dirlo, il pannello sembra bloccato su un rettangolo nero.
+    _setStatus('carico la mappa…');
+    setTimeout(() => {
+      if (_open) _setStatus('collegato', 'ok');
+    }, 18000);
+  });
+  body.appendChild(frame);
+  _frame = frame;
+}
+
+// ── modalità Intelligence ────────────────────────────────────────────────
+// Restringe la dotazione del modello ai soli dieci strumenti OSINT. Non è un
+// risparmio di token (~1.100 in tutto): impedisce a un 9B di rispondere con
+// una ricerca web o con PowerShell alla domanda "cosa succede in Ucraina".
+//
+// Interruttore esplicito e non solo legato al pannello: si può volere
+// l'intelligence senza la mappa davanti, e soprattutto si deve **vedere**
+// quando è attiva.
+
+const PREF_MODO = 'odysseus.osint.mode';
+
+export function modoAttivo() {
+  // Il pannello aperto la implica; l'interruttore la tiene accesa da sola.
+  return _open || localStorage.getItem(PREF_MODO) === '1';
+}
+
+// Il selettore del modello vive nella barra di composizione: quando lo spazio
+// di lavoro ShadowBroker la copre va nascosto, e riacceso alla chiusura.
+// `updateModelPicker` decide da solo cosa mostrare; qui basta risvegliarlo.
+function _aggiornaSelettoreModello() {
+  try {
+    const sm = window.sessionModule;
+    if (sm && typeof sm.updateModelPicker === 'function') sm.updateModelPicker();
+  } catch (_) {}
+}
+
+
+function _aggiornaPulsante() {
+  const b = document.getElementById('overflow-osint-btn');
+  if (!b) return;
+  const on = modoAttivo();
+  b.classList.toggle('active', on);
+  b.title = on
+    ? 'Modalità Intelligence attiva: solo strumenti OSINT (niente ricerca web, niente shell)'
+    : 'Attiva la modalità Intelligence: il modello interroga ShadowBroker invece del web';
+}
+
+export function impostaModo(on) {
+  try { localStorage.setItem(PREF_MODO, on ? '1' : '0'); } catch (_) {}
+  _aggiornaPulsante();
+  try {
+    if (window.uiModule?.showToast) {
+      window.uiModule.showToast(on ? 'Intelligence: solo strumenti OSINT' : 'Intelligence disattivata');
+    }
+  } catch (_) {}
+}
+
+// ── profilo Financial ────────────────────────────────────────────────────
+// Sottoinsieme di Intelligence, non un'aggiunta: **sette** strumenti invece di
+// tredici. Con i dieci OSINT davanti, alla domanda "come sta la difesa" un 9B
+// chiama `osint_militare` — che parla di aerei, non di titoli. Misurato: da
+// 6/10 a 10/10 di scelte corrette restringendo il profilo e riscrivendo le
+// regole (scripts/prova_modello_finanza.py).
+//
+// Tiene mappa, notizie e testo perché senza non potrebbe né mostrare né
+// incrociare: "questa commessa dove sta" e "che notizie la spiegano" sono
+// esattamente le domande per cui esiste.
+
+const PREF_FIN = 'odysseus.financial.mode';
+
+export function financialAttivo() {
+  return localStorage.getItem(PREF_FIN) === '1';
+}
+
+function _aggiornaPulsanteFin() {
+  const b = document.getElementById('overflow-financial-btn');
+  if (!b) return;
+  const on = financialAttivo();
+  b.classList.toggle('active', on);
+  b.title = on
+    ? 'Profilo Financial attivo: mercati, appalti federali, insider — più mappa e notizie'
+    : 'Attiva il profilo Financial: sotto Intelligence, ristretto ai dati economici';
+}
+
+export function impostaFinancial(on) {
+  try {
+    localStorage.setItem(PREF_FIN, on ? '1' : '0');
+    // Financial vive dentro Intelligence: accenderlo da solo lascerebbe il
+    // modello senza l'escalation ad agente, e in chat gli strumenti non
+    // esistono proprio — risponderebbe inventando invece di leggere i dati.
+    if (on) localStorage.setItem(PREF_MODO, '1');
+  } catch (_) {}
+  _aggiornaPulsante();
+  _aggiornaPulsanteFin();
+  try {
+    if (window.uiModule?.showToast) {
+      window.uiModule.showToast(
+        on ? 'Financial: mercati, appalti, insider' : 'Financial disattivato');
+    }
+  } catch (_) {}
+}
+
+export function isOpen() {
+  return _open;
+}
+
+export async function open() {
+  const { panel, railBtn } = _els();
+  if (!panel) return;
+  _open = true;
+  panel.classList.remove('hidden');
+  document.body.classList.add('shadowbroker-active');
+  if (railBtn) railBtn.classList.add('rail-active');
+  _aggiornaPulsante();
+  _aggiornaSelettoreModello();
+  await _mount();
+  // Cheap liveness ticker while the panel is visible; stopped on close so a
+  // backgrounded workspace costs nothing.
+  if (_probeTimer) clearInterval(_probeTimer);
+  _probeTimer = setInterval(async () => {
+    const h = await _probe();
+    if (!h || !h.frontend) _setStatus('non raggiungibile', 'bad');
+    else if (!h.backend) _setStatus('mappa attiva, backend giù', 'warn');
+    else _setStatus('collegato', 'ok');
+  }, 15000);
+}
+
+export function close() {
+  const { panel, railBtn } = _els();
+  if (!panel) return;
+  _open = false;
+  panel.classList.add('hidden');
+  document.body.classList.remove('shadowbroker-active');
+  if (railBtn) railBtn.classList.remove('rail-active');
+  _aggiornaPulsante();
+  _aggiornaSelettoreModello();
+  if (_probeTimer) { clearInterval(_probeTimer); _probeTimer = null; }
+  // The iframe stays in the DOM: reloading it would re-warm MapLibre tiles and
+  // restart the telemetry poll from zero every single time.
+}
+
+export function toggle() {
+  return _open ? close() : open();
+}
+
+/**
+ * Accende sulla mappa i livelli del profilo finanziario.
+ *
+ * Passa dalla rotta di Odysseus e non dal cruscotto: il browser non ha una
+ * connessione diretta a ShadowBroker, e la politica di sicurezza dichiara
+ * `connect-src 'self'`. Fallisce in silenzio di proposito — se la mappa non
+ * c'è, il profilo deve funzionare lo stesso.
+ */
+async function _presetMappaFinanziario() {
+  try {
+    await fetch('/api/shadowbroker/preset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ preset: 'financial' }),
+    });
+  } catch (_) { /* mappa assente: il profilo resta valido */ }
+}
+
+// ── popup di configurazione Financial ────────────────────────────────────
+// Compare a OGNI attivazione del profilo (e all'avvio se il profilo era già
+// acceso): le scelte riguardano il budget di chiamate Finnhub condiviso, e
+// vanno riviste consapevolmente, non ereditate in silenzio. Riusa le classi
+// .modal/.confirm-btn come styledConfirm(), zero markup in index.html.
+
+async function _configAttuale() {
+  try {
+    const r = await fetch('/api/shadowbroker/financial-config', { credentials: 'same-origin' });
+    const j = await r.json();
+    const c = j && (j.config || j);
+    return {
+      preset: c && c.preset === 'broad' ? 'broad' : 'core',
+      deep_news: !!(c && c.deep_news),
+      realtime: !!(c && c.realtime),
+    };
+  } catch (_) {
+    return { preset: 'core', deep_news: false, realtime: false };
+  }
+}
+
+async function _regoleProfilo() {
+  try {
+    const r = await fetch('/api/shadowbroker/rules?profile=financial', { credentials: 'same-origin' });
+    const j = await r.json();
+    return (j && j.rules) || '';
+  } catch (_) { return ''; }
+}
+
+export async function mostraConfigFinancial() {
+  // Un solo popup alla volta.
+  document.getElementById('fin-config-overlay')?.remove();
+
+  const cfg = await _configAttuale();
+
+  const overlay = document.createElement('div');
+  overlay.id = 'fin-config-overlay';
+  overlay.className = 'modal';
+
+  const riga = (input, titolo, spiega) => (
+    `<label style="display:flex;gap:10px;align-items:flex-start;margin:10px 0;cursor:pointer;">
+       ${input}
+       <span><strong>${titolo}</strong><br>
+       <span style="opacity:.75;font-size:.85em;">${spiega}</span></span>
+     </label>`);
+
+  overlay.innerHTML =
+    '<div class="modal-content" role="dialog" aria-modal="true" style="max-width:480px;">' +
+      '<div class="modal-header"><h4>Profilo Financial</h4></div>' +
+      '<div class="modal-body" style="max-height:60vh;overflow-y:auto;">' +
+        '<div style="opacity:.8;font-size:.9em;margin-bottom:6px;">' +
+          'Queste scelte pesano sul budget Finnhub (60 chiamate/min, condiviso ' +
+          'con lo sweep dei prezzi). Si riaprono a ogni attivazione del profilo.</div>' +
+        riga(`<input type="radio" name="fin-preset" value="core" ${cfg.preset === 'core' ? 'checked' : ''}>`,
+             'Titoli: Core (25)',
+             'difesa + big tech + cripto, prezzi aggiornati ogni minuto') +
+        riga(`<input type="radio" name="fin-preset" value="broad" ${cfg.preset === 'broad' ? 'checked' : ''}>`,
+             'Titoli: Broad (60)',
+             'aggiunge banche, energia, industriali, farmaceutici — prezzi ogni 2 minuti') +
+        riga(`<input type="checkbox" id="fin-deep" ${cfg.deep_news ? 'checked' : ''}>`,
+             'Deep news',
+             'notizie su 30 titoli con finestra di 7 giorni invece di 13 titoli su 3 — più contesto, stesso giro da 10 minuti') +
+        riga(`<input type="checkbox" id="fin-rt" ${cfg.realtime ? 'checked' : ''}>`,
+             'Sottoinsieme in tempo quasi reale',
+             '10 titoli chiave riquotati ogni 30 secondi (monitoraggio serrato, non esecuzione ordini)') +
+        '<details style="margin-top:12px;">' +
+          '<summary style="cursor:pointer;opacity:.85;">Regole attive del profilo (quelle vere, come le riceve il modello)</summary>' +
+          '<pre id="fin-config-rules" style="white-space:pre-wrap;font-size:.78em;opacity:.8;margin-top:8px;max-height:220px;overflow-y:auto;">carico…</pre>' +
+        '</details>' +
+      '</div>' +
+      '<div class="modal-footer">' +
+        '<button id="fin-config-cancel" class="confirm-btn confirm-btn-secondary">Annulla</button>' +
+        '<button id="fin-config-ok" class="confirm-btn confirm-btn-primary">Applica</button>' +
+      '</div>' +
+    '</div>';
+  document.body.appendChild(overlay);
+
+  // Le regole arrivano dopo: il popup non deve aspettare la rete.
+  _regoleProfilo().then((t) => {
+    const pre = document.getElementById('fin-config-rules');
+    if (pre) pre.textContent = t || 'regole non disponibili';
+  });
+
+  // Trascinabile dalla testata: il popup sta sopra alla chat e deve potersi
+  // togliere di mezzo senza chiuderlo.
+  const scatola = overlay.querySelector('.modal-content');
+  const testata = overlay.querySelector('.modal-header');
+  if (scatola && testata) {
+    testata.style.cursor = 'grab';
+    let sx = 0, sy = 0, px = 0, py = 0, presa = false;
+    testata.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      presa = true;
+      sx = e.clientX; sy = e.clientY;
+      const r = scatola.getBoundingClientRect();
+      px = r.left; py = r.top;
+      scatola.style.position = 'fixed';
+      scatola.style.margin = '0';
+      scatola.style.left = px + 'px';
+      scatola.style.top = py + 'px';
+      testata.style.cursor = 'grabbing';
+      try { testata.setPointerCapture(e.pointerId); } catch (_) {}
+    });
+    testata.addEventListener('pointermove', (e) => {
+      if (!presa) return;
+      scatola.style.left = (px + e.clientX - sx) + 'px';
+      scatola.style.top = Math.max(0, py + e.clientY - sy) + 'px';
+    });
+    const molla = () => { presa = false; testata.style.cursor = 'grab'; };
+    testata.addEventListener('pointerup', molla);
+    testata.addEventListener('pointercancel', molla);
+  }
+
+  const chiudi = () => overlay.remove();
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) chiudi(); });
+  document.getElementById('fin-config-cancel')?.addEventListener('click', chiudi);
+  document.getElementById('fin-config-ok')?.addEventListener('click', async () => {
+    const preset = overlay.querySelector('input[name="fin-preset"]:checked')?.value || 'core';
+    const corpo = {
+      preset,
+      deep_news: !!document.getElementById('fin-deep')?.checked,
+      realtime: !!document.getElementById('fin-rt')?.checked,
+    };
+    chiudi();
+    try {
+      const r = await fetch('/api/shadowbroker/financial-config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify(corpo),
+      });
+      const j = await r.json().catch(() => null);
+      const ok = r.ok && !(j && j.ok === false);
+      window.uiModule?.showToast?.(ok
+        ? `Financial: ${preset === 'broad' ? '60 titoli' : '25 titoli'}`
+          + (corpo.deep_news ? ' + deep news' : '')
+          + (corpo.realtime ? ' + realtime' : '')
+        : 'Config non salvata: backend ShadowBroker giù?');
+    } catch (_) {
+      window.uiModule?.showToast?.('Config non salvata: backend ShadowBroker giù?');
+    }
+  });
+}
+
+export function init() {
+  const { railBtn, toolBtn, closeBtn, externalBtn } = _els();
+  const modoBtn = document.getElementById('overflow-osint-btn');
+  if (modoBtn) {
+    modoBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      // Col pannello aperto la modalità è già implicita: spegnerla lì
+      // confonderebbe. Si chiude il pannello, e la modalità segue.
+      if (_open) { close(); impostaModo(false); return; }
+      impostaModo(localStorage.getItem(PREF_MODO) !== '1');
+    });
+    _aggiornaPulsante();
+  }
+  const finBtn = document.getElementById('overflow-financial-btn');
+  if (finBtn) {
+    finBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const acceso = !financialAttivo();
+      impostaFinancial(acceso);
+      // Accendendolo si imposta anche la mappa sul preset finanziario, così
+      // il modello trova già acceso quello che gli serve e da lì in poi può
+      // limitarsi a evidenziare invece di spegnere.
+      if (acceso) {
+        _presetMappaFinanziario();
+        mostraConfigFinancial();
+      }
+    });
+    _aggiornaPulsanteFin();
+  }
+  // Il popup compare anche all'avvio se il profilo era rimasto acceso: la
+  // config del giro precedente non va ereditata in silenzio.
+  if (financialAttivo()) {
+    setTimeout(() => { mostraConfigFinancial(); }, 1200);
+  }
+  if (railBtn) railBtn.addEventListener('click', toggle);
+  if (toolBtn) toolBtn.addEventListener('click', () => {
+    open();
+    // Match the other tool-list entries, which collapse the panel on pick.
+    try { document.getElementById('tools-panel')?.classList.add('hidden'); } catch (_) {}
+  });
+  if (closeBtn) closeBtn.addEventListener('click', close);
+  if (externalBtn) externalBtn.addEventListener('click', async () => {
+    const cfg = await _loadConfig();
+    window.open(cfg.url, 'shadowbroker', 'width=1600,height=950');
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && _open) close();
+  });
+
+  // ⏻ nella barra utente: spegne TUTTO lo stack (llama, voce, ShadowBroker,
+  // ChromaDB e Odysseus stesso). Vive qui perché questo è il modulo-colla di
+  // Vergilius, e la rotta sta accanto alle altre in shadowbroker_routes.py.
+  const spegniBtn = document.getElementById('user-bar-spegni');
+  if (spegniBtn) {
+    spegniBtn.addEventListener('click', async () => {
+      const conferma = window.styledConfirm
+        ? await window.styledConfirm(
+            'Spegne tutti i servizi di Vergilius: modello, voce, ShadowBroker, '
+            + 'memoria e questa stessa pagina. Per riaccendere: scripts\\avvia-tutto.ps1.',
+            { title: 'Spegnere Vergilius?', confirmText: 'Spegni', cancelText: 'Annulla', danger: true })
+        : window.confirm('Spegnere tutti i servizi di Vergilius?');
+      if (!conferma) return;
+      spegniBtn.disabled = true;
+      let esito = null;
+      try {
+        const r = await fetch(`${API_BASE}/api/vergilius/spegni`, {
+          method: 'POST', credentials: 'same-origin',
+        });
+        esito = await r.json();
+      } catch (_) { /* se muore prima di rispondere, e' comunque spento */ }
+      if (esito && esito.ok === false) {
+        spegniBtn.disabled = false;
+        if (window.showToast) window.showToast(`Spegnimento fallito: ${esito.detail || '?'}`);
+        return;
+      }
+      // Da qui in poi il server non esiste piu': si copre la pagina, senza
+      // dipendere da niente che debba ancora rispondere.
+      const velo = document.createElement('div');
+      velo.style.cssText = 'position:fixed;inset:0;z-index:99999;display:flex;'
+        + 'flex-direction:column;align-items:center;justify-content:center;gap:12px;'
+        + 'background:#0b0f14;color:#9fb8b8;font-family:monospace;font-size:15px;';
+      velo.innerHTML = '<div style="font-size:34px">⏻</div>'
+        + '<div>Vergilius spento.</div>'
+        + '<div style="opacity:.6">Per riaccendere: scripts\\avvia-tutto.ps1</div>';
+      document.body.appendChild(velo);
+    });
+  }
+}
+
+const shadowbrokerModule = {
+  init, open, close, toggle, isOpen,
+  modoAttivo, impostaModo,
+  financialAttivo, impostaFinancial, mostraConfigFinancial,
+};
+try { window.OdysseusShadowBroker = shadowbrokerModule; } catch (_) {}
+export default shadowbrokerModule;

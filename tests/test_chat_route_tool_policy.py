@@ -88,12 +88,60 @@ def test_browser_form_followups_include_approval_and_send_phrases():
     assert "submit(?:\\s+it)?" in source
 
 
-def test_agent_loop_expands_browser_mcp_tools_from_connected_server():
-    """Browser intent must not depend on stale hardcoded Playwright tool names."""
+def test_italian_contextual_followups_match_route_predicate():
+    from routes import chat_routes
+
+    for text in ("sì", "fallo", "riprova", "continua", "procedi", "il secondo"):
+        assert chat_routes._WEB_FOLLOWUP_RE.search(text), text
+    source = _CHAT_ROUTES.read_text(encoding="utf-8")
+    assert "# Recompute here, immediately before the light-escalation denylist" in source
+
+    from types import SimpleNamespace
+    browser_session = SimpleNamespace(history=[{"content": "Apri YouTube"}])
+    web_session = SimpleNamespace(history=[{"content": "Controlla il meteo"}])
+    assert chat_routes._is_contextual_browser_followup("il secondo", browser_session)
+    assert chat_routes._is_contextual_web_followup("riprova", web_session)
+
+
+def test_unsafe_browser_capability_uses_raw_request_only():
+    from src.browser_tooling_constants import explicit_browser_unsafe_request
+
+    assert not explicit_browser_unsafe_request("Descrivi questa immagine")
+    assert explicit_browser_unsafe_request("Usa codice Playwright per farlo")
+    source = _CHAT_ROUTES.read_text(encoding="utf-8")
+    raw_index = source.index("_allow_browser_unsafe = (")
+    enhanced_index = source.index("ctx.preprocessed.attachment_meta")
+    assert raw_index < enhanced_index
+    assert "allow_browser_unsafe=_allow_browser_unsafe" in source
+
+
+def test_vista_tools_are_disabled_outside_vista_mode():
+    source = _CHAT_ROUTES.read_text(encoding="utf-8")
+    assert "if not vista_mode:" in source
+    assert "disabled_tools.update(VISTA_TOOL_NAMES)" in source
+
+
+def test_agent_loop_uses_progressive_browser_adapter_core():
+    """Browser intent must collapse to the stable adapter kit, not every raw schema."""
     source = (Path(__file__).resolve().parent.parent / "src" / "agent_loop.py").read_text(encoding="utf-8")
-    assert "def _expand_browser_mcp_tools" in source
-    assert "server_id\") == \"builtin_browser\"" in source
-    assert "_relevant_tools = _expand_browser_mcp_tools(_relevant_tools, mcp_mgr)" in source
+    assert "def _select_browser_core_tools" in source
+    assert "names.update(BROWSER_CORE_TOOL_NAMES)" in source
+    assert "_relevant_tools = _select_browser_core_tools(_relevant_tools, mcp_mgr)" in source
+    assert "def _expand_browser_mcp_tools" not in source
+
+
+def test_italian_youtube_intent_survives_light_auto_escalation():
+    intent = classify_tool_intent("Apri YouTube e leggi la pagina")
+    assert intent.needs_tools and intent.category == "browser"
+    source = _CHAT_ROUTES.read_text(encoding="utf-8")
+    assert 'if _tool_intent and _tool_intent.category == "browser":' in source
+    assert "_allow_browser_for_web_turn = True" in source
+
+
+def test_ling_family_has_native_tool_support_without_mutable_db_flag():
+    source = (Path(__file__).resolve().parent.parent / "src" / "agent_loop.py").read_text(encoding="utf-8")
+    assert '_model_basename == "ling"' in source
+    assert '_model_basename.startswith("ling-")' in source
 
 
 def test_disabled_tools_respects_missing_vs_explicit_toggles():

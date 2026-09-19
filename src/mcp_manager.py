@@ -28,7 +28,7 @@ def _format_mcp_connection_error(name: str, command: str = "", args: Optional[Li
         return (
             f"{raw_error}\n\n"
             "Browser MCP could not start. On fresh installs, cache the Playwright MCP package once before connecting:\n\n"
-            "npx -y @playwright/mcp@latest --version\n\n"
+            "npx -y @playwright/mcp@0.0.79 --version\n\n"
             "Then restart Odysseus and reconnect the Browser MCP server."
         )
 
@@ -98,6 +98,29 @@ def _format_mcp_params(input_schema: Any) -> str:
 # classify MCP tools for plan mode when the server provides no readOnlyHint.
 # These are PREFIXES, not whole words (matched via str.startswith below), so a
 # stem like "summar" intentionally covers "summarise"/"summarize"/"summary".
+
+def _tool_input_schema(tool) -> dict:
+    """Schema parametri di un Tool MCP, qualunque sia la versione dell'SDK.
+
+    Vergilius, 22 ago 2026: con `mcp` 2.0.0 l'attributo Python e' `input_schema`
+    (`inputSchema` resta solo alias di serializzazione); il codice leggeva
+    `tool.inputSchema` con `hasattr` → False → `{}` per OGNI tool di OGNI server.
+    Il modello vedeva tool senza parametri e li chiamava con `{}` (App senza
+    name → TypeError NoneType in Windows-MCP). Il server era innocente.
+    """
+    for attr in ("input_schema", "inputSchema"):
+        v = getattr(tool, attr, None)
+        if isinstance(v, dict) and v:
+            return v
+    try:
+        d = tool.model_dump(by_alias=True)
+        v = d.get("inputSchema") or d.get("input_schema")
+        if isinstance(v, dict) and v:
+            return v
+    except Exception:
+        pass
+    return {}
+
 _MCP_READONLY_VERBS = (
     "list", "get", "read", "search", "fetch", "query", "find", "describe",
     "show", "view", "lookup", "count", "status", "info", "inspect", "summar",
@@ -209,7 +232,7 @@ class McpManager:
                     tools.append({
                         "name": tool.name,
                         "description": tool.description or "",
-                        "input_schema": tool.inputSchema if hasattr(tool, "inputSchema") else {},
+                        "input_schema": _tool_input_schema(tool),
                         # MCP tool annotations (readOnlyHint / destructiveHint) drive
                         # plan-mode read-only gating. Absent on many servers, so we
                         # fall back to a name heuristic in mcp_tool_is_readonly().
@@ -278,7 +301,7 @@ class McpManager:
                     tools.append({
                         "name": tool.name,
                         "description": tool.description or "",
-                        "input_schema": tool.inputSchema if hasattr(tool, 'inputSchema') else {},
+                        "input_schema": _tool_input_schema(tool),
                         # MCP tool annotations (readOnlyHint / destructiveHint) drive
                         # plan-mode read-only gating. Absent on many servers, so we
                         # fall back to a name heuristic in mcp_tool_is_readonly().
@@ -365,7 +388,7 @@ class McpManager:
                 tools.append({
                     "name": tool.name,
                     "description": tool.description or "",
-                    "input_schema": tool.inputSchema if hasattr(tool, "inputSchema") else {},
+                    "input_schema": _tool_input_schema(tool),
                 })
 
             self._sessions[server_id] = session
@@ -523,7 +546,10 @@ class McpManager:
                 output_parts.append(str(content.data))
 
         output = "\n".join(output_parts)
-        is_error = getattr(result, 'isError', False)
+        # mcp 2.x exposes snake_case ``is_error``; retain the camelCase
+        # fallback for older SDK objects. Treating an MCP error as success can
+        # mask a failed browser action behind the following snapshot.
+        is_error = bool(getattr(result, 'is_error', getattr(result, 'isError', False)))
 
         result_dict = {
             "stdout": output if not is_error else "",
@@ -572,7 +598,8 @@ class McpManager:
         disabled_map: optional {server_id: set_of_disabled_tool_names} to filter out.
         """
         schemas = []
-        for server_id, tools in self._tools.items():
+        for server_id in sorted(self._tools):
+            tools = self._tools[server_id]
             # Skip builtin Python servers — they use the code-block tool format
             # But include NPX-based builtins (like browser) which need function calling
             if self.is_builtin(server_id) and server_id != "builtin_browser":
@@ -584,7 +611,7 @@ class McpManager:
             identity = conn.get("identity", "")
             label = f"{server_name} ({identity})" if identity else server_name
 
-            for tool in tools:
+            for tool in sorted(tools, key=lambda item: str(item.get("name") or "")):
                 if tool["name"] in disabled:
                     continue
                 qualified = f"mcp__{server_id}__{tool['name']}"
@@ -603,10 +630,11 @@ class McpManager:
     def get_all_tools(self, disabled_map: Optional[Dict[str, set]] = None) -> List[Dict]:
         """Return a flat list of all discovered tools with server info."""
         result = []
-        for server_id, tools in self._tools.items():
+        for server_id in sorted(self._tools):
+            tools = self._tools[server_id]
             conn = self._connections.get(server_id, {})
             disabled = (disabled_map or {}).get(server_id, set())
-            for tool in tools:
+            for tool in sorted(tools, key=lambda item: str(item.get("name") or "")):
                 result.append({
                     "server_id": server_id,
                     "server_name": conn.get("name", server_id),
@@ -656,20 +684,41 @@ class McpManager:
     _cached_prompt_desc = None
     _cached_prompt_desc_key = None
 
-    def get_tool_descriptions_for_prompt(self, disabled_map: Optional[Dict[str, set]] = None) -> str:
-        """Generate text describing MCP tools for the agent system prompt. Cached."""
+    def get_tool_descriptions_for_prompt(
+        self,
+        disabled_map: Optional[Dict[str, set]] = None,
+        allowed_names: Optional[Set[str]] = None,
+    ) -> str:
+        """Describe only MCP tools selected for this turn.
+
+        ``None`` preserves the administrative/full-catalogue behavior.  An
+        empty set intentionally renders nothing. Native function-calling paths
+        omit this duplicate text entirely; fenced/text paths pass their RAG
+        allowlist here.
+        """
+        allowed_key = None if allowed_names is None else frozenset(allowed_names)
         cache_key = (
             frozenset((k, frozenset(v)) for k, v in (disabled_map or {}).items()),
             len(self._tools),
             self._generation,
+            allowed_key,
         )
         if self._cached_prompt_desc is not None and self._cached_prompt_desc_key == cache_key:
             return self._cached_prompt_desc
         tools = self.get_all_tools(disabled_map)
+        if allowed_names is not None:
+            tools = [t for t in tools if t.get("qualified_name") in allowed_names]
+        else:
+            # Progressive browser disclosure: a fallback/full prompt still
+            # uses the compact adapters, never the entire Playwright catalogue.
+            tools = [t for t in tools if t.get("server_id") != "builtin_browser"]
         if not tools:
             return ""
 
-        lines = ["\n\nYou also have access to external MCP tool servers. These tools are called via native function calling:"]
+        lines = [
+            "\n\nYou also have access to external MCP tool servers. "
+            "Call them using the tool-call format defined above:"
+        ]
         by_server = {}
         for t in tools:
             # Skip builtin Python servers — they're already in the agent prompt

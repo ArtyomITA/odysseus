@@ -337,6 +337,23 @@ def analyze_image_with_vl_result(image_path: str, owner: str | None = None) -> d
         settings = _load_vl_settings()
         if not settings.get("vision_enabled", True):
             return {"text": "[Vision is disabled — enable it in Settings → Vision]", "model": ""}
+        # Vista (occhi locali): se la modalita' e' accesa, Holo descrive l'allegato
+        # al posto del modello vision configurato. JSON a schema -> testo compatto
+        # per il cervello cieco. Se Holo non parte, si ricade sulla catena normale.
+        try:
+            from src.vista.client import get_vista
+            _v = get_vista()
+            if _v.attiva:
+                from PIL import Image as _PILImage
+                _im = _PILImage.open(image_path).convert("RGB")
+                _d = _v.descrivi_immagine(_im)
+                _righe = [f"tipo: {_d.get('tipo','')}", f"descrizione: {_d.get('descrizione','')}",
+                          f"soggetti: {', '.join(_d.get('soggetti') or [])}",
+                          f"testo visibile: {_d.get('testo_visibile','')}",
+                          f"ambiente: {_d.get('luogo_o_ambiente','')}"]
+                return {"text": "\n".join(_righe), "model": "holo-3.1-0.8b (vista)"}
+        except Exception as _ve:
+            logger.warning("[vista] descrizione allegato fallita, uso il modello vision configurato: %s", _ve)
         vl_model = settings.get("vision_model", "")
 
         try:

@@ -5,6 +5,12 @@ from __future__ import annotations
 import logging
 from typing import Optional, Set
 
+from src.browser_tooling_constants import (
+    BROWSER_ADAPTER_RAW_DEPENDENCIES,
+    BROWSER_CORE_TOOL_NAMES,
+    BROWSER_MCP_PREFIX,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -33,13 +39,15 @@ BUILTIN_EMAIL_TOOLS = frozenset({
     "download_attachment",
 })
 
+BROWSER_ADAPTER_TOOLS = BROWSER_CORE_TOOL_NAMES
+
 
 # Tools regular/public users must not execute directly. These either expose
 # server/runtime access, sensitive user data, external messaging, persistent
 # state changes, or generic loopback/integration surfaces. All email tools are
 # included (SECURITY.md: email/MCP capabilities are privileged admin
 # functionality).
-NON_ADMIN_BLOCKED_TOOLS = BUILTIN_EMAIL_TOOLS | {
+NON_ADMIN_BLOCKED_TOOLS = BUILTIN_EMAIL_TOOLS | BROWSER_ADAPTER_TOOLS | {
     "bash",
     "python",
     "manage_bg_jobs",
@@ -96,6 +104,8 @@ PLAN_MODE_READONLY_TOOLS = {
     "get_workspace",
     "web_search",
     "web_fetch",
+    "browser_read",
+    "browser_find",
     "search_chats",
     "list_models",
     "list_sessions",
@@ -163,6 +173,8 @@ _PLAN_MODE_KNOWN_MUTATORS = {
     "bash", "python",
     # Controls shell processes (kill); plan mode can't run bash anyway.
     "manage_bg_jobs",
+    "browser_open", "browser_click", "browser_type", "browser_back",
+    "browser_more",
 }
 
 
@@ -216,6 +228,27 @@ def email_tool_policy_names(tool_name: str) -> frozenset:
         bare = tool_name[len("mcp__email__"):]
         if bare in BUILTIN_EMAIL_TOOLS:
             return frozenset((tool_name, bare))
+    # Browser adapters and their raw MCP counterparts are the same capability.
+    # Policy sources may store the server marker, a raw qualified tool, or the
+    # compact adapter spelling; every form must hit the same deny gate.
+    if tool_name in BROWSER_ADAPTER_TOOLS:
+        names = {tool_name, "builtin_browser"}
+        names.update(
+            BROWSER_MCP_PREFIX + raw
+            for raw in BROWSER_ADAPTER_RAW_DEPENDENCIES.get(tool_name, ())
+        )
+        return frozenset(names)
+    if tool_name.startswith(BROWSER_MCP_PREFIX):
+        raw = tool_name[len(BROWSER_MCP_PREFIX):]
+        names = {tool_name, "builtin_browser"}
+        names.update(
+            adapter
+            for adapter, dependencies in BROWSER_ADAPTER_RAW_DEPENDENCIES.items()
+            if raw in dependencies
+        )
+        return frozenset(names)
+    if tool_name == "builtin_browser":
+        return frozenset({tool_name, *BROWSER_ADAPTER_TOOLS})
     return frozenset((tool_name,))
 
 

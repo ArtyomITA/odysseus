@@ -451,6 +451,7 @@ function typewriterReply(text, options = {}) {
             body.style.whiteSpace = '';
             body.innerHTML = markdownModule.processWithThinking(markdownModule.squashOutsideCode(text));
             if (markdownModule.renderMermaid) markdownModule.renderMermaid(body);
+            window.OdysseusCharts?.renderCharts(body);
             uiModule.scrollHistory();
           });
         }

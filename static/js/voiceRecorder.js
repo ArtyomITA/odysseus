@@ -6,9 +6,18 @@
  * STT providers:
  *   "disabled"       — record audio as file attachment (original behavior)
  *   "browser"        — use Web Speech API for real-time transcription
+ *   "stream"         — live transcription over WebSocket (/api/stt/stream)
  *   "local"          — send recording to server /api/stt/transcribe (Whisper)
  *   "endpoint:<id>"  — send recording to server /api/stt/transcribe (API)
+ *
+ * "stream" is a different shape from the others and does not use MediaRecorder
+ * at all. The rest record a whole clip, upload it, and wait: nothing appears
+ * until you press stop. The live path pushes 100 ms of audio at a time and gets
+ * text back while you are still talking — and decides on its own when you have
+ * finished, so the stop press becomes optional.
  */
+
+import { AsrStreaming } from './asrStreaming.js';
 
 let mediaRecorder = null;
 let audioChunks = [];
@@ -145,10 +154,91 @@ function insertTranscription(text, showToast) {
   if (showToast) showToast('Transcribed');
 }
 
+// ── Live transcription (provider "stream") ──
+
+let _live = null;
+let _liveBase = '';          // what was already in the box when the mic opened
+let _liveParziale = '';      // the not-yet-final text currently shown
+
+/**
+ * Paints the box as base + confirmed turns + current partial.
+ *
+ * Rebuilt from scratch each time rather than appended: the partial keeps being
+ * revised as the recogniser hears more ("come mi tru" → "come mi truccavo"),
+ * so appending would leave every intermediate guess behind.
+ */
+function _dipingi(input) {
+  const pezzi = [_liveBase, _liveParziale].filter(s => s && s.trim());
+  input.value = pezzi.join(' ');
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+function startLiveTranscription(showToast, showError) {
+  const input = document.getElementById('message');
+  if (!input) return;
+
+  _liveBase = input.value.trim();
+  _liveParziale = '';
+
+  _live = new AsrStreaming({
+    lingua: (window.OdysseusSttLanguage || 'it'),
+    onParziale: (testo) => {
+      _liveParziale = testo;
+      _dipingi(input);
+    },
+    onTurno: (testo) => {
+      // Turn closed by silence. It becomes part of the base, so the next turn
+      // is appended after it instead of replacing it.
+      _liveBase = [_liveBase, testo].filter(s => s && s.trim()).join(' ');
+      _liveParziale = '';
+      _dipingi(input);
+      input.focus();
+    },
+    onErrore: (msg) => {
+      if (showError) showError('Trascrizione: ' + msg);
+      stopLiveTranscription();
+    },
+  });
+
+  isRecording = true;
+  recordingStartTime = new Date();
+  _live.avvia().then(() => {
+    if (showToast) showToast('Microfono acceso — parla pure');
+  });
+
+  // While the assistant speaks, the microphone would pick it up from the
+  // speakers and transcribe the assistant's own words. Browser echo
+  // cancellation does not cover audio played by the page itself, so the mic is
+  // gated on the TTS state instead.
+  window.addEventListener('odysseus:tts-start', _mutoOn);
+  window.addEventListener('odysseus:tts-end', _mutoOff);
+}
+
+function _mutoOn() { _live?.silenzia(true); }
+function _mutoOff() { _live?.silenzia(false); }
+
+function stopLiveTranscription() {
+  window.removeEventListener('odysseus:tts-start', _mutoOn);
+  window.removeEventListener('odysseus:tts-end', _mutoOff);
+  if (_live) {
+    _live.ferma();
+    _live = null;
+  }
+  _liveBase = '';
+  _liveParziale = '';
+  _resetRecordingUI();
+}
+
 /**
  * Start voice recording
  */
 export function startRecording(onFileCreated, showToast, showError) {
+  // The live path never touches MediaRecorder: there is no clip to record and
+  // no file to upload.
+  if (_sttProvider === 'stream') {
+    return startLiveTranscription(showToast, showError);
+  }
+
   // Check for secure context (getUserMedia requires HTTPS or localhost)
   if (!window.isSecureContext) {
     if (showError) showError('Microphone requires HTTPS. Use a reverse proxy with SSL or access via localhost.');
@@ -164,7 +254,9 @@ export function startRecording(onFileCreated, showToast, showError) {
 
   audioChunks = [];
 
-  navigator.mediaDevices.getUserMedia({ audio: true })
+  // Honour the microphone chosen in Settings; falls back to the system default.
+  navigator.mediaDevices.getUserMedia(
+    window.OdysseusAudioDevices?.micConstraints() || { audio: true })
     .then(stream => {
       mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
 
@@ -247,6 +339,13 @@ export function startRecording(onFileCreated, showToast, showError) {
  * Stop voice recording
  */
 export function stopRecording() {
+  if (_live) {
+    // Close the turn in flight before tearing down, so a sentence that was
+    // still being spoken when the button was pressed is not thrown away.
+    _live.concludi();
+    setTimeout(stopLiveTranscription, 300);
+    return;
+  }
   if (mediaRecorder && mediaRecorder.state === 'recording') {
     mediaRecorder.stop();
     // isRecording will be set to false in _resetRecordingUI called from onstop

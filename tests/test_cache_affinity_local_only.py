@@ -102,3 +102,38 @@ def test_host_just_above_cgnat_gets_no_affinity_fields(monkeypatch):
 def test_hosts_inside_cgnat_get_affinity_fields(monkeypatch, host):
     payload = _affinity_fields(f"http://{host}:8080/v1", monkeypatch)
     assert payload == {"session_id": "sess-123", "cache_prompt": True}
+
+
+def test_local_reasoning_controls_reach_llamacpp_only(monkeypatch):
+    monkeypatch.setattr(model_context, "_configured_endpoint_kind", lambda _u: None)
+    local = {}
+    llm_core._apply_local_reasoning_controls(
+        local,
+        "http://127.0.0.1:8012/v1",
+        enable_thinking=False,
+        reasoning_budget_tokens=128,
+    )
+    assert local == {
+        "chat_template_kwargs": {"enable_thinking": False},
+        "reasoning_budget_tokens": 128,
+    }
+
+    cloud = {}
+    llm_core._apply_local_reasoning_controls(
+        cloud,
+        "https://api.openai.com/v1",
+        enable_thinking=False,
+        reasoning_budget_tokens=128,
+    )
+    assert cloud == {}
+
+
+def test_local_reasoning_budget_is_clamped_non_negative(monkeypatch):
+    monkeypatch.setattr(model_context, "_configured_endpoint_kind", lambda _u: None)
+    payload = {}
+    llm_core._apply_local_reasoning_controls(
+        payload,
+        "http://localhost:8080/v1",
+        reasoning_budget_tokens=-10,
+    )
+    assert payload["reasoning_budget_tokens"] == 0

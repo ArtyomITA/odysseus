@@ -63,3 +63,57 @@ def test_plain_tell_request_stays_minimal():
     assert not (_EMAIL_TOOLS & tools)
     # Always-available baseline is still there.
     assert set(ALWAYS_AVAILABLE) <= tools
+
+
+def test_italian_browser_query_gets_compact_browser_adapter_set():
+    ti = ToolIndex.__new__(ToolIndex)
+    ti._lanes = []
+    ti._lexical_docs = {
+        name: f"Tool: {name}\n{description}"
+        for name, description in __import__(
+            "src.tool_index", fromlist=["BUILTIN_TOOL_DESCRIPTIONS"]
+        ).BUILTIN_TOOL_DESCRIPTIONS.items()
+    }
+    tools = ti.get_tools_for_query("Apri YouTube nel browser e leggi la pagina")
+    assert {"browser_open", "browser_read", "browser_find"} <= tools
+    assert not any(name.startswith("mcp__builtin_browser__") for name in tools)
+
+
+def test_italian_web_and_email_hints_work_without_embeddings():
+    ti = _index_without_embeddings()
+    web_tools = ti.get_tools_for_query("Cerca su internet le ultime notizie")
+    mail_tools = ti.get_tools_for_query("Controlla la posta non letta")
+    assert {"web_search", "web_fetch"} <= web_tools
+    assert {"list_emails", "read_email"} <= mail_tools
+
+
+def test_semantic_query_does_not_expand_disattiva_as_attiva():
+    expanded = ToolIndex._semantic_query("Disattiva il browser")
+    assert "disable turn off" in expanded
+    assert "enable turn on" not in expanded
+
+
+def test_mcp_reindexes_when_disabled_map_changes_without_generation_change():
+    class FakeMcp:
+        _generation = 7
+
+        def __init__(self):
+            self.calls = 0
+
+        def get_all_tools(self, disabled_map):
+            self.calls += 1
+            return []
+
+    ti = ToolIndex.__new__(ToolIndex)
+    ti._lanes = []
+    ti._mcp_generation = -1
+    ti._mcp_disabled_signature = ()
+    ti._lexical_docs = {}
+    mcp = FakeMcp()
+
+    ti.index_mcp_tools(mcp, {"srv": {"alpha"}})
+    assert mcp.calls == 1
+    ti.index_mcp_tools(mcp, {"srv": {"alpha"}})
+    assert mcp.calls == 1
+    ti.index_mcp_tools(mcp, {"srv": {"beta"}})
+    assert mcp.calls == 2

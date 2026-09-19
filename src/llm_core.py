@@ -10,7 +10,7 @@ import re
 import os
 from contextlib import asynccontextmanager
 from fastapi import HTTPException
-from typing import Optional, Dict, List, Tuple
+from typing import Any, Optional, Dict, List, Tuple
 from src.model_context import get_context_length, DEFAULT_CONTEXT, is_local_endpoint
 from urllib.parse import urlparse
 
@@ -119,8 +119,9 @@ def _stream_timeout(read_timeout) -> httpx.Timeout:
 
 
 # Cache for LLM responses
-def _get_cache_key(url: str, model: str, messages: List[Dict], 
-                   temperature: float, max_tokens: int) -> str:
+def _get_cache_key(url: str, model: str, messages: List[Dict],
+                   temperature: float, max_tokens: int,
+                   request_controls: Optional[Dict] = None) -> str:
     """Generate cache key for LLM requests."""
     hashable_messages = []
     for msg in messages:
@@ -132,7 +133,8 @@ def _get_cache_key(url: str, model: str, messages: List[Dict],
         'model': model, 
         'messages': hashable_messages,
         'temp': temperature,
-        'max_tokens': max_tokens
+        'max_tokens': max_tokens,
+        'request_controls': request_controls or {},
     }, sort_keys=True)
     return hashlib.sha256(content.encode()).hexdigest()
 
@@ -905,28 +907,184 @@ def _is_self_hosted_openai_compatible(url: str) -> bool:
     return is_local_endpoint(url)
 
 
-def _apply_local_cache_affinity(payload: Dict, url: str, session_id: Optional[str]) -> None:
+def _local_slot_pin_enabled() -> bool:
+    return os.getenv("ODYSSEUS_LOCAL_SLOT_PIN", "0") == "1"
+
+
+def _local_slot_for(session_id: Optional[str], slot_kind: str) -> int:
+    """Onda 4 / O4: slot llama.cpp fisso. Chat (foreground con sessione) sullo
+    slot CHAT, tutto il resto (titoli, memorie, skill, scheduler) sullo slot
+    SERVICE. La cache di prefisso e' locale allo slot (39 par. O4): senza pin lo
+    scheduler LRU/LCP puo' mandare la chat su uno slot freddo e riprocessare
+    8k token."""
+    if slot_kind == "chat" and session_id:
+        return int(os.getenv("ODYSSEUS_LOCAL_SLOT_CHAT", "0") or 0)
+    return int(os.getenv("ODYSSEUS_LOCAL_SLOT_SERVICE", "3") or 3)
+
+
+_SLOT_ERASE_ROUTE: Dict[str, str] = {}
+
+
+def _slot_erase_candidates(target_url: str, model: str, slot: int) -> List[str]:
+    base = re.split(r"/v1(?:/|$)", str(target_url or ""), maxsplit=1)[0].rstrip("/")
+    if not base:
+        return []
+    urls = [f"{base}/upstream/{model}/slots/{slot}?action=erase",
+            f"{base}/slots/{slot}?action=erase"]
+    cached = _SLOT_ERASE_ROUTE.get(base)
+    if cached:
+        urls.sort(key=lambda u: 0 if u.startswith(cached) else 1)
+    return urls
+
+
+def _slot_erase_wanted(target_url: str, slot) -> bool:
+    if slot is None or not _local_slot_pin_enabled():
+        return False
+    if os.getenv("ODYSSEUS_LOCAL_SLOT_ERASE", "0") != "1":
+        return False
+    if int(slot) == _local_slot_for("x", "chat"):
+        return False
+    return _is_self_hosted_openai_compatible(target_url)
+
+
+def _remember_erase_route(u: str) -> None:
+    base = re.split(r"/(?:upstream/|slots/)", u, maxsplit=1)[0]
+    _SLOT_ERASE_ROUTE[base] = u.split("/slots/")[0]
+
+
+def _erase_local_slot_sync(target_url: str, model: str, slot) -> None:
+    """Onda 4 / C04: svuota lo slot di servizio a fine chiamata. Le sequenze
+    morte nella KV unificata dimezzano il prefill della chat (39 par. OPP)."""
+    if not _slot_erase_wanted(target_url, slot):
+        return
+    for u in _slot_erase_candidates(target_url, model, int(slot)):
+        try:
+            r = httpx.post(u, timeout=5.0)
+            if r.is_success:
+                _remember_erase_route(u)
+                logger.info("[slot-erase] slot=%s ok via %s", slot, u)
+                return
+            logger.info("[slot-erase] slot=%s %s -> %s", slot, u, r.status_code)
+        except Exception as e:
+            logger.info("[slot-erase] slot=%s %s -> %s", slot, u, type(e).__name__)
+    logger.warning("[slot-erase] slot=%s nessuna route ha risposto", slot)
+
+
+async def _erase_local_slot(target_url: str, model: str, slot) -> None:
+    if not _slot_erase_wanted(target_url, slot):
+        return
+    client = _get_http_client()
+    for u in _slot_erase_candidates(target_url, model, int(slot)):
+        try:
+            r = await client.post(u, timeout=5.0)
+            if r.is_success:
+                _remember_erase_route(u)
+                logger.info("[slot-erase] slot=%s ok via %s", slot, u)
+                return
+            logger.info("[slot-erase] slot=%s %s -> %s", slot, u, r.status_code)
+        except Exception as e:
+            logger.info("[slot-erase] slot=%s %s -> %s", slot, u, type(e).__name__)
+    logger.warning("[slot-erase] slot=%s nessuna route ha risposto", slot)
+
+
+_SLOTS_SWEPT: set = set()
+
+
+async def _sweep_local_slots(target_url: str, model: str) -> None:
+    """Onda 4 / C04-bis: alla prima richiesta pinnata di questo processo svuota
+    TUTTI gli slot tranne quello della chat. Le sequenze lasciate dallo
+    scheduler LRU prima del pin (o da un braccio precedente) restano nella KV
+    unificata per sempre e dimezzano il prefill (misurato: slot 1 con 9102
+    token morti durante B7). Una volta per (processo, base URL)."""
+    if not _local_slot_pin_enabled() or os.getenv("ODYSSEUS_LOCAL_SLOT_ERASE", "0") != "1":
+        return
+    base = re.split(r"/v1(?:/|$)", str(target_url or ""), maxsplit=1)[0].rstrip("/")
+    if not base or base in _SLOTS_SWEPT:
+        return
+    _SLOTS_SWEPT.add(base)
+    try:
+        client = _get_http_client()
+        r = await client.get(f"{base}/running", timeout=3.0)
+        if r.is_success:
+            _running = r.json().get("running") or []
+            if not any(str(m.get("model")) == str(model) and m.get("state") == "ready" for m in _running):
+                logger.info("[slot-erase] sweep saltato: modello %s non caricato (slot freschi)", model)
+                return
+    except Exception:
+        pass
+    chat = _local_slot_for("x", "chat")
+    n = int(os.getenv("ODYSSEUS_LOCAL_SLOT_N", "4") or 4)
+    for slot in range(n):
+        if slot == chat:
+            continue
+        try:
+            await _erase_local_slot(target_url, model, slot)
+        except Exception:
+            pass
+    logger.info("[slot-erase] sweep iniziale: slot 0..%d tranne chat=%d", n - 1, chat)
+
+
+def _apply_local_cache_affinity(payload: Dict, url: str, session_id: Optional[str], slot_kind: str = "service") -> None:
     """Add llama.cpp-server slot-affinity hints to an outgoing payload, in place.
 
     As diagnosed in issue #2927, llama.cpp assigns requests to processing
     slots via LRU when no stable identifier is present ("session_id=<empty>
     server-selected (LCP/LRU)"), which means consecutive turns of the same
     chat can land on different slots and lose their cached prefix entirely.
-    Sending a stable ``session_id`` (derived from the Odysseus session) lets
-    the server keep routing the same conversation to the same slot, and
-    ``cache_prompt: true`` asks it to retain/reuse the prefix it already has.
+    ``cache_prompt: true`` asks the server to retain and reuse the prefix it
+    already has, and that part works.
+
+    ``session_id`` DOES NOT pin a slot on llama.cpp (verified 26 Aug 2026
+    against master, commit d222767): the server reads ``id_slot``
+    (``tools/server/server-context.cpp``, ``task.id_slot = json_value(data,
+    "id_slot", -1)``) and the string ``session_id`` appears nowhere in the
+    server sources. It is kept here because LM Studio and other
+    OpenAI-compatible self-hosted servers may honour it, and because an
+    unknown extra field costs nothing on a self-hosted endpoint - but it must
+    not be relied upon for slot affinity on llama.cpp. Real affinity there
+    needs an explicit ``id_slot`` in 0..n_slots-1, which also serialises every
+    request sent to that slot: it is a trade-off to measure end to end, not a
+    free win. See ricerche/opt-1080/27-matrice-test-onda4.md (test C03).
 
     Both fields are llama.cpp / LM Studio extensions to the OpenAI schema; we
     only set them for self-hosted OpenAI-compatible endpoints (never
     api.openai.com or other cloud providers, which reject unrecognized
     top-level request fields).
     """
-    if not session_id:
-        return
     if not _is_self_hosted_openai_compatible(url):
+        return
+    # Onda 4 / O4 + C04 (27 ago 2026): `id_slot` fisso, solo con
+    # ODYSSEUS_LOCAL_SLOT_PIN=1. Vedi _local_slot_for.
+    if _local_slot_pin_enabled():
+        payload["id_slot"] = _local_slot_for(session_id, slot_kind)
+    if not session_id:
         return
     payload.setdefault("session_id", str(session_id))
     payload.setdefault("cache_prompt", True)
+
+
+def _apply_local_reasoning_controls(
+    payload: Dict,
+    url: str,
+    *,
+    enable_thinking: Optional[bool] = None,
+    reasoning_budget_tokens: Optional[int] = None,
+) -> None:
+    """Apply llama.cpp-only per-request reasoning controls.
+
+    b10549 consumes ``chat_template_kwargs.enable_thinking`` while building
+    the chat template and ``reasoning_budget_tokens`` in the sampler.  Strict
+    cloud APIs reject these extension fields, so they are gated by the same
+    self-hosted check used for cache hints.
+    """
+    if not _is_self_hosted_openai_compatible(url):
+        return
+    if enable_thinking is not None:
+        kwargs = payload.setdefault("chat_template_kwargs", {})
+        if isinstance(kwargs, dict):
+            kwargs["enable_thinking"] = bool(enable_thinking)
+    if reasoning_budget_tokens is not None:
+        payload["reasoning_budget_tokens"] = max(0, int(reasoning_budget_tokens))
 
 
 def _is_local_minimax_mlx_request(url: str, model: str) -> bool:
@@ -1850,9 +2008,11 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
         _apply_local_generation_stability(payload, target_url, model)
         if provider == "mistral" and _supports_thinking(model):
             payload["reasoning_effort"] = _MISTRAL_REASONING_EFFORT
+        _apply_local_cache_affinity(payload, url, None, "service")
     try:
         note_model_activity(target_url, model)
         r = httpx_post_kimi_aware(target_url, h, json=payload, timeout=timeout)
+        _erase_local_slot_sync(target_url, model, payload.get("id_slot") if isinstance(payload, dict) else None)
     except Exception as e:
         raise HTTPException(502, f"POST {target_url} failed: {e}")
     if not r.is_success:
@@ -1958,6 +2118,8 @@ async def llm_call_async(
     prompt_type: Optional[str] = None,
     session_id: Optional[str] = None,
     workload: str = "foreground",
+    enable_thinking: Optional[bool] = None,
+    reasoning_budget_tokens: Optional[int] = None,
 ) -> str:
     """Asynchronous LLM call using httpx with connection pooling, timeout, retry logic, and performance logging."""
     provider = _detect_provider(url)
@@ -1976,7 +2138,13 @@ async def llm_call_async(
     else:
         messages_copy = non_sys
 
-    cache_key = _get_cache_key(url, model, messages_copy, temperature, max_tokens)
+    request_controls = {
+        "enable_thinking": enable_thinking,
+        "reasoning_budget_tokens": reasoning_budget_tokens,
+    }
+    cache_key = _get_cache_key(
+        url, model, messages_copy, temperature, max_tokens, request_controls
+    )
     cached_response = _get_cached_response(cache_key)
     if cached_response:
         logger.debug(f"Returning cached response for key: {cache_key}")
@@ -2060,7 +2228,13 @@ async def llm_call_async(
             payload["think"] = False
         if provider == "mistral" and _supports_thinking(model):
             payload["reasoning_effort"] = _MISTRAL_REASONING_EFFORT
-        _apply_local_cache_affinity(payload, url, session_id)
+        _apply_local_cache_affinity(payload, url, session_id, "service")
+        _apply_local_reasoning_controls(
+            payload,
+            url,
+            enable_thinking=enable_thinking,
+            reasoning_budget_tokens=reasoning_budget_tokens,
+        )
         _apply_local_generation_stability(payload, target_url, model)
 
     if _is_host_dead(target_url):
@@ -2076,6 +2250,7 @@ async def llm_call_async(
                 note_model_activity(target_url, model)
                 client = _get_http_client()
                 r = await httpx_post_kimi_aware_async(client, target_url, h, json=payload, timeout=call_timeout)
+                await _erase_local_slot(target_url, model, payload.get("id_slot") if isinstance(payload, dict) else None)
             duration = time.time() - start
             if not r.is_success:
                 friendly = _format_upstream_error(r.status_code, r.text, target_url)
@@ -2132,30 +2307,113 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
                      max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None,
                      timeout: int = LLMConfig.STREAM_TIMEOUT, prompt_type: Optional[str] = None,
                      tools: Optional[List[Dict]] = None, session_id: Optional[str] = None,
-                     tool_choice_none: bool = False, workload: str = "foreground"):
+                     tool_choice_none: bool = False, tool_choice: Optional[Any] = None,
+                     workload: str = "foreground",
+                     reasoning_budget_tokens: Optional[int] = None):
     target_url = _stream_target_url(url)
+    # Onda 4 / O4: la chat (foreground con sessione) e' l'unica a usare lo
+    # slot CHAT; ogni altro stream e' "servizio" e finisce sullo slot SERVICE,
+    # svuotato a fine chiamata (C04) se ODYSSEUS_LOCAL_SLOT_ERASE=1.
+    _slot_kind = "chat" if (str(workload or "foreground") == "foreground" and session_id) else "service"
     async with _local_model_slot(target_url, model, workload):
-        async for chunk in _stream_llm_inner(
-            url,
-            model,
-            messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            headers=headers,
-            timeout=timeout,
-            prompt_type=prompt_type,
-            tools=tools,
-            session_id=session_id,
-            tool_choice_none=tool_choice_none,
-        ):
-            yield chunk
+        try:
+            if _local_slot_pin_enabled() and _is_self_hosted_openai_compatible(url):
+                await _sweep_local_slots(_normalize_openai_chat_url(url), model)
+            async for chunk in _stream_llm_inner(
+                url,
+                model,
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                headers=headers,
+                timeout=timeout,
+                prompt_type=prompt_type,
+                tools=tools,
+                session_id=session_id,
+                tool_choice_none=tool_choice_none,
+                tool_choice=tool_choice,
+                reasoning_budget_tokens=reasoning_budget_tokens,
+                slot_kind=_slot_kind,
+            ):
+                yield chunk
+        finally:
+            if _slot_kind == "service" and _local_slot_pin_enabled():
+                try:
+                    await _erase_local_slot(_normalize_openai_chat_url(url), model, _local_slot_for(session_id, "service"))
+                except Exception:
+                    pass
+
+
+async def _nonstream_tools_call(target_url: str, payload: Dict, headers, timeout, dump_path: Optional[str] = None):
+    """Richiesta con tools in NON-stream, ripresentata al chiamante come SSE.
+
+    Perche': llama.cpp in streaming perde le tool call dei modelli con
+    thinking (finiscono nel blocco think o si spezzano nei delta — bug noti
+    del parser SSE, vedi ricerche/harness-agentici-ciclo-multistep.md).
+    Misurato su questo stack: payload identico, non-stream chiama
+    `fin_mercati`, stream restituisce il nulla. Il costo e' perdere il
+    token-per-token nei soli giri con schemi attaccati; i giri di prosa
+    (senza tools) restano in streaming vero.
+    """
+    p = dict(payload)
+    p["stream"] = False
+    p.pop("stream_options", None)
+    client = _get_http_client()
+    try:
+        r = await client.post(target_url, json=p, headers=headers or {"Content-Type": "application/json"}, timeout=timeout)
+    except Exception as e:
+        yield f'event: error\ndata: {json.dumps({"error": f"{type(e).__name__}: {str(e)[:250]}", "status": 503})}\n\n'
+        return
+    if r.status_code != 200:
+        yield f'event: error\ndata: {json.dumps({"status": r.status_code, "text": r.text[:500]})}\n\n'
+        return
+    try:
+        d = r.json()
+    except Exception:
+        yield f'event: error\ndata: {json.dumps({"error": "risposta non-JSON dal modello", "status": 502})}\n\n'
+        return
+    msg = (d.get("choices") or [{}])[0].get("message") or {}
+    # Onda 4 / telemetria (27 ago 2026): con ODYSSEUS_LLM_DUMP salvo anche la
+    # RISPOSTA del giro con tool (reasoning, contenuto, chiamate, usage,
+    # timings di llama.cpp) accanto al payload: serve per leggere cosa ha
+    # pensato il modello quando inventa o salta il tool.
+    if dump_path:
+        try:
+            with open(dump_path[:-5] + ".risposta.json", "w", encoding="utf-8") as _f:
+                json.dump({"message": msg, "usage": d.get("usage"), "timings": d.get("timings"),
+                           "finish_reason": ((d.get("choices") or [{}])[0] or {}).get("finish_reason")},
+                          _f, ensure_ascii=False, indent=1)
+        except Exception:
+            pass
+    ragio = msg.get("reasoning_content") or ""
+    if ragio:
+        yield _stream_delta_event(ragio, thinking=True)
+    cont = msg.get("content") or ""
+    if cont:
+        yield _stream_delta_event(cont, thinking=False)
+    calls = []
+    for c in (msg.get("tool_calls") or []):
+        f = c.get("function") or {}
+        args = f.get("arguments")
+        if not isinstance(args, str):
+            args = json.dumps(args or {})
+        calls.append({"id": c.get("id") or "", "name": f.get("name") or "",
+                      "arguments": args})
+    if calls:
+        yield f'data: {json.dumps({"type": "tool_calls", "calls": calls})}\n\n'
+    usage = d.get("usage") or {}
+    if usage:
+        yield f'data: {json.dumps({"type": "usage", "data": {"input_tokens": usage.get("prompt_tokens", 0), "output_tokens": usage.get("completion_tokens", 0)}})}\n\n'
+    yield "data: [DONE]\n\n"
 
 
 async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperature: float = LLMConfig.DEFAULT_TEMPERATURE,
                             max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None,
                             timeout: int = LLMConfig.STREAM_TIMEOUT, prompt_type: Optional[str] = None,
                             tools: Optional[List[Dict]] = None, session_id: Optional[str] = None,
-                            tool_choice_none: bool = False):
+                            tool_choice_none: bool = False, tool_choice: Optional[Any] = None,
+                            reasoning_budget_tokens: Optional[int] = None,
+                            slot_kind: str = "service"):
     """Stream LLM responses with improved error handling.
 
     Yields SSE chunks:
@@ -2215,6 +2473,22 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
             payload[tok_key] = max_tokens
         if tools:
             payload["tools"] = tools
+            # Vergilius: "required" (o una funzione precisa) dopo un nudge
+            # intent-without-action — llama.cpp lo onora via grammatica, e
+            # trasforma il «DO IT NOW» da speranza a garanzia sintattica.
+            if tool_choice:
+                payload["tool_choice"] = tool_choice
+        # Onda 4 / E11: budget di thinking per richiesta, solo endpoint locali
+        # (llama.cpp b10549: `reasoning_budget_tokens` letto in server-common.cpp:1354,
+        # sampler-only, non tocca il system prompt). Provider cloud lo rifiuterebbero.
+        if reasoning_budget_tokens is not None and is_local_endpoint(target_url):
+            payload["reasoning_budget_tokens"] = max(0, int(reasoning_budget_tokens))
+            # Messaggio iniettato prima del tag di chiusura quando il budget
+            # finisce (server-common.cpp:1364): chiude il pensiero con una
+            # frase invece che a meta' ragionamento. Vuoto = solo il tag.
+            _rbm = os.getenv("ODYSSEUS_TOOL_ROUND_REASONING_MESSAGE", "").strip()
+            if _rbm:
+                payload["reasoning_budget_message"] = _rbm
         elif tool_choice_none:
             payload["tool_choice"] = "none"
         # Mistral thinking-capable models — send reasoning_effort so Mistral
@@ -2228,7 +2502,7 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
         # <think> blocks. Ollama /v1 accepts "think": false as a top-level param.
         if _is_ollama_openai_compat_url(url) and _supports_thinking(model):
             payload["think"] = False
-        _apply_local_cache_affinity(payload, url, session_id)
+        _apply_local_cache_affinity(payload, url, session_id, slot_kind)
         _apply_local_generation_stability(payload, target_url, model)
         _scrub_openai_chat_tool_reasoning(payload, target_url, model)
         h = _provider_headers(provider, headers)
@@ -2243,10 +2517,36 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
     # path, which -- unlike llm_call -- does not retry the connect.
     stream_timeout = _stream_timeout(timeout)
 
+    # Vergilius, diagnosi: con ODYSSEUS_LLM_DUMP=<dir> ogni payload inviato
+    # al modello viene salvato per intero. E' l'unico modo di vedere ESATTAMENTE
+    # cosa riceve il modello al giro 2 — i log raccontano, il payload dimostra.
+    _dump_dir = os.getenv("ODYSSEUS_LLM_DUMP")
+    _dump_path = None
+    if _dump_dir:
+        try:
+            os.makedirs(_dump_dir, exist_ok=True)
+            _nome = f"{time.strftime('%H%M%S')}_{int(time.time() * 1000) % 1000:03d}.json"
+            _dump_path = os.path.join(_dump_dir, _nome)
+            with open(_dump_path, "w", encoding="utf-8") as _f:
+                json.dump(payload, _f, ensure_ascii=False, indent=1)
+        except Exception:
+            _dump_path = None
+
     if _is_host_dead(target_url):
         yield f'event: error\ndata: {json.dumps({"error": f"Upstream {_host_key(target_url)} unreachable (cooldown active)", "status": 503})}\n\n'
         return
     note_model_activity(target_url, model)
+
+    # Vergilius: giri con tools su endpoint LOCALE -> non-stream (vedi
+    # _nonstream_tools_call). Disattivabile con ODYSSEUS_LOCAL_TOOLS_NONSTREAM=0.
+    if (tools
+            and provider not in {"anthropic", "ollama", "chatgpt-subscription"}
+            and ("127.0.0.1" in target_url or "localhost" in target_url)
+            and os.getenv("ODYSSEUS_LOCAL_TOOLS_NONSTREAM", "1") != "0"):
+        async for chunk in _nonstream_tools_call(target_url, payload, h, stream_timeout, dump_path=_dump_path):
+            yield chunk
+        return
+
     degenerate_guard = _DegenerateStreamGuard(model)
 
     # ── ChatGPT Subscription / Codex Responses streaming ──

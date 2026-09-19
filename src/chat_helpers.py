@@ -158,9 +158,25 @@ def lmstudio_supports_vision(url: str, model: str) -> Optional[bool]:
 
 def model_supports_vision(model_name: str, endpoint_url: str = "") -> bool:
     """Whether a model accepts images, using the endpoint's reported
-    capability when available (LM Studio) and falling back to name-based
-    detection otherwise."""
+    capability when available (llama-swap, LM Studio) and falling back to
+    name-based detection otherwise.
+
+    llama-swap comes first because it is authoritative: llama.cpp's /props
+    reports `modalities.vision`, which is true exactly when an mmproj was
+    loaded. Our profiles are named `qwenpaw-vista` / `heretic-vista` and carry
+    no "vl"/"vision" keyword, so the name heuristic below would call a
+    vision-capable server blind and strip the image out of the request.
+    """
     if endpoint_url:
+        try:
+            from src.llamaswap import supports_vision as _swap_vision
+            # load=True: this is only reached with an image attached, so the
+            # profile is about to be started by the outgoing request anyway.
+            advertised = _swap_vision(endpoint_url, model_name or "", load=True)
+        except Exception:
+            advertised = None
+        if advertised is not None:
+            return advertised
         try:
             advertised = lmstudio_supports_vision(endpoint_url, model_name or "")
         except Exception:

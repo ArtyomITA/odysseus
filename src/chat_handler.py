@@ -280,6 +280,51 @@ class ChatHandler:
                         if _m is not None:
                             _m["vision"] = vl_desc
                             _m["vision_model"] = vl_model
+                elif file_info and self.upload_handler.is_video_file(
+                    file_info["name"], file_info.get("mime", "")
+                ):
+                    # Vergilius: video allegato. Gli occhi (Holo) descrivono i
+                    # frame uno per uno con timestamp; il cervello racconta la
+                    # sequenza. Solo con Vista attiva — senza occhi il video
+                    # resta un allegato muto e lo si dice.
+                    _vcache = os.path.join(UPLOAD_DIR, ".vision", att_id + ".txt")
+                    v_desc = None
+                    if os.path.exists(_vcache):
+                        try:
+                            with open(_vcache, encoding="utf-8") as _vf:
+                                _c = _vf.read().strip()
+                            if _c and not _c.startswith("["):
+                                v_desc = _c
+                        except Exception:
+                            v_desc = None
+                    if not v_desc:
+                        try:
+                            from src.vista.client import get_vista
+                            _v = get_vista()
+                            if _v.attiva:
+                                _d = await asyncio.to_thread(_v.descrivi_video, file_info["path"], 0.5)
+                                _righe = [f"t={f['t_s']}s: {f['descrizione']}" for f in _d.get("frame", [])]
+                                v_desc = "\n".join(_righe) if _righe else "[nessun frame estratto]"
+                                if not v_desc.startswith("["):
+                                    try:
+                                        os.makedirs(os.path.join(UPLOAD_DIR, ".vision"), exist_ok=True)
+                                        with open(_vcache, "w", encoding="utf-8") as _vf:
+                                            _vf.write(v_desc)
+                                    except Exception:
+                                        pass
+                            else:
+                                v_desc = "[Video allegato: attiva la modalità Vista per descriverlo]"
+                        except Exception as _e:
+                            logger.warning("[vista] video non descritto: %s", _e)
+                            v_desc = f"[Video allegato non analizzabile: {str(_e)[:80]}]"
+                    enhanced_message = (
+                        f"{enhanced_message}\n\n[Video: {file_info['name']}] — frame descritti in ordine, "
+                        f"racconta tu la sequenza:\n{v_desc}"
+                    )
+                    _m = meta_by_id.get(att_id)
+                    if _m is not None:
+                        _m["vision"] = v_desc
+                        _m["vision_model"] = "holo-3.1-0.8b (vista)"
 
         user_content = build_user_content(
             enhanced_message, effective_att_ids, UPLOAD_DIR, self.upload_handler,

@@ -102,7 +102,11 @@ CLEANUP_ENABLED = os.getenv("CLEANUP_ENABLED", "True").lower() == "true"
 CLEANUP_INTERVAL_HOURS = int(os.getenv("CLEANUP_INTERVAL_HOURS", "24"))
 
 # Auth policy
-PASSWORD_MIN_LENGTH = 8
+# Lunghezza minima della password. Resta 8 per chiunque non la cambi; Vergilius
+# la abbassa nel profilo locale (vergilius.env) perche' il primo avvio propone
+# admin/admin su 127.0.0.1 e la schermata di login avvisa di cambiarla se il
+# programma viene esposto in rete.
+PASSWORD_MIN_LENGTH = max(1, int(os.getenv("ODYSSEUS_PASSWORD_MIN_LENGTH", "8") or 8))
 
 # Default parameters
 DEFAULT_TEMPERATURE = 1.0

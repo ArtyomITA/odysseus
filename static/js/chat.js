@@ -8,7 +8,7 @@
 import Storage from './storage.js';
 import uiModule from './ui.js';
 import sessionModule from './sessions.js';
-import chatRenderer from './chatRenderer.js?v=20260722emailfastindex1';
+import chatRenderer from './chatRenderer.js?v=20260826emotionname1';
 import chatStream from './chatStream.js';
 import { addAITTSButton } from './tts-ai.js';
 import markdownModule from './markdown.js';
@@ -1680,6 +1680,22 @@ import { wireArrowUpRecall, getUserMessagesFromChatHistory } from './composerArr
 	      }
 	      fd.append('mode', isAgentMode ? 'agent' : 'chat');
 	      fd.append('plan_mode', isPlanMode ? 'true' : 'false');
+	      // Vergilius: with the ShadowBroker workspace open, the turn is about
+	      // that map. The backend narrows the toolset to the OSINT ones so a
+	      // small model doesn't reach for PowerShell to answer "what's
+	      // happening in Ukraine".
+	      try {
+	        if (window.OdysseusShadowBroker?.modoAttivo()) fd.append('osint_mode', 'true');
+	        if (window.OdysseusShadowBroker?.financialAttivo()) fd.append('financial_mode', 'true');
+	        // Vergilius: la vista deriva dal MODELLO (ling-vista = Ling + occhi
+	        // Holo), non da un toggle. Computer/Browser nel menu "+" scelgono
+	        // quali tool di azione forzare insieme agli occhi.
+	        if (window.OdysseusVista?.attiva()) {
+	          fd.append('vista_mode', 'true');
+	          if (window.OdysseusVista.computer()) fd.append('computer_mode', 'true');
+	          if (window.OdysseusVista.browser()) fd.append('browser_mode', 'true');
+	        }
+	      } catch (_) { /* pannello non caricato */ }
 	      if (!isPlanMode && _pendingApprovedPlan) {
 	        fd.append('approved_plan', _pendingApprovedPlan.slice(0, 8192));
 	        _pendingApprovedPlan = '';
@@ -2145,21 +2161,55 @@ import { wireArrowUpRecall, getUserMessagesFromChatHistory } from './composerArr
           return;
         }
 
-        // If thinking is still streaming (unclosed <think>), show indicator instead of raw text
+        // If thinking is still streaming (unclosed <think>), show a collapsible
+        // "Thinking (N lines)" section instead of raw text. The section is built
+        // ONCE and then updated in place — rebuilding it with innerHTML on every
+        // chunk would wipe the user's expanded/collapsed choice mid-stream.
+        // Expand/collapse itself is handled by the document-level delegated
+        // .thinking-header click handler in markdown.js, so re-created nodes
+        // can never orphan the listener. If the live thinking box from the
+        // delta handler is already present, its header/inner are reused
+        // (same classes) instead of being destroyed.
         if (markdownModule.hasUnclosedThinkTag && markdownModule.hasUnclosedThinkTag(dt)) {
           const thinkStart = dt.search(/<(?:think(?:ing)?|thought)(?:\s+[^>]*)?>|<\|channel>thought/i);
-          const thinkContent = dt.substring(Math.max(thinkStart, 0))
+          const thinkText = dt.substring(Math.max(thinkStart, 0))
             .replace(/<(?:think(?:ing)?|thought)(?:\s+[^>]*)?>|<\|channel>thought\s*\n?/i, '')
             .replace(/<channel\|>/gi, '')
             .trim();
-          const lines = thinkContent.split('\n').length;
+          const lines = thinkText.split('\n').length;
+          const thinkLabel = 'Thinking' + (lines > 1 ? ` (${lines} lines)` : '');
           // Don't show beforeThink text during streaming — it'll appear in the final render
           // This prevents the "split into two" duplication
-          contentEl.innerHTML =
-            '<div class="thinking-section"><div class="thinking-header"><div class="thinking-header-left">Thinking' +
-            (lines > 1 ? ` (${lines} lines)` : '') + '</div></div></div>';
-          // The stream renderer self-heals when it next sees this overwritten
-          // container (streamingRenderer.js), so no explicit reset is needed here.
+          let thinkSec = contentEl.querySelector(':scope > .thinking-section');
+          let thinkHdrLabel = thinkSec && thinkSec.querySelector('.thinking-header-left span');
+          let thinkSecInner = thinkSec && thinkSec.querySelector('.thinking-content-inner');
+          if (!thinkSec || !thinkHdrLabel || !thinkSecInner) {
+            const streamThinkId = 'stream-think-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+            contentEl.innerHTML =
+              '<div class="thinking-section">' +
+                '<div class="thinking-header" data-thinking-id="' + streamThinkId + '">' +
+                  '<div class="thinking-header-left"><span>' + thinkLabel + '</span></div>' +
+                  '<div style="display:flex;align-items:center;gap:6px;"><span class="thinking-toggle" id="' + streamThinkId + '-toggle"></span></div>' +
+                '</div>' +
+                '<div class="thinking-content" id="' + streamThinkId + '">' +
+                  '<div class="thinking-content-inner"></div>' +
+                '</div>' +
+              '</div>';
+            // The stream renderer self-heals when it next sees this overwritten
+            // container (streamingRenderer.js), so no explicit reset is needed here.
+            thinkSec = contentEl.querySelector(':scope > .thinking-section');
+            thinkHdrLabel = thinkSec.querySelector('.thinking-header-left span');
+            thinkSecInner = thinkSec.querySelector('.thinking-content-inner');
+          }
+          thinkHdrLabel.textContent = thinkLabel;
+          thinkSecInner.innerHTML = markdownModule.mdToHtml(thinkText);
+          // If the user expanded the box, keep it following the newest thinking
+          // text unless they scrolled up to read something.
+          const thinkSecContent = thinkSec.querySelector('.thinking-content');
+          if (thinkSecContent && thinkSecContent.classList.contains('expanded')) {
+            const nearBottom = thinkSecContent.scrollHeight - thinkSecContent.clientHeight - thinkSecContent.scrollTop < 80;
+            if (nearBottom) thinkSecContent.scrollTop = thinkSecContent.scrollHeight;
+          }
           uiModule.scrollHistory();
           return;
         }
@@ -2235,6 +2285,7 @@ import { wireArrowUpRecall, getUserMessagesFromChatHistory } from './composerArr
 
             if (data === '[DONE]') {
               _streamSawDone = true;
+              if (!_isBg) window.OdysseusAvatar?.handleStreamEnd();
               // Always update background map if entry exists (even if user switched back)
               var bgDone = _backgroundStreams.get(streamSessionId);
               if (bgDone && !_isBg) {
@@ -2316,6 +2367,7 @@ import { wireArrowUpRecall, getUserMessagesFromChatHistory } from './composerArr
                 typewriterInto(roundHolder.querySelector('.body'), errMsg);
                 break;
               }
+              if (!_isBg) window.OdysseusAvatar?.handleStreamEvent(json);
               if (json.delta || json.type === 'agent_prep' || json.type === 'generated_image' || json.type === 'tool_start' || json.type === 'tool_output' || json.type === 'tool_progress' || json.type === 'agent_step' || json.type === 'loop_breaker_triggered' || json.type === 'intent_nudge_exhausted' || json.type === 'doc_stream_open' || json.type === 'doc_stream_delta' || json.type === 'research_progress') {
                 clearResponseTimeout();
                 clearProcessingProbe();
@@ -2599,8 +2651,14 @@ import { wireArrowUpRecall, getUserMessagesFromChatHistory } from './composerArr
                   if (spinner && spinner.element) spinner.destroy();
                   _renderStream();
                   _scheduleThinkingSpinner();
-                  // Feed streaming TTS with accumulated text
-                  if (streamingTTS) window.aiTTSManager.streamingUpdate(roundText);
+                  // Feed streaming TTS with the WHOLE message, not roundText.
+                  // The manager keeps one character offset for the turn, but
+                  // roundText is reset to '' at every agent round while the
+                  // offset is not — so after the first round the offset pointed
+                  // past the new round's text and everything from there on was
+                  // silently skipped. streamingEnd() is handed `accumulated`,
+                  // so the offset has to be measured against the same string.
+                  if (streamingTTS) window.aiTTSManager.streamingUpdate(accumulated);
                 }
               } else if (json.type === 'research_progress') {
                 if (_isBg) continue; // Skip DOM updates in background
@@ -3610,6 +3668,7 @@ import { wireArrowUpRecall, getUserMessagesFromChatHistory } from './composerArr
           });
         }
         if (markdownModule.renderMermaid) markdownModule.renderMermaid(roundHolder);
+        window.OdysseusCharts?.renderCharts(roundHolder);
 
         uiModule.scrollHistory();
         // Render RAG sources if present

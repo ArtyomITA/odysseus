@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -77,11 +78,35 @@ _BUILTIN_SERVERS = {
 }
 
 # NPX-based built-in servers (run via npx, not Python)
+#
+# Flags are tuned for a small local model with a ~48k window, where Playwright's
+# defaults are ruinous (measured elsewhere at ~114k tokens for a 10-step task):
+#   --caps vision      REMOVED: adds 6 coordinate-based tools, worse than the
+#                      ref-based ones for a small model, and every screenshot
+#                      costs thousands of tokens.
+#   --snapshot-mode none   default "full" re-snapshots the page after EVERY
+#                      action; the model asks for a snapshot when it needs one.
+#   --output-mode file REMOVED (22 ago 2026): Playwright MCP 0.0.79 non accetta
+#                      piu' il flag ("error: unknown option '--output-mode'") e
+#                      il server moriva in avvio: niente browser per il modello.
+#                      La versione attuale scrive comunque gli output su disco
+#                      (--output-dir, default tmp); il flag era diventato
+#                      ridondante. Vergilius: verificato con --help della
+#                      versione scaricata da npx.
+#   --image-responses omit / --isolated   no images back, ephemeral profile.
+PLAYWRIGHT_MCP_PACKAGE = "@playwright/mcp@0.0.79"
+
 _BUILTIN_NPX_SERVERS = {
     "builtin_browser": {
         "name": "Built-in: Browser",
         "command": "npx",
-        "args": ["-y", "@playwright/mcp@latest", "--headless", "--caps", "vision"],
+        "args": [
+            "-y", PLAYWRIGHT_MCP_PACKAGE,
+            "--headless",
+            "--isolated",
+            "--snapshot-mode", "none",
+            "--image-responses", "omit",
+        ],
     }
 }
 
@@ -118,6 +143,22 @@ def _find_browser_executable() -> str:
         path = shutil.which(name)
         if path:
             return path
+    if IS_WINDOWS:
+        roots = (
+            os.environ.get("PROGRAMFILES", ""),
+            os.environ.get("PROGRAMFILES(X86)", ""),
+            os.environ.get("LOCALAPPDATA", ""),
+        )
+        relative_candidates = (
+            os.path.join("Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join("Microsoft", "Edge", "Application", "msedge.exe"),
+            os.path.join("Chromium", "Application", "chrome.exe"),
+        )
+        for root in roots:
+            for relative in relative_candidates:
+                candidate = os.path.join(root, relative) if root else ""
+                if candidate and os.path.isfile(candidate):
+                    return candidate
     for candidate in (
         "/opt/google/chrome/chrome",
         "/usr/bin/google-chrome",
@@ -127,6 +168,86 @@ def _find_browser_executable() -> str:
         if os.path.isfile(candidate):
             return candidate
     return ""
+
+
+# Vergilius (23 ago 2026): consenso cookie risolto A MONTE, non dal modello.
+# Un profilo `--isolated` e' vergine ad ogni avvio: Google/YouTube mostrano
+# SEMPRE "Prima di continuare" e il backdrop del dialog intercetta i click
+# (misurato: 4 click falliti su "Home", 2 turni da 500 e 400 s senza mai
+# leggere la pagina). Due livelli:
+#   1. `--storage-state`: cookie `SOCS=CAI` su .youtube.com/.google.*: e' lo
+#      stesso che imposta yt-dlp ("accept all"); il dialog non compare proprio.
+#   2. `--init-script`: per tutti gli altri CMP (OneTrust, Didomi, ...) un
+#      MutationObserver clicca UNA volta il bottone "Rifiuta tutto"/"Reject
+#      all" (preferito) o "Accetta tutto"/"Accept all", poi si spegne.
+# Spegnibile con ODYSSEUS_BROWSER_CONSENT=0. I file vivono in DATA_DIR/local
+# e vengono rigenerati se mancano (il contenuto e' versionato qui sotto).
+_CONSENT_COOKIE_DOMAINS = (".youtube.com", ".google.com", ".google.it")
+_CONSENT_INIT_SCRIPT = r"""(() => {
+  if (window.__vergiliusConsentDone) return;
+  const REJECT = [/^rifiuta tutto$/i, /^reject all$/i, /^rifiuta$/i, /^reject$/i,
+    /^decline all$/i, /^rifiuta tutti$/i, /^solo (i )?necessari/i, /^only necessary/i,
+    /^continua senza accettare/i, /^continue without accepting/i, /^alle ablehnen$/i,
+    /^tout refuser$/i, /^rechazar todo$/i];
+  const ACCEPT = [/^accetta tutto$/i, /^accept all$/i, /^accetta tutti$/i, /^accetta$/i,
+    /^accept$/i, /^i agree$/i, /^agree$/i, /^consenti$/i, /^ok,? capito$/i, /^got it$/i,
+    /^alle akzeptieren$/i, /^tout accepter$/i, /^aceptar todo$/i];
+  const label = (el) => (el.innerText || el.textContent || el.getAttribute('aria-label') || '').trim().replace(/\s+/g, ' ');
+  const visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const find = (pats) => {
+    const nodes = document.querySelectorAll('button, [role="button"], input[type="button"], input[type="submit"], a');
+    for (const el of nodes) {
+      const t = el.tagName === 'INPUT' ? (el.value || '') : label(el);
+      if (t && t.length < 40 && visible(el) && pats.some((p) => p.test(t))) return el;
+    }
+    return null;
+  };
+  let tries = 0;
+  const attempt = () => {
+    if (window.__vergiliusConsentDone) return true;
+    const el = find(REJECT) || find(ACCEPT);
+    if (el) { window.__vergiliusConsentDone = true; try { el.click(); } catch (e) {} return true; }
+    return false;
+  };
+  const obs = new MutationObserver(() => { if (attempt() || ++tries > 400) obs.disconnect(); });
+  const start = () => {
+    if (attempt()) return;
+    obs.observe(document.documentElement, { childList: true, subtree: true });
+    setTimeout(() => obs.disconnect(), 15000);
+  };
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, { once: true });
+  else start();
+})();"""
+
+
+def _browser_consent_files(base_dir: str | None = None) -> tuple[str, str] | None:
+    """Create (once) and return the consent storage-state + init-script paths."""
+    try:
+        import json as _json
+        import time as _time
+        from src.constants import DATA_DIR
+        root = os.path.join(base_dir or os.environ.get("ODYSSEUS_DATA_DIR") or DATA_DIR, "local")
+        os.makedirs(root, exist_ok=True)
+        state_path = os.path.join(root, "browser-consent-state.json")
+        script_path = os.path.join(root, "browser-consent-init.js")
+        if not os.path.exists(state_path):
+            expires = int(_time.time()) + 390 * 24 * 3600  # ~13 mesi, come Google
+            cookies = [
+                {
+                    "name": "SOCS", "value": "CAI", "domain": d, "path": "/",
+                    "expires": expires, "httpOnly": False, "secure": True, "sameSite": "Lax",
+                }
+                for d in _CONSENT_COOKIE_DOMAINS
+            ]
+            with open(state_path, "w", encoding="utf-8") as fh:
+                _json.dump({"cookies": cookies, "origins": []}, fh, indent=1)
+        if not os.path.exists(script_path) or open(script_path, encoding="utf-8").read() != _CONSENT_INIT_SCRIPT:
+            with open(script_path, "w", encoding="utf-8") as fh:
+                fh.write(_CONSENT_INIT_SCRIPT)
+        return state_path, script_path
+    except Exception as exc:  # mai bloccare l'avvio del browser per il consenso
+        logger.warning("browser consent files unavailable: %s", exc)
+        return None
 
 
 def _browser_mcp_args(args: list[str]) -> list[str]:
@@ -142,6 +263,16 @@ def _browser_mcp_args(args: list[str]) -> list[str]:
     if os.environ.get("ODYSSEUS_BROWSER_NO_SANDBOX", "1").lower() not in ("0", "false", "no"):
         if "--no-sandbox" not in out and "--sandbox" not in out:
             out.append("--no-sandbox")
+    if os.environ.get("ODYSSEUS_BROWSER_CONSENT", "1").lower() not in ("0", "false", "no"):
+        files = _browser_consent_files()
+        if files:
+            state_path, script_path = files
+            # `--storage-state` vale solo per i contesti isolati; con un profilo
+            # persistente i cookie restano da soli.
+            if "--storage-state" not in out and "--isolated" in out:
+                out.extend(["--storage-state", state_path])
+            if "--init-script" not in out:
+                out.extend(["--init-script", script_path])
     return out
 
 
@@ -230,10 +361,16 @@ async def register_builtin_servers(mcp_manager):
                         os.path.join(base_dir, "data", "local", "playwright-mcp-cache"),
                     )
                     os.makedirs(cache_home, exist_ok=True)
-                    env = {
-                        "XDG_CACHE_HOME": cache_home,
-                        "PLAYWRIGHT_BROWSERS_PATH": os.path.join(cache_home, "browsers"),
-                    }
+                    env = {"XDG_CACHE_HOME": cache_home}
+                    # Do not force Playwright into a private empty browser
+                    # directory.  A user may opt into a managed cache, while
+                    # the default either uses the detected Chrome/Edge
+                    # executable or Playwright's normal platform cache.
+                    browsers_path = os.environ.get(
+                        "ODYSSEUS_PLAYWRIGHT_BROWSERS_PATH", ""
+                    ).strip()
+                    if browsers_path:
+                        env["PLAYWRIGHT_BROWSERS_PATH"] = browsers_path
                 ok = await mcp_manager.connect_server(
                     server_id=server_id,
                     name=cfg["name"],
@@ -323,27 +460,43 @@ async def _is_npx_package_cached(npx_path, package_spec, timeout_s=5):
 
 def _is_package_in_npx_cache(package_spec):
     """Return True when npm's `_npx` cache already contains package_spec."""
-    package_name = _npx_package_name(package_spec)
+    package_name, package_version = _npx_package_identity(package_spec)
     if not package_name:
         return False
 
     for cache_root in _npm_cache_roots():
         npx_root = os.path.join(cache_root, "_npx")
-        if _npx_cache_contains_package(npx_root, package_name):
+        if _npx_cache_contains_package(npx_root, package_name, package_version):
             return True
     return False
 
 
 def _npx_package_name(package_spec):
     """Strip a version/range suffix from an npm package spec."""
+    return _npx_package_identity(package_spec)[0]
+
+
+def _npx_package_identity(package_spec):
+    """Return ``(name, exact_version)`` for an npm package spec.
+
+    Tags/ranges such as ``latest`` intentionally accept any cached version;
+    an exact pin must match the package.json version as well as its name.
+    """
     if not package_spec:
-        return ""
-    if package_spec.startswith("@"):
-        parts = package_spec.split("@", 2)
-        if len(parts) >= 3:
-            return f"@{parts[1]}"
-        return package_spec
-    return package_spec.split("@", 1)[0]
+        return "", ""
+    spec = str(package_spec).strip()
+    if spec.startswith("@"):
+        split_at = spec.rfind("@")
+        if split_at > 0:
+            name, requested = spec[:split_at], spec[split_at + 1:]
+        else:
+            name, requested = spec, ""
+    else:
+        name, sep, requested = spec.partition("@")
+        if not sep:
+            requested = ""
+    exact = requested if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", requested) else ""
+    return name, exact
 
 
 def _npm_cache_roots():
@@ -358,7 +511,7 @@ def _npm_cache_roots():
     return list(dict.fromkeys(roots))
 
 
-def _npx_cache_contains_package(npx_root, package_name):
+def _npx_cache_contains_package(npx_root, package_name, package_version=""):
     if not os.path.isdir(npx_root):
         return False
     package_path = os.path.join("node_modules", *package_name.split("/"), "package.json")
@@ -371,16 +524,29 @@ def _npx_cache_contains_package(npx_root, package_name):
             is_dir = entry.is_dir()
         except OSError:
             continue
-        cached_name = _cached_package_name(os.path.join(entry.path, package_path))
-        if is_dir and cached_name == package_name:
+        cached_name, cached_version = _cached_package_identity(
+            os.path.join(entry.path, package_path)
+        )
+        if (
+            is_dir
+            and cached_name == package_name
+            and (not package_version or cached_version == package_version)
+        ):
             return True
     return False
 
 
 def _cached_package_name(package_json_path):
+    return _cached_package_identity(package_json_path)[0]
+
+
+def _cached_package_identity(package_json_path):
     try:
         with open(package_json_path, encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, ValueError):
-        return ""
-    return str(data.get("name", "")).strip()
+        return "", ""
+    return (
+        str(data.get("name", "")).strip(),
+        str(data.get("version", "")).strip(),
+    )

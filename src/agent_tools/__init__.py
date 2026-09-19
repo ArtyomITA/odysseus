@@ -67,6 +67,40 @@ TOOL_HANDLERS = {
 # Config/integration admin tools (manage_endpoints/mcp/webhooks/tokens/settings).
 TOOL_HANDLERS.update(ADMIN_TOOL_HANDLERS)
 
+# Browser automation uses a small adapter surface instead of exposing every
+# Playwright MCP schema at once.  The raw specialist tools remain unlockable
+# through browser_more.
+try:
+    from .browser_tools import BROWSER_TOOL_HANDLERS, BROWSER_CORE_TOOL_NAMES
+    TOOL_HANDLERS.update(BROWSER_TOOL_HANDLERS)
+except Exception as _e:  # pragma: no cover
+    logger.warning("Browser adapters not loaded: %s", _e)
+    BROWSER_TOOL_HANDLERS = {}
+    BROWSER_CORE_TOOL_NAMES = frozenset()
+
+# Vergilius: strumenti OSINT (ShadowBroker). L'import e' protetto perche'
+# ShadowBroker e' un servizio esterno opzionale: se il modulo non carica,
+# Odysseus deve partire lo stesso senza quegli strumenti.
+try:
+    from .shadowbroker_tools import (
+        SHADOWBROKER_TOOL_HANDLERS, OSINT_TOOL_NAMES, FINANCE_TOOL_NAMES,
+    )
+    TOOL_HANDLERS.update(SHADOWBROKER_TOOL_HANDLERS)
+except Exception as _e:  # pragma: no cover
+    import logging as _logging
+    _logging.getLogger(__name__).warning("Strumenti OSINT non caricati: %s", _e)
+    OSINT_TOOL_NAMES = frozenset()
+    FINANCE_TOOL_NAMES = frozenset()
+
+# Vergilius: gli occhi (Holo via llama-server CPU). Stesso import protetto.
+try:
+    from .vista_tools import VISTA_TOOL_HANDLERS, VISTA_TOOL_NAMES
+    TOOL_HANDLERS.update(VISTA_TOOL_HANDLERS)
+except Exception as _e:  # pragma: no cover
+    import logging as _logging
+    _logging.getLogger(__name__).warning("Strumenti vista non caricati: %s", _e)
+    VISTA_TOOL_NAMES = frozenset()
+
 # ---------------------------------------------------------------------------
 # Constants (re-exported for backward compatibility — single source of truth
 # is src.constants; always prefer importing from there for new code)
@@ -92,6 +126,11 @@ TOOL_TAGS = {"bash", "python", "web_search", "web_fetch", "read_file", "write_fi
              "manage_tokens", "manage_documents", "manage_settings",
              "manage_notes", "manage_calendar",
              "resolve_contact", "manage_contact",
+             # Vergilius: OSINT / ShadowBroker (elenco letterale sostituito
+             # dall'unione derivata qui sotto — vedi commento dopo il set)
+             "osint_situazione", "osint_notizie", "osint_militare", "osint_allerte",
+             "osint_zona", "osint_dettaglio", "osint_cerca",
+             "osint_recon", "osint_mappa",
              # Email tool names come from BUILTIN_EMAIL_TOOLS (unioned below)
              # so the fence regex, dispatch, and non-admin blocklist all cover
              # the same set.
@@ -113,6 +152,15 @@ TOOL_TAGS = {"bash", "python", "web_search", "web_fetch", "read_file", "write_fi
              # there's no named tool wrapper for the action.
              "app_api"} | BUILTIN_EMAIL_TOOLS
 
+# Vergilius: i nomi ShadowBroker/finanza derivati DAGLI HANDLER, non a mano.
+# Il bug pagato: i tool `fin_*` esistevano, il modello li CHIAMAVA, e il
+# convertitore li buttava come "Unknown function call" perche' mancavano da
+# questo set — fallimento silenzioso, zero errori visibili, il turno moriva
+# in prosa. Derivandoli, il prossimo strumento registrato negli handler e'
+# automaticamente riconosciuto anche qui.
+TOOL_TAGS |= {n for n in TOOL_HANDLERS if n.startswith(("osint_", "fin_", "vista_"))}
+TOOL_TAGS |= set(BROWSER_TOOL_HANDLERS)
+
 ToolBlock = namedtuple("ToolBlock", ["tool_type", "content"])
 
 # ---------------------------------------------------------------------------
@@ -122,6 +170,8 @@ ToolBlock = namedtuple("ToolBlock", ["tool_type", "content"])
 # Parsing
 from src.tool_parsing import (  # noqa: E402, F401
     parse_tool_blocks,
+    parse_reasoning_tool_blocks,
+    parse_reasoning_tool_calls,
     strip_tool_blocks,
     _TOOL_NAME_MAP,
     _TOOL_BLOCK_RE,

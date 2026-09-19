@@ -9,10 +9,19 @@ The LLM decides when to use tools by writing fenced code blocks.
 import asyncio
 import collections
 import json
+import os as _os
 import re
 import time
 import logging
-from typing import AsyncGenerator, List, Dict, Optional, Set
+from typing import Any, AsyncGenerator, List, Dict, Optional, Set
+
+# Onda 4 / E06: set di tool congelato per sessione (session_id -> lista ordinata)
+# e flag admin congelato (session_id -> bool): `_needs_admin` cambia tra i turni e
+# aggiunge/toglie i 5 `_ADMIN_TOOLS` sia negli schemi sia nella prosa del system
+# (misurato: 12 <-> 17 tool, prefisso rotto anche col set congelato, dump-B3).
+# Vivono per il processo; si svuotano al riavvio. Vedi il blocco [tool-freeze].
+_SESSION_TOOLSET: Dict[str, List[str]] = {}
+_SESSION_ADMIN: Dict[str, bool] = {}
 from urllib.parse import urlparse
 
 from src.llm_core import (
@@ -28,6 +37,7 @@ from src.tool_policy import GUIDE_ONLY_DIRECTIVE, WEB_TOOL_NAMES, ToolPolicy
 from src.tool_utils import _truncate, get_mcp_manager
 from src.agent_tools import (
     parse_tool_blocks,
+    parse_reasoning_tool_calls,
     strip_tool_blocks,
     execute_tool_block,
     format_tool_result,
@@ -42,30 +52,88 @@ from src.agent_tools import (
 
 logger = logging.getLogger(__name__)
 
-_BROWSER_MCP_PREFIX = "mcp__builtin_browser__"
+from src.browser_tooling_constants import (
+    browser_adapters_disabled_by_raw,
+    BROWSER_CORE_ORDER,
+    BROWSER_CORE_TOOL_NAMES,
+    BROWSER_MCP_PREFIX as _BROWSER_MCP_PREFIX,
+)
 
 
-def _expand_browser_mcp_tools(tool_names: Set[str], mcp_mgr) -> Set[str]:
-    """Expand browser intent to every connected Playwright MCP tool.
+def _select_browser_core_tools(tool_names: Set[str], mcp_mgr=None) -> Set[str]:
+    """Replace browser markers/raw hits with the stable adapter core.
 
-    Playwright MCP tool names can change between releases (for example
-    browser_click vs browser_mouse_down). Route-level intent only needs to say
-    "browser"; the final prompt/schema set should use the names the connected
-    MCP server actually exposed.
+    Raw specialist tools are added later only after ``browser_more`` succeeds.
+    This one-time normalization therefore cannot erase a deliberate unlock.
+    ``mcp_mgr`` remains an accepted compatibility argument for older tests.
     """
     names = set(tool_names or set())
-    if not mcp_mgr:
+    if not any(
+        name == "builtin_browser"
+        or name in BROWSER_CORE_TOOL_NAMES
+        or name.startswith(_BROWSER_MCP_PREFIX)
+        for name in names
+    ):
         return names
-    if not any(name == "builtin_browser" or name.startswith(_BROWSER_MCP_PREFIX) for name in names):
+    names.discard("builtin_browser")
+    names = {name for name in names if not name.startswith(_BROWSER_MCP_PREFIX)}
+    names.update(BROWSER_CORE_TOOL_NAMES)
+    return names
+
+
+def _minimal_persona_messages(messages: List[Dict], last_user: str) -> List[Dict]:
+    """Fast-path chat that still keeps the trusted preset/persona contract."""
+    system_messages = [
+        {"role": "system", "content": msg.get("content")}
+        for msg in (messages or [])
+        if msg.get("role") == "system"
+        and isinstance(msg.get("content"), str)
+        and msg.get("content").strip()
+    ]
+    return system_messages + [{"role": "user", "content": last_user}]
+
+
+# Tools whose only output is an image. A text-only model cannot read them: it
+# gets a token-expensive blob it will either ignore or hallucinate about. Bare
+# names, because MCP qualified names embed a per-install server id
+# (mcp__<server_id>__<tool>).
+_IMAGE_ONLY_TOOL_NAMES = frozenset({
+    "Screenshot",              # Windows-MCP: full screen / window capture
+    "browser_take_screenshot",  # Playwright MCP
+})
+
+
+def _drop_image_only_tools(tool_names: Set[str], endpoint_url: str, model: str) -> Set[str]:
+    """Hide screenshot tools from a model that has no vision projector.
+
+    Vergilius runs the same GGUF with and without an mmproj (`qwenpaw` vs
+    `qwenpaw-vista`), so "can this model see?" is a per-profile runtime fact,
+    not a property of the weights. When llama.cpp reports modalities.vision =
+    false there is no point offering a camera: both the accessibility tree
+    (`Snapshot`) and the DOM (`browser_snapshot`) stay available and are
+    cheaper anyway.
+
+    Only filters on a definite negative. `supports_vision` returns None for a
+    non-llama-swap endpoint AND for a profile that simply isn't loaded yet —
+    both mean "unknown", and an unknown must never take the camera away from
+    `qwenpaw-vista` just because its process happens to be down. Deliberately
+    does not use `model_supports_vision`, whose name-based fallback answers
+    False for every profile we run.
+    """
+    names = set(tool_names or set())
+    if not names:
         return names
     try:
-        for tool in mcp_mgr.get_all_tools():
-            if tool.get("server_id") == "builtin_browser" and not tool.get("is_disabled"):
-                qualified = tool.get("qualified_name")
-                if qualified:
-                    names.add(qualified)
+        from src.llamaswap import supports_vision
+        if supports_vision(endpoint_url or "", model or "") is not False:
+            return names
     except Exception as exc:
-        logger.warning("Failed to expand browser MCP tools: %s", exc)
+        logger.warning("[vision-gate] capability check failed, keeping tools: %s", exc)
+        return names
+    removed = {n for n in names if n.rsplit("__", 1)[-1] in _IMAGE_ONLY_TOOL_NAMES}
+    if removed:
+        names -= removed
+        logger.info("[vision-gate] %s has no vision; dropped %s", model, sorted(removed))
     return names
 
 
@@ -415,6 +483,8 @@ _API_AGENT_RULES = """\
 - Only call tools when they materially help answer the request. For casual messages like "test", "yo", "thanks", answer normally.
 - You MUST use tools to take action; do not claim you did something without a tool result.
 - If a needed tool/domain is missing from this turn, say what is missing briefly instead of pretending.
+- Desktop/browser/shell tools overlap. Use `browser_open/read/find/click/type/back` for web pages; use desktop Snapshot/Click only for desktop applications.
+- Browser actions use exact refs returned by the latest tree. Prefer `browser_find` for a specific item; never invent a selector or prose target. Use `browser_more` only for an uncommon specialist category.
 - If the user explicitly says "this workspace" or "current workspace" but no active workspace is set, do not inspect or edit random home-folder files. Tell them to set one with `/workspace pick` or `/workspace set /absolute/path`.
 - Keep answers concise unless the user asks for depth.
 - After a tool succeeds, do not second-guess it; reply with one short confirmation unless more work remains.
@@ -436,7 +506,316 @@ When referencing app entities by id, use clickable markdown anchors:
 - Research jobs: `[Topic](#research-<session_id>)`
 """
 
+# Onda 4 / H3 (27 ago 2026, ricerca 37): regole di ancoraggio ai dati. Testo
+# STATICO (niente timestamp: il prefisso KV deve restare byte-identico tra i
+# turni; la data sta gia' nel messaggio user di contesto). Solo con
+# ODYSSEUS_GROUNDING_RULES=1. Da sole non bastano (ToolFailBench: Tool-Skip
+# 20-28% anche con "do not answer from memory"), sono la base su cui agisce
+# il `tool_choice=required` delle domande fresche (ODYSSEUS_FRESH_REQUIRED).
+_GROUNDING_RULES = """\
+## Grounding rules
+- Never invent data. Prices, quotes, percentages, dates, headlines, who holds an office and anything "today", "latest" or "current" must come from a tool result in this conversation. If you have no such result yet, call the tool before answering.
+- If no available tool can provide the data, or the tool call fails or returns nothing useful, say so plainly in one sentence and stop; do not fill the gap with plausible numbers, sample data or memory.
+- If you are not sure, say you are not sure. "I do not have that data" is always a better answer than a guess.
+- Report numbers exactly as the tool returned them; do not round, convert or extrapolate them.
+"""
+
+
+def _grounding_rules_block() -> list:
+    return [_GROUNDING_RULES] if _os.getenv("ODYSSEUS_GROUNDING_RULES", "0") == "1" else []
+
+
+# Onda 4 / H1a (ricerca 37, S2 "solo lessico"): domanda che chiede un dato
+# fresco (prezzi, notizie, oggi/ultime, chi guida X) + almeno uno strumento
+# fin_/osint_/web tra quelli inviati -> `tool_choice=required` al PRIMO giro.
+# Non tocca il set di tool ne' il prompt: il prefisso KV resta identico.
+_FRESH_RE = re.compile(
+    r"(?i)(?<![\w'])("
+    r"oggi|adesso|stamattina|stasera|stanotte|ieri|domani|"
+    r"attual\w*|corrent\w*|ultim[aeio]\w*|recent[ei]\w*|novit[aà]\w*|aggiornat\w*|"
+    r"in questo momento|al momento|a che punto|quest[ao] (?:settimana|mese|anno)|(?:in |la |le |alla )bors[ae]|"
+    r"quanto (?:sta|vale|costa|quota|rende)|prezz\w*|quotazion\w*|listino|"
+    r"notizi[ae]|news|titoli di (?:oggi|giornata)|meteo|previsioni|"
+    r"chi (?:guida|dirige|comanda|presiede|e'|è|governa)\b|"
+    r"today|tonight|yesterday|now|current\w*|latest|recent\w*|breaking|price[sd]?|quote[sd]?|"
+    r"how (?:is|are) .{0,20}\b(?:doing|going)|who (?:is|leads|runs|heads)"
+    r")(?![\w'])"
+)
+
+
+def _fresh_data_question(text: str) -> bool:
+    return bool(text) and bool(_FRESH_RE.search(str(text)))
+
+
+def _is_fresh_data_tool(name: str) -> bool:
+    n = str(name or "")
+    return n.startswith(("fin_", "osint_")) or n in {"web_search", "web_fetch"}
+
+
+def _last_user_text(messages) -> str:
+    for m in reversed(messages or []):
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if isinstance(c, list):
+            c = " ".join(str(p.get("text") or "") for p in c if isinstance(p, dict))
+        c = str(c or "")
+        _cl = c.lstrip()
+        # messaggi automatici dell'harness, non domande dell'utente: contesto data/ora,
+        # nudge, rilancio grounding. Senza questo filtro le "entita'" venivano estratte dal
+        # testo del rilancio stesso ('Grounding', 'Rewrite', 'ONLY', 'Automated').
+        if _cl.startswith(("[Context", "[Grounding check]", "[ERROR]")) or "(Automated message" in c:
+            continue
+        return c
+    return ""
+
+
+# Onda 4 / E12 (27 ago 2026): dedup delle chiamate identiche nello stesso
+# turno. Baseline: `osint_notizie` x4-5 con gli stessi argomenti in un turno,
+# in ogni braccio misurato. Solo strumenti di lettura idempotenti; il
+# risultato viene ripetuto con una nota, nessuna esecuzione.
+_DEDUP_TOOLS_EXACT = {"web_search", "web_fetch", "read_file", "grep", "glob", "browser_read"}
+_DEDUP_NOTE = ("[Note: this exact call was already executed earlier in this turn; "
+               "its result is repeated below unchanged. Do not call it again with the same arguments.]\n")
+
+
+_SESSION_TOOL_CACHE: Dict[str, Dict[str, tuple]] = {}   # Onda 4 / E16: session -> key -> (ts, desc, result)
+_CACHE_NOTE = ("[Note: identical call already executed {age}s ago in this conversation; cached result "
+               "repeated below, not refreshed. Do not call it again with the same arguments.]\n")
+
+
+def _tool_cache_ttl() -> int:
+    try:
+        return int(_os.getenv("ODYSSEUS_TOOL_CACHE_TTL", "0") or 0)
+    except ValueError:
+        return 0
+
+
+def _tool_dedup_key(tool_type: str, command: str):
+    if _os.getenv("ODYSSEUS_TOOL_DEDUP", "0") != "1" and _tool_cache_ttl() <= 0:
+        return None
+    t = str(tool_type or "")
+    if not (t.startswith(("osint_", "fin_")) or t in _DEDUP_TOOLS_EXACT):
+        return None
+    c = str(command or "").strip()
+    try:
+        c = json.dumps(json.loads(c), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    except Exception:
+        c = re.sub(r"\s+", " ", c)
+    return f"{t}\x00{c}"
+
+
+def _tool_dedup_replay(entry, note: str = None):
+    import copy as _copy
+    desc, result = entry
+    note = _DEDUP_NOTE if note is None else note
+    r = _copy.deepcopy(result) if isinstance(result, dict) else {"output": str(result)}
+    for k in ("output", "response", "results", "content"):
+        v = r.get(k)
+        if isinstance(v, str) and v.strip():
+            r[k] = note + v
+            break
+    else:
+        r["output"] = note + str(r.get("output") or "")
+    r["dedup"] = True
+    return desc, r
+
+
+def _session_cache_get(session_id, key):
+    ttl = _tool_cache_ttl()
+    if ttl <= 0 or not session_id or key is None:
+        return None
+    bucket = _SESSION_TOOL_CACHE.get(session_id) or {}
+    hit = bucket.get(key)
+    if not hit:
+        return None
+    age = time.time() - hit[0]
+    if age > ttl:
+        bucket.pop(key, None)
+        return None
+    return int(age), hit[1], hit[2]
+
+
+def _session_cache_put(session_id, key, desc, result):
+    ttl = _tool_cache_ttl()
+    if ttl <= 0 or not session_id or key is None:
+        return
+    bucket = _SESSION_TOOL_CACHE.setdefault(session_id, {})
+    now = time.time()
+    for k in [k for k, v in bucket.items() if now - v[0] > ttl]:
+        bucket.pop(k, None)
+    bucket[key] = (now, desc, result)
+
+
+# Onda 4 / H4 (detector-only, 27 ago 2026): numeri nella risposta finale che
+# non compaiono in nessun output tool del turno (regola Output-Fabrication di
+# ToolFailBench / AgentLTL). Solo log, nessun retry: serve a misurare
+# Result-Ignore e Output-Fabrication nelle suite. ODYSSEUS_GROUNDING_CHECK=1.
+_GR_NUM_RE = re.compile(r"(?<![\w.,])(?:[$€£]\s?)?(\d{1,3}(?:[.,]\d{3})+(?:[.,]\d+)?|\d+[.,]\d+|\d+\s?%|\d{3,})")
+
+
+def _gr_canon(tok: str) -> str:
+    t = re.sub(r"[^\d.,]", "", tok)
+    if re.fullmatch(r"\d{1,3}(?:[.,]\d{3})+", t):        # 34.500 / 1,234,567 -> migliaia
+        return re.sub(r"[.,]", "", t)
+    if "," in t and "." in t:
+        t = t.replace(".", "").replace(",", ".") if t.rfind(",") > t.rfind(".") else t.replace(",", "")
+    else:
+        t = t.replace(",", ".")
+    if "." in t:
+        t = t.rstrip("0").rstrip(".")
+    return t
+
+
+_ENT_STOP = {"Come", "Cosa", "Quali", "Quale", "Qual", "Chi", "Che", "Quanto", "Quanta", "Quando", "Dove",
+             "Perché", "Perche", "Ciao", "Oggi", "Ieri", "Domani", "Il", "La", "Le", "Gli", "Lo", "Un", "Una",
+             "Dimmi", "Dammi", "Cercami", "Trovami", "Spiegami", "Mostrami", "What", "How", "Who", "Which", "The",
+             "Regno", "Unito", "Stati", "Uniti", "Europa", "Italia", "Borsa", "Milano", "Nel", "Nella", "Del", "Della"}
+
+
+def _grounding_entities(question: str) -> list:
+    """Entita' nominate nella domanda: parole con maiuscola (non a inizio frase, non stopword)
+    e ticker in maiuscolo di 2-5 lettere. Sono le 'targhe' che devono comparire negli output tool."""
+    q = str(question or "")
+    # note appese dall'harness al messaggio utente (tracce agente): non sono parole dell'utente.
+    # Misurato: "Guida" da "[nota di sistema: ... Guida se pertinente ...]" faceva scattare il rilancio.
+    q = re.sub(r"\[nota di sistema:.*?\]", " ", q, flags=re.S)
+    ents = []
+    for m in re.finditer(r"(?<![\w])([A-Z][a-zà-ù]{2,}|[A-Z]{2,5})(?![\w])", q):
+        w = m.group(1)
+        if w in _ENT_STOP or (m.start() == 0 and not w.isupper()):
+            continue
+        # maiuscola dopo punto/virgola a inizio frase: tienila solo se compare anche altrove o e' un ticker
+        if w not in ents:
+            ents.append(w)
+    return ents
+
+
+def _grounding_check(text: str, raw_outputs: list, question: str = None) -> dict:
+    testo = str(text or "")
+    corpus = " ".join(str(o) for o in raw_outputs if o)
+    ents = _grounding_entities(question) if question else []
+    # L'eco della richiesta non e' un dato: `"titolo_richiesto": "Leonardo"` e
+    # `"descrizione": ...` accanto a `disponibile: false` dicono solo che abbiamo
+    # CHIESTO quell'entita', non che lo strumento abbia risposto su di essa.
+    corpus_dati = corpus
+    if '"disponibile": false' in corpus.lower().replace("'", '"'):
+        corpus_dati = re.sub(r'"(?:titolo_richiesto|descrizione|alternative|avviso|motivo)"\s*:\s*(?:"[^"]*"|\{[^}]*\}|\[[^\]]*\])',
+                             "", corpus_dati)
+    corpus_low = corpus_dati.lower()
+    ent_assenti = [e for e in ents if e.lower() not in corpus_low]
+    # I numeri che l'utente ha scritto nella domanda sono dati suoi, non invenzioni del modello
+    # ("con un cambio di 0,92", "10 azioni", "5000 dollari"): regex larga, prende anche gli interi corti.
+    _q = re.sub(r"\[nota di sistema:.*?\]", " ", str(question or ""), flags=re.S)
+    corpus_canon = {_gr_canon(m.group(1)) for m in _GR_NUM_RE.finditer(corpus)}
+    corpus_canon |= {_gr_canon(x) for x in re.findall(r"\d+(?:[.,]\d+)*", _q)}
+    corpus_digits = {re.sub(r"\D", "", c) for c in corpus_canon}
+    _vals = []
+    for _c in corpus_canon:
+        try:
+            _v = float(_c)
+        except ValueError:
+            continue
+        if _v:
+            _vals.append(_v)
+    _vals = sorted(set(_vals))[:400]
+
+    def _derivato(val: float) -> bool:
+        """val ottenibile da due numeri supportati con un'operazione elementare (entro lo 0,5%)."""
+        tol = abs(val) * 0.005
+        for a in _vals:
+            for b in _vals:
+                for r in (a * b, a + b, a - b, a * b / 100.0, (a / b if b else None), (a / b * 100.0 if b else None)):
+                    if r is not None and abs(abs(r) - abs(val)) <= tol:
+                        return True
+        return False
+
+    non_sup, tot = [], 0
+    for m in _GR_NUM_RE.finditer(testo):
+        tok = m.group(1)
+        can = _gr_canon(tok)
+        dig = re.sub(r"\D", "", can)
+        if len(dig) < 3 or re.fullmatch(r"(?:19|20)\d\d", dig):   # anni, numeri corti: fuori
+            continue
+        tot += 1
+        if can in corpus_canon or dig in corpus_digits or tok in corpus:
+            continue
+        # tolleranza di arrotondamento: SOLO entro lo 0,5% del valore, non
+        # "stesse prime cifre" (H3: 210,17 passava per 210,54, due titoli diversi).
+        try:
+            val = float(can)
+        except ValueError:
+            val = None
+        if val:
+            vicino = False
+            for d in corpus_canon:
+                try:
+                    v2 = float(d)
+                except ValueError:
+                    continue
+                if v2 and abs(val - v2) <= abs(v2) * 0.005:
+                    vicino = True
+                    break
+            if vicino or _derivato(val):
+                continue
+        non_sup.append(tok)
+    return {"numeri": tot, "non_supportati": len(non_sup), "esempi": non_sup[:6],
+            "entita": ents, "entita_assenti": ent_assenti}
+
+
+# Onda 4 / E08c: coda del turno da persistire per il replay fedele (vedi
+# core/models.py get_llm_messages). Output tool troncati a
+# ODYSSEUS_HISTORY_TOOL_CHARS (1500) come faceva la storia ricostruita.
+def _history_tail_for_persist(messages) -> tuple:
+    import copy as _copy
+    idx = None
+    for k, m in enumerate(messages or []):
+        if (isinstance(m, dict) and m.get("role") == "user"
+                and str(m.get("content") or "").lstrip().startswith("[Context")
+                and "current date/time" in str(m.get("content") or "")[:120]):
+            idx = k
+    if idx is None:
+        return None, []
+    ctx = str(messages[idx].get("content") or "")
+    limit = int(_os.getenv("ODYSSEUS_HISTORY_TOOL_CHARS", "1500") or 1500)
+    # blocchi iniettati tra la fine della storia e l'utente (memorie, documento,
+    # skill, email, data/ora): tutti untrusted_context_message o "[Context".
+    start = idx
+    while start - 1 >= 0:
+        pm = messages[start - 1]
+        if not isinstance(pm, dict) or pm.get("role") != "user":
+            break
+        if pm.get("_pre"):
+            start -= 1
+        else:
+            break
+    pre = []
+    for m in messages[start:idx + 1]:
+        c = _copy.deepcopy(m)
+        c.pop("metadata", None)
+        pre.append(c)
+    tail = []
+    for m in messages[idx + 2:]:
+        if not isinstance(m, dict) or not m.get("role"):
+            continue
+        c = _copy.deepcopy(m)
+        c.pop("metadata", None)
+        if c.get("role") == "tool" and isinstance(c.get("content"), str) and len(c["content"]) > limit:
+            c["content"] = c["content"][:limit] + "\n…[output troncato]"
+        tail.append(c)
+    user_sent = None
+    if idx + 1 < len(messages) and isinstance(messages[idx + 1], dict) and messages[idx + 1].get("role") == "user":
+        user_sent = messages[idx + 1].get("content")
+    return {"ctx": ctx, "pre": pre, "user_sent": user_sent}, tail
+
+
 _DOMAIN_RULES = {
+    "browser": """\
+## Browser rules
+- Use browser_open/read/find/click/type/back for normal browsing; refs must come from the latest returned tree.
+- Prefer browser_find for a specific item and browser_read for a page overview. Never invent selectors or prose targets.
+- Use browser_more only for one uncommon specialist category; do not request it for normal navigation.
+- Screenshots are a visual fallback, not the default way to read a page.""",
     "web": """\
 ## Web rules
 - For web lookup/search/latest/current requests, use `web_search` or `web_fetch`.
@@ -498,6 +877,7 @@ _DOMAIN_RULES = {
 }
 
 _DOMAIN_TOOL_MAP = {
+    "browser": set(BROWSER_CORE_TOOL_NAMES),
     "web": set(WEB_TOOL_NAMES),
     "documents": {"create_document", "edit_document", "update_document", "suggest_document", "manage_documents"},
     "email": {"list_email_accounts", "list_emails", "read_email", "scan_email_unsubscribes", "unsubscribe_email", "send_email", "reply_to_email", "bulk_email", "archive_email", "delete_email", "mark_email_read", "resolve_contact", "manage_contact"},
@@ -569,6 +949,14 @@ Use this instead of `bash`, `curl`, `python`, `requests`, or scraping code for w
 <url or domain>
 ```
 Fetch and read the text content of a SPECIFIC URL the user names (e.g. "check example.com", "what does this page say <url>"). A bare domain like `example.com` works (defaults to https). Use this when you already have a concrete URL. For open-ended lookups use `web_search`, and for "research X" jobs use `trigger_research`.""",
+
+    "browser_open": "- ```browser_open``` — Open an absolute http/https URL. Args: {\"url\":\"https://...\"}. Returns an accessibility tree with refs.",
+    "browser_read": "- ```browser_read``` — Read the current browser page. Args: {}. Prefer browser_find for a specific item.",
+    "browser_find": "- ```browser_find``` — Find text in the current page tree. Args: {\"text\":\"...\"}. Returns exact refs.",
+    "browser_click": "- ```browser_click``` — Click only an exact current ref. Args: {\"ref\":\"e12\"}. Never invent selectors or prose targets.",
+    "browser_type": "- ```browser_type``` — Type at an exact current ref. Args: {\"ref\":\"e12\",\"text\":\"...\",\"submit\":false}.",
+    "browser_back": "- ```browser_back``` — Go back one page. Args: {}.",
+    "browser_more": "- ```browser_more``` — Expose one uncommon family next round. Args: {\"category\":\"navigation|forms|debug|visual|storage|developer|unsafe\"}. Core browsing never needs this.",
 
     "read_file": """\
 ```read_file
@@ -832,6 +1220,7 @@ def _assemble_prompt(tool_names: set, disabled_tools: set = None, compact: bool 
             _API_AGENT_RULES,
         ]
         parts.extend(_domain_rules_for_tools(included))
+        parts.extend(_grounding_rules_block())
         return "\n\n".join(parts)
 
     parts = [_AGENT_PREAMBLE]
@@ -859,6 +1248,7 @@ def _assemble_prompt(tool_names: set, disabled_tools: set = None, compact: bool 
 
     parts.append(_AGENT_RULES)
     parts.extend(_domain_rules_for_tools(included))
+    parts.extend(_grounding_rules_block())
     return "\n\n".join(parts)
 
 
@@ -1182,6 +1572,9 @@ _CASUAL_BLOCKLIST_RE = re.compile(
 _EXPLICIT_CONTINUATION_RE = re.compile(
     r"^\s*(?:"
     r"yes|y|yeah|yep|ok|okay|sure|do it|go ahead|continue|carry on|"
+    r"s[iì](?:\s*,?\s*(?:fallo|vai|procedi|continua))?|"
+    r"va bene|fallo|vai|procedi|continua|avanti|usa quello|usa quella|"
+    r"quello|quella|lo stesso|la stessa|il primo|il secondo|il terzo|"
     r"run it|launch it|start it|use that|that one|same|the same|"
     r"first|second|third|the first one|the second one|the third one|"
     r"[123]|[abc]"
@@ -1195,7 +1588,9 @@ _EXPLICIT_CONTINUATION_RE = re.compile(
 )
 _RETRY_CONTINUATION_RE = re.compile(
     r"\b(?:try again|retry|again|rerun|re-run|run it again|launch it again|"
-    r"start it again|failed|fails?|died|crashed|broke|insta|instantly)\b",
+    r"start it again|failed|fails?|died|crashed|broke|insta|instantly|"
+    r"riprova|prova di nuovo|rifallo|riesegui|[eè] fallito|non ha funzionato|"
+    r"si [eè] rotto|crashato)\b",
     re.IGNORECASE,
 )
 _COOKBOOK_CONTEXT_RE = re.compile(
@@ -1266,7 +1661,8 @@ def _assistant_requested_followup(messages: List[Dict]) -> bool:
         return bool(re.search(
             r"\b(what would you like|what should|what do you want|which one|which model|"
             r"what.+(?:todo|to-do|list|document|email|model|server|item)|"
-            r"any specific|give me|tell me)\b",
+            r"any specific|give me|tell me|cosa (?:vuoi|vorresti)|quale (?:vuoi|modello)|"
+            r"che cosa|cosa devo|dimmi|dammi|quale preferisci)\b",
             text,
         ))
     return False
@@ -1303,11 +1699,15 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
         domains.add("cookbook")
     if has(r"\b(emails?|mails?|gmail|inbox|reply|forward|cc|bcc|send email|compose email|draft email|message chris|message him|message her)\b"):
         domains.add("email")
+    if has(r"\b(posta|casella|email|messaggi?)\b", r"\b(invia|manda|rispondi|leggi|controlla)\b.{0,80}\b(posta|email|messaggi?|casella)\b"):
+        domains.add("email")
     if has(r"\b(notes?|todos?|to-dos?|checklists?|tasks?|task list|remind me|reminders?|buy|pickup|pick up)\b"):
         domains.add("notes_calendar_tasks")
     if has(r"\b(every day|every morning|every evening|recurring|automatically|cron|scheduled task|background task)\b"):
         domains.add("notes_calendar_tasks")
     if has(r"\b(calendar|event|meeting|appointment|schedule)\b"):
+        domains.add("notes_calendar_tasks")
+    if has(r"\b(calendario|evento|riunione|appuntamento|agenda|promemoria|ricordami|nota|todo)\b"):
         domains.add("notes_calendar_tasks")
     _code_write_intent = has(
         r"\b(?:python|javascript|typescript|java|c\+\+|cpp|c#|csharp|rust|go|golang|"
@@ -1321,6 +1721,17 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
     if has(r"\b(search|web|google|look up|latest|news|current|weather|forecast|stock price|price of|website|url|https?://|www\.)\b"):
         domains.add("web")
     if has(
+        r"\b(cerca|cercami|trova|controlla|verifica)\b.{0,100}\b(internet|web|online)\b",
+        r"\b(ultime|ultimo|attuale|corrente|oggi|adesso)\b.{0,100}\b(notizie|meteo|prezzo|quotazione|risultato)\b",
+        r"\b(notizie|meteo|prezzo|quotazione)\b.{0,100}\b(oggi|attuale|ultime|adesso|online)\b",
+    ):
+        domains.add("web")
+    if has(
+        r"\b(apri|vai\s+su|naviga(?:re)?|clicca|digita|compila|invia)\b.{0,100}\b(browser|sito|pagina|link|url|youtube|chrome|firefox|modulo)\b",
+        r"\b(browser|sito|pagina|link|url|youtube)\b.{0,100}\b(clicca|digita|compila|naviga|apri)\b",
+    ):
+        domains.add("browser")
+    if has(
         r"\b(wyszukaj|wyszukać|wyszukac)\b.*\b(internet|internecie|online|web)\b",
         r"\b(sprawd[zź]|znajd[zź])\b.*\b(internet|internecie|online|web)\b",
         r"\b(aktualn\w*|bieżąc\w*|biezac\w*|dzisiaj|teraz)\b.*\b(pogod\w*|temperatur\w*)\b",
@@ -1330,9 +1741,15 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
         domains.add("web")
     if has(r"\b(open|show|toggle|turn on|turn off|disable|enable|switch model|change model|settings|theme|panel)\b"):
         domains.add("ui")
+    if has(r"\b(apri|mostra|chiudi|attiva|disattiva|cambia)\b.{0,80}\b(impostazioni|pannello|tema|galleria|documenti|memorie|abilit[aà]|ricerca|shell|browser)\b"):
+        domains.add("ui")
     if has(r"\b(session|chat history|rename chat|delete chat|archive chat|fork chat|list chats)\b"):
         domains.add("sessions")
+    if has(r"\b(chat|conversazioni?|sessioni?|cronologia)\b.{0,80}\b(elenca|mostra|apri|rinomina|archivia|elimina)\b", r"\b(elenca|mostra|apri|rinomina|archivia|elimina)\b.{0,80}\b(chat|conversazioni?|sessioni?)\b"):
+        domains.add("sessions")
     if has(r"\b(file|folder|directory|repo|git|grep|find in files|read file|edit file|shell|terminal|bash)\b"):
+        domains.add("files")
+    if has(r"\b(file|cartella|directory|repo|repository|codice|sorgente|log|terminale|shell)\b"):
         domains.add("files")
     if has(
         r"\b(run|execute|test|debug|fix|save|create|edit|read|open)\b.{0,40}\b("
@@ -1353,7 +1770,11 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
         domains.add("files")
     if has(r"\b(endpoint|api token|mcp|webhook|preference|configure|config|setting)\b"):
         domains.add("settings")
+    if has(r"\b(impostazioni|preferenze|configura|configurazione|endpoint|token|webhook)\b"):
+        domains.add("settings")
     if has(r"\b(contact|contacts|phone|phone number|address book|vcard)\b"):
+        domains.add("contacts")
+    if has(r"\b(contatto|contatti|telefono|numero di telefono|rubrica|indirizzo)\b"):
         domains.add("contacts")
     # API-integration intent — calling a configured service via the api_call
     # tool. Without this the #3794 repro ("Use the api_call tool to call Home
@@ -2038,6 +2459,7 @@ def _build_system_prompt(
     suppress_skills: bool = False,
     active_email: Optional[Dict[str, str]] = None,
     workspace: Optional[str] = None,
+    include_mcp_descriptions: bool = True,
 ) -> List[Dict]:
     """Build agent system prompt, inject MCP/document context, merge consecutive system msgs."""
     global _cached_base_prompt, _cached_base_prompt_key
@@ -2532,9 +2954,12 @@ def _build_system_prompt(
             logger.debug(f"Integration prompt injection skipped: {_integ_err}")
 
     # MCP tool descriptions — sourced from external servers, must not be in system role.
-    if mcp_mgr:
+    if mcp_mgr and include_mcp_descriptions:
         try:
-            _mcp_desc = mcp_mgr.get_tool_descriptions_for_prompt(mcp_disabled_map or {})
+            _mcp_desc = mcp_mgr.get_tool_descriptions_for_prompt(
+                mcp_disabled_map or {},
+                allowed_names=(set(relevant_tools) if relevant_tools is not None else None),
+            )
             if _mcp_desc:
                 _mcp_desc_message = untrusted_context_message("MCP tools", _mcp_desc)
         except Exception as _mcp_err:
@@ -2593,6 +3018,12 @@ def _build_system_prompt(
         last_user_idx += 1
     if _datetime_message:
         merged.insert(last_user_idx, _datetime_message)
+    # Onda 4 / E08c: marca i blocchi iniettati davanti all'ultimo user, cosi' la
+    # persistenza del turno (_history_tail_for_persist) prende SOLO questi.
+    for _blk in (_doc_message, _email_message, _email_style_message, _integ_message,
+                 _mcp_desc_message, _skills_message, _datetime_message):
+        if isinstance(_blk, dict):
+            _blk["_pre"] = True
 
     return merged, mcp_schemas
 
@@ -2704,6 +3135,9 @@ def _resolve_tool_blocks(
     round_num: int,
     is_api_model: bool = False,
     allow_fenced_for_api: bool = False,
+    round_reasoning: str = "",
+    allowed_tool_names: Optional[Set[str]] = None,
+    reasoning_allowed_tool_names: Optional[Set[str]] = None,
 ):
     """Choose native function calls or fenced code block parsing. Returns (tool_blocks, used_native)."""
     used_native = False
@@ -2741,6 +3175,83 @@ def _resolve_tool_blocks(
         if tool_blocks:
             logger.info(f"Agent round {round_num}: {len(tool_blocks)} fenced tool block(s) detected")
 
+    def _advertised(block: ToolBlock) -> bool:
+        if allowed_tool_names is None:
+            return True
+        candidates = {block.tool_type}
+        if block.tool_type.startswith("mcp__email__"):
+            candidates.add(block.tool_type[len("mcp__email__"):])
+        return not candidates.isdisjoint(allowed_tool_names)
+
+    if tool_blocks and allowed_tool_names is not None:
+        kept_blocks = []
+        kept_calls = []
+        rejected = []
+        for idx, block in enumerate(tool_blocks):
+            if _advertised(block):
+                kept_blocks.append(block)
+                if used_native and idx < len(converted_calls):
+                    kept_calls.append(converted_calls[idx])
+            else:
+                rejected.append(block.tool_type)
+        tool_blocks = kept_blocks
+        if used_native:
+            converted_calls = kept_calls
+            if not tool_blocks:
+                used_native = False
+        if rejected:
+            logger.warning(
+                "Agent round %s rejected unadvertised tool call(s): %s",
+                round_num, rejected,
+            )
+
+    # Some reasoning parsers route a COMPLETE tool call into reasoning_content
+    # instead of the structured channel. Recover only when content/native paths
+    # found nothing, only from bounded explicit markup, and only for tools that
+    # were actually advertised this round. Partial calls and zero-schema rounds
+    # remain inert.
+    reasoning_allowlist = (
+        allowed_tool_names
+        if reasoning_allowed_tool_names is None
+        else reasoning_allowed_tool_names
+    )
+    if (
+        not tool_blocks
+        and not native_tool_calls
+        and round_reasoning
+        and reasoning_allowlist
+        and len(round_reasoning) <= 64_000
+    ):
+        recovered_calls = parse_reasoning_tool_calls(round_reasoning)
+        recovered_calls = [
+            (block, arguments) for block, arguments in recovered_calls
+            if block.tool_type in reasoning_allowlist
+            or (
+                block.tool_type.startswith("mcp__email__")
+                and block.tool_type[len("mcp__email__"):] in reasoning_allowlist
+            )
+        ]
+        if recovered_calls:
+            tool_blocks = [block for block, _arguments in recovered_calls]
+            # Bailing's native template expects the following observation as
+            # role=tool, paired with an assistant tool_calls entry.  Treat a
+            # complete, schema-allowlisted call recovered from
+            # reasoning_content as native for history threading; otherwise the
+            # next Ling round sees its own action as a generic user message.
+            converted_calls = [
+                {
+                    "id": f"recovered_{round_num}_{idx}",
+                    "name": block.tool_type,
+                    "arguments": arguments,
+                }
+                for idx, (block, arguments) in enumerate(recovered_calls)
+            ]
+            used_native = True
+            logger.info(
+                "Agent round %s recovered %s complete advertised tool call(s) from reasoning",
+                round_num, len(recovered_calls),
+            )
+
     resp_preview = round_response[:200].replace('\n', '\\n') if round_response else "(empty)"
     logger.info(f"Agent round {round_num} summary: {len(round_response)} chars, "
                 f"{len(native_tool_calls)} native calls, "
@@ -2758,6 +3269,7 @@ def _append_tool_results(
     used_native: bool,
     round_num: int,
     round_reasoning: str = "",
+    model_name: str = "",
 ):
     """Append tool execution results back into the message history for the next LLM round.
 
@@ -2778,6 +3290,21 @@ def _append_tool_results(
     for _m in messages:
         if _m.get("role") == "assistant":
             _m.pop("reasoning_content", None)
+    # Vergilius: il reasoning nella storia serve SOLO a DeepSeek (la loro API
+    # rifiuta i follow-up senza). La regola Qwen e' l'opposto: «the
+    # historical model output should only include the final output part» —
+    # rimettere il thinking nel turno assistant insegna al modello che il
+    # pattern e' "prosa di piano", e al giro 2 imita la prosa invece di
+    # emettere la chiamata. Quindi: reasoning solo per DeepSeek.
+    if round_reasoning and "deepseek" not in (model_name or "").lower():
+        round_reasoning = ""
+    # Vergilius: la storia deve contenere SOLO l'output finale, mai il
+    # thinking — regola ufficiale Qwen ("the historical model output should
+    # only include the final output part"). Un <think> lasciato nel content
+    # insegna al modello che il pattern e' la prosa di piano, e al giro dopo
+    # imita quella invece di chiamare. La prosa vera invece RESTA: nessun
+    # harness la strippa.
+    round_response = _strip_think_blocks(round_response or "").strip()
     if used_native and native_tool_calls:
         assistant_msg = {"role": "assistant"}
         # When the model emitted ONLY tool calls (no prose), content must be
@@ -3102,6 +3629,7 @@ async def stream_agent_loop(
     uploaded_files: Optional[List[Dict]] = None,
     workload: str = "foreground",
     _is_teacher_run: bool = False,
+    allow_browser_unsafe: bool = False,
 ) -> AsyncGenerator[str, None]:
     """Streaming agent loop generator.
 
@@ -3117,6 +3645,8 @@ async def stream_agent_loop(
     mcp_mgr = get_mcp_manager()
     prep_timings: Dict[str, float] = {}
     disabled_tools = set(disabled_tools or [])
+    if "builtin_browser" in disabled_tools:
+        disabled_tools.update(BROWSER_CORE_TOOL_NAMES)
     if tool_policy:
         disabled_tools.update(tool_policy.all_disabled_names())
         if tool_policy.disable_mcp:
@@ -3144,6 +3674,9 @@ async def stream_agent_loop(
     _t0 = time.time()
     _needs_admin = _detect_admin_intent(messages)
     _last_user = _extract_last_user_message(messages)
+    # This capability comes only from the raw HTTP request.  Never infer it
+    # from model-visible/enhanced messages, which may contain attachment OCR.
+    _allow_browser_unsafe = bool(allow_browser_unsafe)
     _ody_qwen_finetune_model = (model or "").lower().startswith("odysseus-qwen3")
     if _ody_qwen_finetune_model:
         try:
@@ -3222,7 +3755,7 @@ async def stream_agent_loop(
                 include_memory=True,
             )
             if _ody_qwen_finetune_model
-            else [{"role": "user", "content": _last_user}]
+            else _minimal_persona_messages(messages, _last_user)
         )
         direct_response = ""
         direct_start = time.time()
@@ -3304,6 +3837,18 @@ async def stream_agent_loop(
         for _sid, _names in _mcp_block_map.items():
             _mcp_disabled_map.setdefault(_sid, set()).update(_names)
         disabled_tools.update(_mcp_block_q)
+    # Per-server MCP settings store raw Playwright names, while the model sees
+    # compact adapter names.  Carry both spellings into the runtime denylist so
+    # an adapter cannot bypass a disabled raw dependency, and so browser_more
+    # never unlocks a disabled specialist.
+    _browser_raw_disabled = set(_mcp_disabled_map.get("builtin_browser", set()))
+    if _browser_raw_disabled:
+        disabled_tools.update(
+            _BROWSER_MCP_PREFIX + name for name in _browser_raw_disabled
+        )
+        disabled_tools.update(
+            browser_adapters_disabled_by_raw(_browser_raw_disabled)
+        )
     prep_timings["request_setup"] = time.time() - _t0
 
     # RAG-based tool selection: retrieve relevant tools for this query.
@@ -3473,7 +4018,12 @@ async def stream_agent_loop(
         _relevant_tools.update(forced_set)
 
     if not guide_only and _relevant_tools is not None:
-        _relevant_tools = _expand_browser_mcp_tools(_relevant_tools, mcp_mgr)
+        _relevant_tools = _select_browser_core_tools(_relevant_tools, mcp_mgr)
+        _relevant_tools = await asyncio.to_thread(
+            _drop_image_only_tools, _relevant_tools, endpoint_url, model
+        )
+
+    _frozen_toolset: Optional[List[str]] = None  # E06, valorizzato piu' sotto
 
     # The skill index injected by _build_system_prompt tells the model to
     # call `manage_skills action=view`, and Jaccard-matched skills are pasted
@@ -3594,6 +4144,52 @@ async def stream_agent_loop(
                 _removed_doc_file_tools,
             )
 
+    # Onda 4 / E06 (27 ago 2026): set di tool CONGELATO per sessione. Sta QUI,
+    # dopo l'ultima pulizia per turno (skill, documento, clamp finetune): il primo
+    # tentativo piu' in alto lasciava passare +5 tool di skill a turni alterni
+    # (12 <-> 17) e il prefisso cambiava lo stesso (dump-B2).
+    # Perche': il tool-RAG sceglie un set diverso a ogni turno (baseline: 12 -> 18
+    # -> 14 -> 19, 6 prefissi su 40 richieste); su Ling (memoria ibrida) ogni
+    # cambio nel blocco `# Tools` diverge prima del primo checkpoint = riprocesso
+    # pieno di 7-15k token (39-onda4-precondizioni-esiti.md). Il primo turno della
+    # sessione fissa set e ordine; i turni dopo lo riusano. Espansione solo per
+    # domini ESPLICITI (intent router, forced_tools), mai per similarita' RAG,
+    # sempre in coda. Le modalita' finetune (doc/notes) hanno la precedenza.
+    # Attivo solo con ODYSSEUS_TOOLSET_FREEZE=1 (istanza di prova, A/B).
+    if (
+        _os.getenv("ODYSSEUS_TOOLSET_FREEZE", "0") == "1"
+        and session_id and not guide_only and _relevant_tools is not None
+        and not _ody_doc_finetune_mode and not _ody_notes_finetune_mode
+    ):
+        _frozen_toolset = _SESSION_TOOLSET.get(session_id)
+        if _frozen_toolset is None:
+            # Si congela cio' che viene DAVVERO inviato (gia' al netto dei
+            # disabled_tools della route, che cambiano per turno: al primo turno
+            # i 5 manage_* erano esclusi, dal secondo no -> 12 <-> 17, dump-B4).
+            # Le revoche successive valgono comunque: il filtro disabled_tools
+            # a valle toglie, mai aggiunge. Sicurezza prima del prefisso.
+            _frozen_toolset = sorted(set(_relevant_tools) - set(disabled_tools))
+            _SESSION_TOOLSET[session_id] = _frozen_toolset
+            _SESSION_ADMIN[session_id] = bool(_needs_admin)
+            logger.info("[tool-freeze] session=%s freeze %d tools admin=%s",
+                        session_id[:8], len(_frozen_toolset), bool(_needs_admin))
+        else:
+            if bool(_needs_admin) != _SESSION_ADMIN.get(session_id, False):
+                logger.info("[tool-freeze] session=%s admin %s -> tenuto %s (prefisso stabile)",
+                            session_id[:8], bool(_needs_admin), _SESSION_ADMIN.get(session_id, False))
+            _needs_admin = _SESSION_ADMIN.get(session_id, False)
+            _expl: Set[str] = set(forced_tools or ())
+            for _domain in (_intent.get("domains") or set()):
+                _expl |= _DOMAIN_TOOL_MAP.get(str(_domain), set())
+            _new = sorted((_expl & _relevant_tools) - set(_frozen_toolset))
+            if _new:
+                _frozen_toolset.extend(_new)
+                logger.info("[tool-freeze] session=%s expand +%d %s", session_id[:8], len(_new), _new)
+            _dropped = sorted(_relevant_tools - set(_frozen_toolset))
+            _relevant_tools = set(_frozen_toolset)
+            logger.info("[tool-freeze] session=%s reuse %d tools (turno proponeva +%d, ignorati)",
+                        session_id[:8], len(_relevant_tools), len(_dropped))
+
     if _relevant_tools is not None:
         logger.info("[agent-intent] selected_tools=%s", sorted(_relevant_tools)[:50])
 
@@ -3625,7 +4221,12 @@ async def stream_agent_loop(
             _db.close()
     except Exception as _e:
         logger.debug(f"endpoint supports_tools lookup failed: {_e}")
-    _model_supports_tools = any(kw in _model_lc for kw in (
+    _model_basename = _model_lc.rsplit("/", 1)[-1]
+    _model_supports_tools = (
+        _model_basename == "ling"
+        or _model_basename.startswith("ling-")
+        or "bailing" in _model_basename
+        or any(kw in _model_lc for kw in (
         "gpt-4", "gpt-5", "gpt-o", "claude", "gemini", "gemma",
         "qwen3", "qwen2.5", "mixtral", "mistral", "llama-3.1", "llama-3.2",
         "llama-3.3", "llama-4", "llama3.1", "llama3.2", "llama3.3", "llama4",
@@ -3637,7 +4238,8 @@ async def stream_agent_loop(
         # deepseek-v2/v3/chat support tools via the cloud API; deepseek-r1
         # (reasoning model) does not — handled by the blocklist below.
         "deepseek-v", "deepseek-chat",
-    ))
+        ))
+    )
     # Models known to reject tool schemas at the Ollama/local level even when
     # the endpoint URL would otherwise enable native function calling.
     # The per-endpoint supports_tools flag (True/False) always takes priority
@@ -3681,6 +4283,7 @@ async def stream_agent_loop(
         suppress_skills=_low_signal_turn,
         active_email=active_email,
         workspace=workspace,
+        include_mcp_descriptions=not _is_api_model,
     )
     if _ody_doc_finetune_mode and not plan_mode and not approved_plan and not guide_only:
         messages = _minimal_odysseus_doc_messages(
@@ -3811,6 +4414,22 @@ async def stream_agent_loop(
     time_to_first_token = None
     first_token_received = False
     tool_events = []   # Persist tool executions for history reload
+    _turn_tool_cache: Dict[str, tuple] = {}   # Onda 4 / E12: (tool, args) -> (desc, result) in questo turno
+    _dedup_hits = 0
+    _turn_tool_raw: List[str] = []             # Onda 4 / H4: output tool grezzi del turno (per il detector)
+
+
+    def _tool_raw_storia() -> list:
+        """Output degli strumenti gia' presenti nella conversazione (turni precedenti).
+
+        Un turno di sintesi ("cosa dovrei guardare domani?") non chiama nulla e riusa i
+        numeri raccolti prima: senza questo, il rilevatore li dichiara tutti inventati.
+        """
+        fuori = []
+        for _m in messages or []:
+            if isinstance(_m, dict) and _m.get("role") == "tool" and isinstance(_m.get("content"), str):
+                fuori.append(_m["content"])
+        return fuori
     round_texts = []   # Cleaned text per round for history reload
     # Completion-verifier state (mechanism 3a). _effectful_used flips on when
     # a tool that produces a checkable artifact runs; the verifier only fires
@@ -3844,7 +4463,14 @@ async def stream_agent_loop(
     # an action without emitting the tool call. Capped to prevent a model
     # that *can't* call the tool from looping forever.
     _intent_nudge_count = 0
-    _MAX_INTENT_NUDGES = 2
+    _grounding_retry_count = 0   # Onda 4 / H4-retry: un solo rilancio per turno
+    # 3 come Cline/Roo: il loro contatore di errori consecutivi prima
+    # dell'escalation e' il riferimento di settore.
+    # Leve per modelli obbedienti (LFM): default = comportamento storico tarato su Ling.
+    _MAX_INTENT_NUDGES = max(0, int(_os.getenv("ODYSSEUS_INTENT_NUDGE_MAX", "3") or 3))
+    _NUDGE_FORCE_TOOL = _os.getenv("ODYSSEUS_INTENT_NUDGE_FORCE", "1") == "1"
+    _NUDGE_FUTURO = _os.getenv("ODYSSEUS_INTENT_NUDGE_FUTURO", "1") == "1"
+    _STATE_REMINDER = _os.getenv("ODYSSEUS_STATE_REMINDER", "1") == "1"
 
     # "I said I would, then didn't" detector. The pattern that breaks debug
     # loops on weak models (deepseek-v4-flash mid-2026): the model writes
@@ -3853,16 +4479,53 @@ async def stream_agent_loop(
     # Match the common phrasings + an action verb that maps to an available
     # tool, so we don't nudge on harmless transitional text like "let me
     # know what you think".
+    # Vergilius: il ramo italiano. Misurato sul 9B locale: "Proviamo a
+    # cercare direttamente le notizie finanziarie sui mercati." e poi il
+    # turno moriva con "Done." — l'intento c'era, la chiamata no, e la regex
+    # solo-inglese non scattava. Prima persona plurale compresa: il modello
+    # annuncia quasi sempre con "proviamo/cerchiamo/vediamo".
+    # L'ancora accetta anche l'inizio di FRASE, non solo di riga: il secondo
+    # stallo osservato era «Ottimo, ho le news sulla guerra. Ora devo
+    # ottenere le informazioni sui mercati.» — annuncio a meta' paragrafo,
+    # con un verbo ("ottenere") che mancava dalla lista. I falsi positivi
+    # restano rari: il nudge scatta solo su risposte corte (<400) senza
+    # tool call, col tetto di 2.
     _INTENT_RE = re.compile(
-        r"(?:^|\n)\s*(?:let me|i'?ll|i will|i need to|we need to|need to|"
-        r"i should|we should|i must|we must|going to|let's)\s+"
+        r"(?:^|\n|[.!?]\s+)\s*(?:let me|i'?ll|i will|i need to|we need to|need to|"
+        r"i should|we should|i must|we must|going to|let's|"
+        r"proviamo(?:\s+a)?|prover[oò]|cerchiamo(?:\s+di)?|cerco|vediamo|"
+        r"controlliamo|controllo|verifichiamo|verifico|adesso|ora|"
+        r"passiamo\s+a|andiamo\s+a|facciamo|devo|dobbiamo|bisogna|"
+        r"iniziamo(?:\s+ad?)?|inizio(?:\s+ad?)?|cominciamo(?:\s+ad?)?|"
+        r"partiamo(?:\s+da)?|analizziamo|per\s+prima\s+cosa|"
+        r"mi\s+serve|serve)\s+"
         r"(?:tail|check|investigate|look at|see|tail|read|fetch|inspect|"
         r"verify|diagnose|examine|debug|capture|grab|pull|view|run|call|"
         r"trigger|launch|start|kick off|stop|kill|restart|adopt|serve|"
-        r"register|adopt|list|search|find|query|hit|ping|test|use|perform|do)"
+        r"register|adopt|list|search|find|query|hit|ping|test|use|perform|do|"
+        r"obtain|get|gather|collect|combine|compare|"
+        r"cercare|cerco|controllare|verificare|leggere|leggo|recuperare|"
+        r"recupero|chiamare|chiamo|lanciare|lancio|eseguire|eseguo|"
+        r"interrogare|interrogo|guardare|guardo|prendere|prendo|usare|uso|"
+        r"provare|provo|analizzare|analizzo|consultare|consulto|mostrare|"
+        r"mostro|evidenziare|evidenzio|centrare|centro|"
+        r"ottenere|ottengo|vedere|vedo|raccogliere|raccolgo|incrociare|"
+        r"incrocio|confrontare|confronto|combinare|combino|integrare|"
+        r"integro|aggiungere|aggiungo|completare|completo|"
+        r"analizzando|cercando|controllando|leggendo|recuperando|"
+        r"verificando|ottenendo|raccogliendo|chiamando|usando|guardando)"
         r"\b[^.\n]{0,140}",
         re.IGNORECASE,
     )
+    # Rete generale, oltre la lista frasi: un verbo al futuro ("vedremo",
+    # "approfondiremo", "cercherò") in una risposta corta senza tool call e'
+    # un piano, non una risposta. Prende gli annunci che la lista non
+    # conosce ancora — la lista era gia' stata bucata due volte.
+    _FUTURO_RE = re.compile(r"\b\w{4,}(?:eremo|iremo|her[oò]|er[oò]|ir[oò])\b")
+    # Dopo un nudge, il giro successivo FORZA una tool call via
+    # tool_choice="required" (llama.cpp la garantisce per grammatica):
+    # il «DO IT NOW» smette di essere una preghiera.
+    _force_tool_next = False
     _awaiting_user = False  # set by ask_user → end the turn and wait for a choice
 
     # Document streaming state (persists across rounds)
@@ -3877,9 +4540,33 @@ async def stream_agent_loop(
     # so the user can resume instead of the turn silently stalling.
     _exhausted_rounds = False
 
+    # Pin schema order for this task. Existing schemas never move between
+    # rounds; a specialist family unlocked later is appended. This maximises
+    # llama.cpp's common-prefix reuse even when the available set grows.
+    _schema_order: Dict[str, int] = {}
+    # E06: con il set congelato anche l'ORDINE e' quello della sessione, cosi' il
+    # blocco `# Tools` e' byte-identico tra turni, non solo tra round.
+    if _frozen_toolset:
+        for _i, _n in enumerate(_frozen_toolset):
+            _schema_order[_n] = _i
+
+    def _pin_schema_order(schemas: List[Dict]) -> List[Dict]:
+        for schema in schemas or []:
+            name = (schema.get("function") or {}).get("name") or schema.get("name") or ""
+            if name and name not in _schema_order:
+                _schema_order[name] = len(_schema_order)
+        return sorted(
+            schemas or [],
+            key=lambda schema: _schema_order.get(
+                (schema.get("function") or {}).get("name") or schema.get("name") or "",
+                len(_schema_order),
+            ),
+        )
+
     for round_num in range(1, max_rounds + 1):
         round_response = ""
         round_reasoning = ""  # reasoning_content deltas (DeepSeek-thinking, vLLM --reasoning-parser)
+        round_actual_model = model
         native_tool_calls = []  # populated if model uses function calling
         # Reset doc streaming state per round
         _doc_acc = ""
@@ -3924,7 +4611,10 @@ async def stream_agent_loop(
                     s for s in FUNCTION_TOOL_SCHEMAS
                     if s.get("function", {}).get("name") not in _ADMIN_SCHEMA_NAMES
                 ]
-                all_tool_schemas = base_schemas + mcp_schemas
+                all_tool_schemas = base_schemas + [
+                    schema for schema in mcp_schemas
+                    if not (schema.get("function") or {}).get("name", "").startswith(_BROWSER_MCP_PREFIX)
+                ]
             # Odysseus-Qwen fine-tunes are trained to emit Odysseus tool calls
             # from the lightweight domain prompt. Do not inject OpenAI-native
             # tool schemas; that adds prompt overhead and changes the behavior
@@ -3941,7 +4631,11 @@ async def stream_agent_loop(
             # Local: only MCP schemas when message suggests MCP tool usage
             _last_content = _last_user.lower()
             _wants_mcp = any(kw in _last_content for kw in _MCP_KEYWORDS)
-            all_tool_schemas = mcp_schemas if (_wants_mcp and mcp_schemas) else []
+            all_tool_schemas = [
+                schema for schema in (mcp_schemas if (_wants_mcp and mcp_schemas) else [])
+                if not (schema.get("function") or {}).get("name", "").startswith(_BROWSER_MCP_PREFIX)
+            ]
+        all_tool_schemas = _pin_schema_order(all_tool_schemas)
         agent_stream_timeout = int(get_setting("agent_stream_timeout_seconds", 300) or 300)
 
         _tool_names_sent = [t.get("function", {}).get("name") for t in (all_tool_schemas or []) if t.get("function")]
@@ -3969,14 +4663,48 @@ async def stream_agent_loop(
             bool(all_tool_schemas),
             agent_stream_timeout,
         )
+        # Vergilius, temperatura per fase: i giri con gli schemi attaccati
+        # sono giri di SCELTA (quale tool, quali argomenti) e vanno freddi;
+        # i giri senza schemi (force-answer, sintesi) restano alla
+        # temperatura del preset. Evidenza: BFCL/pratica harness — T bassa
+        # per le tool call, piu' alta per la prosa.
+        _temp_giro = min(temperature, 0.25) if all_tool_schemas else temperature
+        _tool_choice_giro = "required" if (_force_tool_next and all_tool_schemas) else None
+        _force_tool_next = False
+        # Onda 4 / H1a: domanda fresca al primo giro -> chiamata garantita
+        # dalla grammatica (set di tool invariato, prefisso KV intatto).
+        if (_tool_choice_giro is None and round_num == 1 and all_tool_schemas
+                and _os.getenv("ODYSSEUS_FRESH_REQUIRED", "0") == "1"
+                and not _ody_doc_finetune_mode
+                and any(_is_fresh_data_tool(n) for n in _tool_names_sent)
+                and _fresh_data_question(_last_user_text(messages))):
+            _tool_choice_giro = "required"
+            logger.info("[fresh-required] round=1 domanda fresca: tool_choice=required (%d tool inviati)", len(_tool_names_sent))
+        # Onda 4 / E11 (27 ago 2026): budget di thinking SOLO sui giri con schemi
+        # (scelta del tool). Baseline: 56-106 s di ragionamento per emettere una
+        # chiamata da ~900 byte. `reasoning_budget_tokens` e' sampler-only
+        # (server-common.cpp:1354): non tocca il system, non rompe il prefisso.
+        # Tetto ai token: max_tokens=0 significa "senza limite" per llama.cpp e
+        # il baseline ha avuto un round da 300 s / 0 byte. Entrambi via env,
+        # solo istanza di prova finche' non sono misurati.
+        _budget_giro = None
+        _rb_env = _os.getenv("ODYSSEUS_TOOL_ROUND_REASONING_BUDGET", "").strip()
+        if all_tool_schemas and _rb_env.isdigit():
+            _budget_giro = int(_rb_env)
+        _mt_giro = max_tokens
+        _cap_env = _os.getenv("ODYSSEUS_AGENT_MAX_TOKENS_CAP", "").strip()
+        if (not _mt_giro or _mt_giro <= 0) and _cap_env.isdigit():
+            _mt_giro = int(_cap_env)
         async for chunk in stream_llm_with_fallback(
             _candidates,
             messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
+            temperature=_temp_giro,
+            max_tokens=_mt_giro,
+            reasoning_budget_tokens=_budget_giro,
             prompt_type=prompt_type if round_num == 1 else None,
             tools=all_tool_schemas if all_tool_schemas else None,
             tool_choice_none=_ody_doc_finetune_mode,
+            tool_choice=_tool_choice_giro,
             timeout=agent_stream_timeout,
             session_id=session_id,
             workload=workload,
@@ -4056,6 +4784,7 @@ async def stream_agent_loop(
                     elif data.get("type") == "usage":
                         u = data.get("data", {})
                         actual_model = u.get("model") or actual_model
+                        round_actual_model = u.get("model") or round_actual_model
                         round_input = u.get("input_tokens", 0)
                         real_input_tokens += round_input
                         real_output_tokens += u.get("output_tokens", 0)
@@ -4073,11 +4802,13 @@ async def stream_agent_loop(
                         # The selected model failed and another answered; surface
                         # the notice so a misconfigured provider isn't masked.
                         actual_model = data.get("answered_by") or actual_model
+                        round_actual_model = data.get("answered_by") or round_actual_model
                         logger.warning(f"[agent] round {round_num} fell back: "
                                        f"{data.get('selected_model')} -> {data.get('answered_by')}")
                         yield chunk
                     elif data.get("type") == "model_actual":
                         actual_model = data.get("model") or actual_model
+                        round_actual_model = data.get("model") or round_actual_model
                         data["requested_model"] = requested_model
                         yield f"data: {json.dumps(data)}\n\n"
                     elif "delta" in data:
@@ -4206,7 +4937,33 @@ async def stream_agent_loop(
             round_num,
             is_api_model=(_is_api_model and not guide_only),
             allow_fenced_for_api=_ody_doc_finetune_mode,
+            round_reasoning=round_reasoning,
+            allowed_tool_names=(
+                set(disabled_tools or set())
+                if _force_answer or guide_only
+                else (
+                    set(_tool_names_sent) | set(disabled_tools or set())
+                    if _is_api_model
+                    else set(_relevant_tools or TOOL_TAGS) | set(disabled_tools or set())
+                )
+            ),
+            reasoning_allowed_tool_names=(
+                set()
+                if _force_answer or guide_only
+                else (
+                    set(_tool_names_sent)
+                    if _is_api_model
+                    else set(_relevant_tools or TOOL_TAGS) - set(disabled_tools or set())
+                )
+            ),
         )
+        if used_native and not native_tool_calls and converted_calls:
+            # The recovered call is represented structurally in converted_calls
+            # below.  Remove only its complete wrapper from preserved thinking
+            # so Bailing's template cannot render the same action twice.
+            round_reasoning = strip_tool_blocks(
+                round_reasoning, skip_fenced=True
+            ).strip()
         if _ody_doc_stream_create_mode and tool_blocks:
             create_idx = next(
                 (idx for idx, block in enumerate(tool_blocks) if block.tool_type == "create_document"),
@@ -4425,7 +5182,41 @@ async def stream_agent_loop(
             # _MAX_INTENT_NUDGES so a model that genuinely cannot use the
             # tool doesn't pin us in a forever loop.
             _intent_text = _strip_think_blocks(cleaned_round).strip()
+            # Onda 4 / H4-retry (ODYSSEUS_GROUNDING_RETRY=1): la risposta finale
+            # contiene numeri che nessun output tool del turno riporta (misurato
+            # H0: 3 turni su 35 con tool, es. prezzi di Leonardo inventati quando
+            # fin_mercati non aveva il titolo). Un solo rilancio, ruolo user
+            # (pattern Cline/Anthropic "retract the claim"), poi si accetta.
+            _storia_tool = _tool_raw_storia() if _os.getenv("ODYSSEUS_GROUNDING_RETRY", "0") == "1" else []
+            if (_os.getenv("ODYSSEUS_GROUNDING_RETRY", "0") == "1" and (tool_events or _storia_tool)
+                    and not guide_only and _grounding_retry_count < 1 and _intent_text):
+                try:
+                    _grc = _grounding_check(_intent_text, _turn_tool_raw + _storia_tool, _last_user_text(messages))
+                except Exception:
+                    _grc = {"non_supportati": 0, "esempi": [], "entita_assenti": [], "numeri": 0}
+                _ent_miss = [e for e in (_grc.get("entita_assenti") or []) if e.lower() in _intent_text.lower()]
+                _sostituzione = bool(_ent_miss) and _grc.get("numeri", 0) >= 2 and _grc.get("non_supportati", 0) == 0
+                if _grc.get("non_supportati", 0) >= 1 or _sostituzione:
+                    _grounding_retry_count += 1
+                    logger.info("[grounding-retry] round=%s numeri non supportati=%s es=%s entita_assenti=%s sostituzione=%s",
+                                round_num, _grc.get("non_supportati"), _grc.get("esempi"), _ent_miss, _sostituzione)
+                    _parti = ["[Grounding check]"]
+                    if _grc.get("non_supportati", 0) >= 1:
+                        _parti.append("These figures in your answer do not appear in any tool result of this turn: "
+                                      + ", ".join(str(x) for x in (_grc.get("esempi") or [])) + ".")
+                    if _ent_miss:
+                        _parti.append("No tool result mentions " + ", ".join(_ent_miss) + ": say explicitly that you "
+                                      "have no data about it; do not describe other companies or assets in its place.")
+                    _parti.append("Rewrite the answer using ONLY data returned by the tools. If the requested figure "
+                                  "is not in the tool results, say so plainly instead of estimating it. Do not call "
+                                  "tools again. (Automated message: do not respond conversationally.)")
+                    messages.append({"role": "user", "content": "\n".join(_parti)})
+                    yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1, "grounding_retry": True})}\n\n'
+                    continue
             _intent_match = _INTENT_RE.search(_intent_text) if _intent_text else None
+            if _intent_match is None and _intent_text and _NUDGE_FUTURO:
+                # Ripiego generale: futuro italiano in risposta corta.
+                _intent_match = _FUTURO_RE.search(_intent_text)
             # Only nudge when the round REALLY looks like an unfinished
             # promise: short response (<400 chars), no fenced code/answer,
             # and an action-intent phrase was matched. Long answers that
@@ -4449,19 +5240,27 @@ async def stream_agent_loop(
                         "session_id from the serve/list result. Never answer with "
                         "\"check logs\" when those tools are available."
                     )
+                # Ruolo USER, non system: il consenso degli harness (Cline,
+                # Claude Code coi system-reminder) e' che lo slot user e'
+                # quello a cui il modello obbedisce davvero; il testo ricalca
+                # il messaggio di stallo di Cline, che offre sempre una via
+                # d'uscita legale invece del solo divieto.
                 messages.append({
-                    "role": "system",
+                    "role": "user",
                     "content": (
-                        f"You just wrote: \"{_matched_phrase}\" — but ended the "
-                        "turn without making the actual tool call. The user can "
-                        "see you announced the action but didn't run it, which "
-                        "is the most frustrating thing you can do. "
-                        "DO IT NOW: emit the actual function call this turn. "
+                        f"[ERROR] You wrote \"{_matched_phrase}\" but called "
+                        "no tool.\n"
+                        "# Next Steps\n"
+                        "Need data → emit the function call NOW.\n"
                         f"{_cookbook_log_hint}"
-                        "If you decided not to do it after all, say so plainly in "
-                        "one sentence instead of restating the plan."
+                        "Have everything → write the final answer.\n"
+                        "Decided not to act → say so in one sentence.\n"
+                        "(Automated message: do not respond conversationally.)"
                     ),
                 })
+                # Il prossimo giro forza la chiamata (tool_choice="required"):
+                # senza, il modello puo' ripetere l'annuncio a parole.
+                _force_tool_next = _NUDGE_FORCE_TOOL
                 # Visible signal in the stream so the user knows we caught it.
                 yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
                 continue
@@ -4634,60 +5433,87 @@ async def stream_agent_loop(
                 }
                 logger.info("Tool blocked before start by policy: %s", block.tool_type)
             else:
+                _dd_key = _tool_dedup_key(block.tool_type, full_command)
+                _dd_hit = _dd_key is not None and _dd_key in _turn_tool_cache
                 yield (
-                    f'data: {json.dumps({"type": "tool_start", "tool": block.tool_type, "command": cmd_display, "full_command": full_command, "round": round_num})}\n\n'
+                    f'data: {json.dumps({"type": "tool_start", "tool": block.tool_type, "command": cmd_display, "full_command": full_command, "round": round_num, "dedup": _dd_hit})}\n\n'
                 )
+                _sc_hit = None if _dd_hit else _session_cache_get(session_id, _dd_key)
+                if _dd_hit:
+                    desc, result = _tool_dedup_replay(_turn_tool_cache[_dd_key])
+                    _dedup_hits += 1
+                    logger.info("[tool-dedup] hit tool=%s round=%s hits_turno=%d", block.tool_type, round_num, _dedup_hits)
+                elif _sc_hit is not None:
+                    desc, result = _tool_dedup_replay((_sc_hit[1], _sc_hit[2]), _CACHE_NOTE.format(age=_sc_hit[0]))
+                    logger.info("[tool-cache] hit tool=%s round=%s eta=%ss", block.tool_type, round_num, _sc_hit[0])
+                else:
+                    # Streaming progress for long-running tools (bash, python).
+                    # The bash/python branches inside _direct_fallback emit
+                    # periodic {elapsed_s, tail} payloads via this callback;
+                    # we forward each one as a `tool_progress` SSE event so
+                    # the UI can render live elapsed-time + tail-of-output.
+                    _progress_q: asyncio.Queue = asyncio.Queue()
+                    async def _push_progress(payload):
+                        await _progress_q.put(payload)
 
-                # Streaming progress for long-running tools (bash, python).
-                # The bash/python branches inside _direct_fallback emit
-                # periodic {elapsed_s, tail} payloads via this callback;
-                # we forward each one as a `tool_progress` SSE event so
-                # the UI can render live elapsed-time + tail-of-output.
-                _progress_q: asyncio.Queue = asyncio.Queue()
-                async def _push_progress(payload):
-                    await _progress_q.put(payload)
-
-                async def _run_tool():
-                    try:
-                        return await execute_tool_block(
-                            block,
-                            session_id=session_id,
-                            disabled_tools=disabled_tools,
-                            tool_policy=tool_policy,
-                            owner=owner,
-                            progress_cb=_push_progress,
-                            workspace=workspace,
-                        )
-                    finally:
-                        # Sentinel so the drainer knows to stop.
-                        await _progress_q.put(None)
-
-                _tool_task = asyncio.create_task(_run_tool())
-                try:
-                    # Drain progress events as they arrive — block until the
-                    # next event OR the tool finishes (sentinel = None).
-                    while True:
-                        evt = await _progress_q.get()
-                        if evt is None:
-                            break
-                        yield (
-                            f'data: {json.dumps({"type": "tool_progress", "tool": block.tool_type, "round": round_num, **evt})}\n\n'
-                        )
-                    desc, result = await _tool_task
-                finally:
-                    # If the SSE client disconnects (or this generator is
-                    # otherwise closed) while we're awaiting a progress event
-                    # above, GeneratorExit is thrown in right here and the
-                    # `await _tool_task` on the line above never runs — the
-                    # task (and any subprocess execute_tool_block spawned for
-                    # bash/python tools) would otherwise keep running
-                    # orphaned with nothing left to await or cancel it.
-                    if not _tool_task.done():
-                        _tool_task.cancel()
+                    async def _run_tool():
                         try:
-                            await _tool_task
-                        except (asyncio.CancelledError, Exception):
-                            pass
+                            return await execute_tool_block(
+                                block,
+                                session_id=session_id,
+                                disabled_tools=disabled_tools,
+                                tool_policy=tool_policy,
+                                owner=owner,
+                                progress_cb=_push_progress,
+                                workspace=workspace,
+                                allow_browser_unsafe=_allow_browser_unsafe,
+                            )
+                        finally:
+                            # Sentinel so the drainer knows to stop.
+                            await _progress_q.put(None)
+
+                    _tool_task = asyncio.create_task(_run_tool())
+                    try:
+                        # Drain progress events as they arrive — block until the
+                        # next event OR the tool finishes (sentinel = None).
+                        while True:
+                            evt = await _progress_q.get()
+                            if evt is None:
+                                break
+                            yield (
+                                f'data: {json.dumps({"type": "tool_progress", "tool": block.tool_type, "round": round_num, **evt})}\n\n'
+                            )
+                        desc, result = await _tool_task
+                    finally:
+                        # If the SSE client disconnects (or this generator is
+                        # otherwise closed) while we're awaiting a progress event
+                        # above, GeneratorExit is thrown in right here and the
+                        # `await _tool_task` on the line above never runs — the
+                        # task (and any subprocess execute_tool_block spawned for
+                        # bash/python tools) would otherwise keep running
+                        # orphaned with nothing left to await or cancel it.
+                        if not _tool_task.done():
+                            _tool_task.cancel()
+                            try:
+                                await _tool_task
+                            except (asyncio.CancelledError, Exception):
+                                pass
+                    if _dd_key is not None and isinstance(result, dict) and not result.get("error"):
+                        _turn_tool_cache[_dd_key] = (desc, result)
+                        _session_cache_put(session_id, _dd_key, desc, result)
+                    # Onda 4 / B10: cap dell'output tool IN-TURNO uguale a quello della storia
+                    # (ODYSSEUS_HISTORY_TOOL_CHARS), cosi' il messaggio tool in cache e quello
+                    # rigiocato al turno dopo sono byte-identici e il replay copre tutta la chat.
+                    _cap = 0
+                    try:
+                        _cap = int(_os.getenv("ODYSSEUS_TOOL_OUTPUT_CHARS", "0") or 0)
+                    except ValueError:
+                        _cap = 0
+                    if _cap > 0 and isinstance(result, dict) and not result.get("error"):
+                        for _k in ("output", "response", "results", "content", "stdout"):
+                            _v = result.get(_k)
+                            if isinstance(_v, str) and len(_v) > _cap:
+                                result[_k] = _v[:_cap] + f"\n…[output troncato a {_cap} caratteri]"
 
             # A skill the model just loaded can prescribe tools that weren't
             # RAG-selected this turn (declared via requires_toolsets in its
@@ -4728,6 +5554,24 @@ async def stream_agent_loop(
                                 break
                     except Exception as _e:
                         logger.debug(f"skill requires_toolsets unlock skipped: {_e}")
+
+            if (
+                block.tool_type == "browser_more"
+                and _relevant_tools is not None
+                and not result.get("error")
+            ):
+                _new_browser_tools = {
+                    str(name) for name in (result.get("unlock_tools") or [])
+                    if isinstance(name, str)
+                    and name.startswith(_BROWSER_MCP_PREFIX)
+                    and name not in disabled_tools
+                }
+                if _new_browser_tools:
+                    _relevant_tools.update(_new_browser_tools)
+                    logger.info(
+                        "[browser-disclosure] unlocked for next round: %s",
+                        sorted(_new_browser_tools),
+                    )
 
             # Extract structured web sources from web_search tool output.
             # web_search returns {"output": ..., "exit_code": 0}; check "output"
@@ -5062,6 +5906,11 @@ async def stream_agent_loop(
                 # message removes it as answered.
                 tool_event["ask_user"] = _pending_ask_user_event
             tool_events.append(tool_event)
+            if _os.getenv("ODYSSEUS_GROUNDING_CHECK", "0") == "1" or _os.getenv("ODYSSEUS_GROUNDING_RETRY", "0") == "1":
+                try:
+                    _turn_tool_raw.append(json.dumps(result, ensure_ascii=False, default=str) if isinstance(result, dict) else str(result))
+                except Exception:
+                    pass
             if block.tool_type in _VERIFIER_EFFECTFUL_TOOLS:
                 _effectful_used = True
 
@@ -5118,7 +5967,30 @@ async def stream_agent_loop(
         # (and left the real call answered empty).
         _append_tool_results(messages, round_response, converted_calls,
                              tool_results, tool_result_texts, used_native, round_num,
-                             round_reasoning=round_reasoning)
+                             round_reasoning=round_reasoning,
+                             model_name=round_actual_model or model or "")
+
+        # Vergilius, promemoria a giro N: dal terzo giro in poi il rischio
+        # non e' piu' "troppo poco" ma "raccolta infinita". Un modello
+        # piccolo perde il filo su 30K+ token di risultati: gli si ricorda
+        # cosa ha gia' e gli si chiede di chiudere o di fare LA chiamata
+        # mancante — una, non un'altra campagna di raccolta. Append-only:
+        # il prefisso resta stabile per la cache.
+        if round_num >= 3 and _STATE_REMINDER:
+            _strumenti_usati = sorted({t.get("tool") or t.get("tool_type") or "?"
+                                       for t in tool_events if isinstance(t, dict)}) or ["nessuno"]
+            # Ruolo user (slot a cui il modello obbedisce — pattern
+            # environment_details di Cline / system-reminder di Claude Code).
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"[state] Round {round_num} done. Tools run: "
+                    f"{', '.join(str(s) for s in _strumenti_usati)}. "
+                    "Results answer the question → WRITE FINAL ANSWER NOW. "
+                    "Otherwise: ONE missing call only. Never re-run a tool "
+                    "with similar arguments. (Automated.)"
+                ),
+            })
 
         # Emit agent_step event
         yield (
@@ -5150,10 +6022,37 @@ async def stream_agent_loop(
     if _fallback_chunk:
         yield _fallback_chunk
 
+    # Onda 4 / H4 detector-only: numeri della risposta non presenti negli
+    # output tool del turno (solo log; misura Result-Ignore/Output-Fabrication).
+    if _os.getenv("ODYSSEUS_GROUNDING_CHECK", "0") == "1":
+        try:
+            _gr = _grounding_check(strip_tool_blocks(full_response),
+                                   _turn_tool_raw + _tool_raw_storia(), _last_user_text(messages))
+            logger.info("[grounding] tools=%d numeri=%d non_supportati=%d es=%s entita=%s assenti=%s",
+                        len(tool_events), _gr["numeri"], _gr["non_supportati"], _gr["esempi"],
+                        _gr.get("entita"), _gr.get("entita_assenti"))
+        except Exception as _gr_err:
+            logger.info("[grounding] errore %s", _gr_err)
+
     # Do not persist raw textual tool-call JSON / role markers as assistant
     # prose. Local finetunes may emit those before the parser catches and
     # executes them; saved history should contain only the user-facing answer.
     full_response = strip_tool_blocks(full_response).strip()
+
+    # Vergilius: memoria delle sequenze riuscite. Turno buono = almeno un
+    # tool, una risposta vera, niente giri esauriti ne' attesa dell'utente.
+    # La traccia servira' da esempio alle domande simili (few-shot dinamico).
+    try:
+        if (tool_events and len(full_response) > 80
+                and not _exhausted_rounds and not _awaiting_user):
+            from src.tracce_agente import registra as _registra_traccia
+            _registra_traccia(
+                _last_user or "",
+                [_resolved_tool_event_name(_e) for _e in tool_events
+                 if isinstance(_e, dict)],
+            )
+    except Exception:
+        pass
     if _ody_qwen_finetune_model:
         full_response = _normalize_ody_qwen_text_artifacts(full_response)
         if (
@@ -5224,6 +6123,20 @@ async def stream_agent_loop(
         backend_prefill_tps=backend_prefill_tps,
     )
     metrics["requested_model"] = requested_model
+    if _os.getenv("ODYSSEUS_HISTORY_REPLAY", "0") == "1" and not guide_only:
+        try:
+            _ctx_persist, _tail_persist = _history_tail_for_persist(messages)
+            if _ctx_persist and _ctx_persist.get("ctx"):
+                metrics["datetime_ctx"] = _ctx_persist["ctx"]
+                metrics["llm_pre"] = _ctx_persist.get("pre") or []
+                if isinstance(_ctx_persist.get("user_sent"), str) and _ctx_persist.get("user_sent"):
+                    metrics["llm_user_sent"] = _ctx_persist["user_sent"]
+            if _tail_persist:
+                metrics["llm_tail"] = _tail_persist
+            logger.info("[history-replay] persisto pre=%d coda=%d messaggi",
+                        len((_ctx_persist or {}).get("pre") or []), len(_tail_persist))
+        except Exception as _hr_err:
+            logger.info("[history-replay] persistenza fallita: %s", _hr_err)
     yield f"data: {json.dumps({'type': 'metrics', 'data': metrics})}\n\n"
 
     # Teacher-escalation: inline takeover visible in the chat stream.

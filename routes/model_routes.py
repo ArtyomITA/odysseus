@@ -1370,6 +1370,9 @@ def _api_key_fingerprint(api_key: Optional[str]) -> str:
 
 def setup_model_routes(model_discovery):
     router = APIRouter(prefix="/api")
+    import threading as _vista_threading
+    _vista_watcher_keys = set()
+    _vista_watcher_lock = _vista_threading.Lock()
 
     # ---- Model list cache ----
     import time as _time
@@ -1657,6 +1660,138 @@ def setup_model_routes(model_discovery):
         if background or refresh:
             _refresh_caches_bg(force=refresh)
         return result
+
+    # ── llama-swap runtime (Vergilius) ──────────────────────────────────
+    # Switching profile in the model dropdown makes llama-swap stop one
+    # llama-server and start another (30-60s cold). These two routes let the
+    # frontend show a loading overlay instead of a chat that silently hangs,
+    # and report the loaded model's real `modalities.vision`.
+
+    def _resolve_known_endpoint(request: Request, endpoint_url: str) -> str:
+        """Map a client-supplied endpoint URL onto a configured endpoint.
+
+        The client picks the URL, so it must never be fetched as given —
+        that would turn these routes into an SSRF gadget pointed at anything
+        reachable from the server. Only enabled endpoints the caller can
+        already see are accepted, and the DB's own base_url is returned.
+        """
+        owner = effective_user(request) or ""
+        auth_mgr = getattr(request.app.state, "auth_manager", None)
+        if not owner and not _auth_disabled() and auth_mgr is not None and getattr(auth_mgr, "is_configured", False):
+            raise HTTPException(401, "Not authenticated")
+        wanted = _normalize_base(endpoint_url or "")
+        if not wanted:
+            raise HTTPException(400, "endpoint_url is required")
+        db = SessionLocal()
+        try:
+            rows = db.query(ModelEndpoint).filter(ModelEndpoint.is_enabled == True)
+            if owner:
+                rows = owner_filter(rows, ModelEndpoint, owner)
+            for ep in rows.all():
+                if _normalize_base(ep.base_url) == wanted:
+                    return _normalize_base(ep.base_url)
+        finally:
+            db.close()
+        raise HTTPException(404, "Unknown model endpoint")
+
+    @router.get("/model-runtime/status")
+    def model_runtime_status(request: Request, endpoint_url: str = Query(...), model: str = Query(...)):
+        """Loading state + real capabilities of one llama-swap profile.
+
+        `{"swap": false}` for anything that isn't llama-swap, so the UI knows
+        to skip the overlay entirely rather than spin forever.
+        """
+        base = _resolve_known_endpoint(request, endpoint_url)
+        from src import llamaswap
+        out = llamaswap.status(base, model)
+        # Status is deliberately read-only. A late poll for a previously
+        # selected ling-vista profile must never resurrect Holo after the user
+        # has switched back to plain Ling.
+        return out
+
+    @router.post("/model-runtime/warmup")
+    def model_runtime_warmup(request: Request, payload: Dict[str, Any] = Body(...)):
+        """Start loading a profile and return immediately.
+
+        Returns `{"swap": true, "state": "..."}`; the caller polls
+        /model-runtime/status until `state == "ready"`. Loading is kicked off
+        in a thread because llama-swap holds the /upstream request open for
+        the whole swap, which is longer than any sane HTTP timeout here.
+        """
+        base = _resolve_known_endpoint(request, str(payload.get("endpoint_url") or ""))
+        model = str(payload.get("model") or "").strip()
+        if not model:
+            raise HTTPException(400, "model is required")
+        from src import llamaswap
+        if not llamaswap.is_llamaswap(base):
+            return {"swap": False, "state": ""}
+        state = llamaswap.model_state(base, model)
+        if not state:
+            raise HTTPException(404, "Unknown llama-swap model profile")
+        if state not in ("ready", "starting"):
+            import threading as _threading
+            _threading.Thread(
+                target=llamaswap.start_load,
+                args=(base, model),
+                kwargs={"timeout": 300.0},
+                daemon=True,
+            ).start()
+            state = "starting"
+        # Vergilius: `ling-vista` = Ling + occhi esterni (Holo su CPU). Holo
+        # parte SOLO dopo che Ling e' ready (nel route status sopra); il loader
+        # lato UI aspetta entrambi. Scegliere un profilo senza -vista spegne
+        # gli occhi: niente RAM sprecata e modalita' vista coerente col modello.
+        try:
+            from src.vista.client import get_vista
+            _v = get_vista()
+            if llamaswap.vista_esterna(model):
+                _start_generation = _v.imposta_attiva(True)
+                if state == "ready" and not _v.pronto():
+                    _v.avvia_in_background(
+                        expected_generation=_start_generation
+                    )
+                elif state != "ready":
+                    # One watcher per warmup request is harmless: generation
+                    # checks make stale workers exit, while VistaClient itself
+                    # deduplicates the real start/warm thread.
+                    _watcher_key = (base, model, _start_generation)
+                    with _vista_watcher_lock:
+                        _new_watcher = _watcher_key not in _vista_watcher_keys
+                        if _new_watcher:
+                            _vista_watcher_keys.add(_watcher_key)
+                    if _new_watcher:
+                        def _avvia_occhi_dopo_ling() -> None:
+                            try:
+                                deadline = _time.monotonic() + 360.0
+                                while _time.monotonic() < deadline:
+                                    if not _v.generazione_attiva(_start_generation):
+                                        return
+                                    if llamaswap.model_state(base, model) == "ready":
+                                        _v.avvia_in_background(
+                                            expected_generation=_start_generation
+                                        )
+                                        return
+                                    _time.sleep(0.5)
+                            finally:
+                                with _vista_watcher_lock:
+                                    _vista_watcher_keys.discard(_watcher_key)
+
+                        _vista_threading.Thread(
+                            target=_avvia_occhi_dopo_ling,
+                            name="vista-after-ling",
+                            daemon=True,
+                        ).start()
+            else:
+                _stop_generation = _v.imposta_attiva(False)
+                import threading as _t3
+                _t3.Thread(
+                    target=_v.ferma,
+                    kwargs={"expected_generation": _stop_generation},
+                    daemon=True,
+                ).start()
+        except Exception as _e:
+            logger.debug("[vista] warmup occhi non applicato: %s", _e)
+        return {"swap": True, "state": state}
 
     # Brief cache for local-probe results so picker-open doesn't hammer
     # endpoint health checks every time. 8s TTL — long enough to amortize cost,

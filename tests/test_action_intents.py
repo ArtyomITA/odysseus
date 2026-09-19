@@ -56,6 +56,71 @@ def test_explicit_web_search_promotes_to_agent():
     assert classify_tool_intent("use web search and find a recipe").category == "web"
 
 
+def test_italian_browser_and_web_actions_promote_to_agent():
+    browser_prompts = [
+        "Apri YouTube e dimmi i primi tre canali che vedi",
+        "Vai sul sito example.com",
+        "Clicca il pulsante nella pagina",
+        "Vai su example.com",
+        "Apri https://example.com",
+        "Leggi questa pagina",
+    ]
+    for prompt in browser_prompts:
+        intent = classify_tool_intent(prompt)
+        assert intent.needs_tools
+        assert intent.category == "browser"
+
+    web = classify_tool_intent("Cerca su internet le ultime notizie su CUDA")
+    assert web.needs_tools
+    assert web.category == "web"
+
+
+def test_italian_personal_searches_route_to_their_local_domains():
+    expected = {
+        "Cerca nelle mie chat la conversazione su Ling": "sessions",
+        "Trova nelle mie note il promemoria per domani": "notes",
+        "Cerca nella mia posta il messaggio di Luca": "email",
+    }
+    for prompt, category in expected.items():
+        intent = classify_tool_intent(prompt)
+        assert intent.needs_tools, prompt
+        assert intent.category == category, prompt
+
+
+def test_italian_read_lookup_and_research_requests_promote():
+    expected = {
+        "Controlla il meteo": "web",
+        "Che tempo fa oggi?": "web",
+        "Cosa ho in calendario domani?": "calendar",
+        "Quali appuntamenti ho oggi?": "calendar",
+        "Mostrami le mie note": "notes",
+        "Fammi una ricerca approfondita su Ling": "research",
+        "Cerca Ling 3.0": "web",
+    }
+    for prompt, category in expected.items():
+        intent = classify_tool_intent(prompt)
+        assert intent.needs_tools, prompt
+        assert intent.category == category, prompt
+
+
+def test_italian_generic_lookup_excludes_local_personal_targets():
+    for prompt in ("Cerca nelle chat CUDA", "Cerca nelle mie chat Ling", "Cerca nelle note Ling"):
+        assert classify_tool_intent(prompt).category != "web"
+    local = classify_tool_intent("Trova il file config.yaml")
+    assert local.needs_tools and local.category == "workspace"
+
+
+def test_italian_explanatory_questions_stay_plain_chat():
+    assert not message_needs_tools("Come posso aprire un sito nel browser?")
+    assert not message_needs_tools("Puoi spiegare come funziona il calendario?")
+
+
+def test_italian_note_router_does_not_capture_any_generic_write_verb():
+    assert classify_tool_intent("Scrivi una poesia sulla luna").category != "notes"
+    assert classify_tool_intent("Crea un programma Python").category != "notes"
+    assert classify_tool_intent("Scrivi una nota: compra il latte").category == "notes"
+
+
 def test_workspace_agent_requests_promote_to_shell_workspace():
     prompts = [
         "fix the bug in this repo",
@@ -68,6 +133,23 @@ def test_workspace_agent_requests_promote_to_shell_workspace():
         intent = classify_tool_intent(prompt)
         assert intent.needs_tools
         assert intent.category == "workspace"
+
+
+def test_italian_workspace_action_promotes_to_agent():
+    intent = classify_tool_intent("Analizza il codice del repo e testa il fix")
+    assert intent.needs_tools
+    assert intent.category == "workspace"
+
+    for prompt in ("Crea un file nel repo", "Scrivi il fix nel codice"):
+        intent = classify_tool_intent(prompt)
+        assert intent.needs_tools
+        assert intent.category == "workspace"
+
+
+def test_italian_write_in_browser_is_not_misrouted_to_notes():
+    intent = classify_tool_intent("Scrivi Roma nel campo del browser")
+    assert intent.needs_tools
+    assert intent.category == "browser"
 
 
 def test_explanatory_calendar_questions_stay_plain_chat():

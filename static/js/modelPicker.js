@@ -6,6 +6,7 @@ import uiModule from './ui.js';
 import settingsModule from './settings.js';
 import { sortModelObjects } from './modelSort.js';
 import spinnerModule from './spinner.js';
+import modelLoadingModule from './modelLoading.js';
 
 const API_BASE = window.location.origin;
 
@@ -14,6 +15,9 @@ const API_BASE = window.location.origin;
 // own key. Favorites is the SAME key the sidebar Models section uses, so a
 // favorite toggled here shows up there and vice-versa.
 const RECENT_KEY = 'odysseus-model-recent';
+
+// Una sola scaldata all'apertura della chat (vedi updateModelPicker).
+let _warmupIniziale = false;
 const FAVORITES_KEY = 'odysseus-model-favorites';
 const RECENT_MAX = 5;
 // Catalogs at or below this size are small enough that hiding everything
@@ -641,6 +645,17 @@ function _initModelPickerDropdown() {
     }
   }
 
+  // Vergilius: a pick against llama-swap means an actual process swap, so
+  // start the load now and show the overlay instead of letting the first
+  // message hang for a minute. Deliberately NOT awaited by _pick: the picker
+  // must stay responsive, and llama-swap queues any request that arrives
+  // mid-load anyway. Resolving capabilities is a side effect of the same call.
+  function _warmupPicked(m) {
+    try {
+      modelLoadingModule.warmup(m).catch(() => {});
+    } catch (_) { /* module missing — pre-Vergilius behaviour */ }
+  }
+
 async function _pick(m) {
     _defaultPendingSeq++;
     try {
@@ -687,6 +702,7 @@ async function _pick(m) {
       updateModelPicker();
       uiModule.showToast(`Using ${m.display}`);
       finishSwitch();
+      _warmupPicked(m);
       return;
     } else if (!currentSessionId) {
       // No session yet — create one with this model
@@ -726,6 +742,7 @@ async function _pick(m) {
     if (window.refreshChatContextHeader) window.refreshChatContextHeader('model-pick');
     uiModule.showToast(`Using ${m.display}`);
     finishSwitch();
+    _warmupPicked(m);
   }
 
   document.addEventListener('odysseus:auto-select-model', async (e) => {
@@ -856,9 +873,13 @@ export function updateModelPicker() {
   if (!_deps) return;
   const label = document.getElementById('model-picker-label');
   if (!label) return;
-  // Hide model picker when group chat is active
+  // Hide model picker when group chat is active, or when the ShadowBroker
+  // workspace covers the chat: the picker belongs to the composer, and leaving
+  // it up paints the model pill on top of a view where it means nothing.
   const wrap = document.getElementById('model-picker-wrap');
-  if (window.groupModule && window.groupModule.isActive()) {
+  const inGroup = !!(window.groupModule && window.groupModule.isActive());
+  const inShadowBroker = !!(window.OdysseusShadowBroker && window.OdysseusShadowBroker.isOpen());
+  if (inGroup || inShadowBroker) {
     if (wrap) { wrap.style.display = 'none'; }
     return;
   }
@@ -943,6 +964,23 @@ export function updateModelPicker() {
     (!modelId || (latestPending && latestPending.source === 'fallback'))
   ) {
     _ensureDefaultPendingChat();
+  }
+
+  // Vergilius: scaldare il modello ANCHE all'apertura della chat, non solo
+  // quando l'utente ne sceglie uno dal menu. Dopo il boot llama-swap non ha
+  // nulla caricato: senza questa chiamata non partiva alcun sondaggio di stato,
+  // quindi niente rotella di caricamento e si poteva scrivere mentre il modello
+  // era ancora in `starting` (misurato: 80 s per il primo carico di Q6_K).
+  // Una sola volta per pagina, e mai per la voce segnaposto "Select model".
+  if (modelId && !_warmupIniziale) {
+    _warmupIniziale = true;
+    const _u = (s && s.endpoint_url) || (_pendingChat && _pendingChat.url) || '';
+    if (_u) {
+      try {
+        modelLoadingModule.warmup({ mid: modelId, url: _u, display: modelId.split('/').pop() })
+          .catch(() => {});
+      } catch (_) { /* modulo assente */ }
+    }
   }
 
   const displayName = modelId ? modelId.split('/').pop() : 'Select model';

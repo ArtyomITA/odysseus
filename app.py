@@ -55,7 +55,7 @@ from typing import Dict
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -264,6 +264,7 @@ if AUTH_ENABLED:
         "/api/auth/settings",
         "/api/auth/integrations/presets",
         "/api/health",
+        "/api/startup-profile-status",
         "/api/version",
         "/login",
     }
@@ -719,6 +720,18 @@ app.include_router(setup_embedding_routes())
 from routes.model_routes import setup_model_routes
 app.include_router(setup_model_routes(model_discovery))
 
+# ShadowBroker workspace (discovery + liveness for the embedded dashboard)
+from routes.shadowbroker_routes import setup_shadowbroker_routes
+app.include_router(setup_shadowbroker_routes())
+
+# Vergilius: Vista (gli occhi) — avvio on-demand di Holo e stato per il loader
+from routes.vista_routes import setup_vista_routes
+app.include_router(setup_vista_routes())
+
+# Vergilius: proxy verso il Boot (:7001) per il selettore di profilo in alto
+from routes.boot_routes import setup_boot_routes
+app.include_router(setup_boot_routes())
+
 # GitHub Copilot device-flow login
 from routes.copilot_routes import setup_copilot_routes
 app.include_router(setup_copilot_routes())
@@ -868,7 +881,32 @@ app.include_router(setup_companion_routes())
 async def serve_index(request: Request):
     static_path = abs_join(BASE_DIR, "static/index.html")
     if os.path.exists(static_path):
-        return serve_html_with_nonce(request, static_path)
+        response = serve_html_with_nonce(request, static_path)
+        # Vergilius Lite keeps the complete application shell and every tool,
+        # but does not download/initialise the optional Live2D runtime. Full
+        # keeps the byte-for-byte original markup. This is profile selection,
+        # not feature removal: restarting with Full restores Avatar 2D.
+        if os.getenv("ODYSSEUS_AVATAR2D_ENABLED", "1").strip().lower() in {"0", "false", "no", "off"}:
+            html = response.body.decode("utf-8")
+            avatar_scripts = (
+                '<script src="/static/lib/live2dcubismcore.min.js"></script>',
+                '<script src="/static/lib/pixi.min.js"></script>',
+                '<script src="/static/lib/pixi-unsafe-eval.min.js"></script>',
+                '<script src="/static/lib/live2d-cubism4.min.js"></script>',
+                '<script type="module" src="/static/js/avatarCore.js"></script>',
+                '<script type="module" src="/static/js/avatarDock.js"></script>',
+                '<script type="module" src="/static/js/avatarPersona.js"></script>',
+            )
+            for tag in avatar_scripts:
+                html = html.replace(tag, "")
+            html = html.replace(
+                '<div id="avatar-dock" hidden>',
+                '<div id="avatar-dock" hidden data-profile-disabled="true">',
+            )
+            headers = dict(response.headers)
+            headers.pop("content-length", None)
+            return HTMLResponse(html, status_code=response.status_code, headers=headers)
+        return response
     # No static bundle — fall back to a root-level index.html if one is shipped.
     # If neither exists, serve_html_with_nonce logs it and returns a generic 500:
     # a missing index.html is a broken deployment (server fault), not a client
@@ -931,6 +969,28 @@ async def get_version():
 @app.get("/api/health")
 async def health_check() -> Dict[str, str]:
     return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
+@app.get("/api/startup-profile-status")
+async def startup_profile_status() -> Dict[str, object]:
+    """Aggregate readiness used by the local graphical startup gate.
+
+    No MCP names, commands, endpoints or credentials are exposed here; the
+    route only confirms that profile-selected eager initialization completed.
+    """
+    warmups_enabled = str(os.getenv("ODYSSEUS_STARTUP_WARMUPS", "")).lower() in {
+        "1", "true", "yes", "on",
+    }
+    mcp_ready = bool(getattr(app.state, "mcp_startup_complete", False))
+    tool_index_ready = bool(getattr(app.state, "tool_index_warmup_complete", not warmups_enabled))
+    endpoints_ready = bool(getattr(app.state, "endpoint_warmup_complete", not warmups_enabled))
+    return {
+        "ready": mcp_ready and tool_index_ready and endpoints_ready,
+        "profile": os.getenv("ODYSSEUS_STARTUP_PROFILE", "full"),
+        "mcp_initialized": mcp_ready,
+        "tool_index_initialized": tool_index_ready,
+        "model_endpoints_warmed": endpoints_ready,
+    }
 
 @app.post("/api/client-perf")
 async def client_perf(request: Request):
@@ -1008,6 +1068,9 @@ app.router.lifespan_context = _lifespan
 async def _startup_event():
     global upload_cleanup_task
     logger.info("Application starting up...")
+    app.state.mcp_startup_complete = False
+    app.state.tool_index_warmup_complete = False
+    app.state.endpoint_warmup_complete = False
     webhook_manager.set_loop(asyncio.get_running_loop())
     # Wipe any leftover incognito sessions from previous process — they're
     # ephemeral by design and must not survive a restart.
@@ -1039,6 +1102,15 @@ async def _startup_event():
         _startup_tasks.append(start_bg_monitor())
     except Exception as _e:
         logger.warning("Failed to start background-job monitor: %s", _e)
+    # Archivio finanziario: ogni 10 minuti le notizie fresche entrano nel RAG
+    # dedicato, cosi' il passato resta consultabile anche dopo un riavvio.
+    # Legge dal magazzino layer (niente chiamate Finnhub in piu') e parte con
+    # 90s di ritardo per non pesare sull'avvio.
+    try:
+        from src.shadowbroker.archivio import giro_di_fondo
+        _startup_tasks.append(asyncio.create_task(giro_di_fondo()))
+    except Exception as _e:
+        logger.warning("Archivio finanziario non avviato: %s", _e)
     # MCP servers can be slow or blocked by local tooling. Connect them after
     # the web server is accepting traffic instead of delaying the whole UI.
     async def _startup_mcp_connections():
@@ -1053,6 +1125,8 @@ async def _startup_event():
             logger.warning("User MCP startup timed out (non-critical)")
         except BaseException as e:
             logger.warning(f"MCP startup failed (non-critical): {type(e).__name__}: {e}")
+        finally:
+            app.state.mcp_startup_complete = True
 
     _startup_tasks.append(asyncio.create_task(_startup_mcp_connections()))
 
@@ -1070,6 +1144,8 @@ async def _startup_event():
                     logger.info("[startup] Tool index pre-warmed")
             except Exception as e:
                 logger.warning(f"Tool index warmup failed (non-critical): {type(e).__name__}: {e}")
+            finally:
+                app.state.tool_index_warmup_complete = True
 
         _startup_tasks.append(asyncio.create_task(_warmup_tool_index()))
 
@@ -1089,9 +1165,13 @@ async def _startup_event():
                         logger.debug(f"Warmup ping failed for endpoint: {e}")
             except Exception as e:
                 logger.debug(f"Warmup ping skipped: {e}")
+            finally:
+                app.state.endpoint_warmup_complete = True
 
         _startup_tasks.append(asyncio.create_task(_warmup_endpoints()))
     else:
+        app.state.tool_index_warmup_complete = True
+        app.state.endpoint_warmup_complete = True
         logger.info("Startup warmups disabled (set ODYSSEUS_STARTUP_WARMUPS=1 to enable)")
 
     # Keep-alive is opt-in. The ping path performs model discovery, and when

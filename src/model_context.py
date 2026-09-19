@@ -417,7 +417,25 @@ def _query_context_length(endpoint_url: str, model: str) -> Tuple[int, bool]:
             return api_ctx, True
         return DEFAULT_CONTEXT, False
 
-    # Try llama.cpp /slots endpoint first — reports actual serving context
+    # llama-swap owns /slots itself (404); the loaded upstream's /props is the
+    # authoritative source for the actual --ctx-size. Never use load=True here:
+    # generic context discovery must not evict another active profile.
+    if is_local_endpoint(endpoint_url):
+        try:
+            from src.llamaswap import is_llamaswap, props as llamaswap_props
+            if is_llamaswap(endpoint_url):
+                info = llamaswap_props(endpoint_url, model, load=False)
+                swap_ctx = (info or {}).get("context_tokens")
+                if isinstance(swap_ctx, int) and swap_ctx > 0:
+                    logger.info(
+                        "llama-swap /props reports n_ctx=%s for %s",
+                        swap_ctx, model,
+                    )
+                    return swap_ctx, True
+        except Exception as exc:
+            logger.debug("Failed to read llama-swap context for %s: %s", model, exc)
+
+    # Try a direct llama.cpp /slots endpoint next.
     if is_local_endpoint(endpoint_url):
         try:
             base = endpoint_url.split("/v1")[0] if "/v1" in endpoint_url else endpoint_url.rsplit("/", 1)[0]

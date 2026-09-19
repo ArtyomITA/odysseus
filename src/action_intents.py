@@ -37,7 +37,8 @@ _CALENDAR_ACTION = (
 _CALENDAR_THING = r"(?:calendar|calendar\s+(?:entry|item)|event|meeting|appointment|entry|call)"
 _CALENDAR_READ_THING = r"(?:calendar|schedule|events?|meetings?|appointments?|classes?)"
 _EXPLANATORY_PREFIX = re.compile(
-    r"^\s*(?:how\s+(?:do|can)\s+i|can\s+you\s+explain|what\s+about|tell\s+me\s+how|show\s+me\s+how)\b",
+    r"^\s*(?:how\s+(?:do|can)\s+i|can\s+you\s+explain|what\s+about|tell\s+me\s+how|show\s+me\s+how|"
+    r"come\s+(?:posso|faccio|si\s+fa)|puoi\s+spiegare|spiegami\s+come|dimmi\s+come|mostrami\s+come)\b",
     re.I,
 )
 
@@ -49,6 +50,30 @@ _PANEL = (
 _ROUTING_PATTERNS: tuple[tuple[str, str, Pattern[str]], ...] = tuple(
     (category, reason, re.compile(pattern, re.I))
     for category, reason, pattern in (
+        # Italian action pairs. Keep them before generic English categories so
+        # an interactive "apri il sito" selects browser rather than quick web.
+        ("browser", "Italian URL navigation request", r"^\s*(?:(?:per favore|ok|allora)[\s,.!-]+)*(?:apri|vai\s+(?:su|a)|naviga(?:\s+(?:su|a))?)\s+(?:https?://|www\.|(?:[a-z0-9-]+\.)+[a-z]{2,})(?:\S*)?\s*$"),
+        ("browser", "Italian browser navigation request", r"^\s*(?:(?:per favore|ok|allora)[\s,.!-]+)*(?:apri|vai\s+(?:su|sul|sulla|sui|sugli|sulle)|naviga(?:\s+(?:su|sul|sulla|sui|sugli|sulle))?)\s+(?:(?:il|la|un|una)\s+)?(?:browser|sito|pagina|link|url|youtube|chrome|firefox)\b"),
+        ("browser", "Italian browser interaction request", r"\b(?:clicca|digita|scrivi|compila|seleziona|invia)\b.{0,100}\b(?:nel|nella|sul|sulla|il|la)?\s*(?:browser|sito|pagina|link|campo|modulo|pulsante|bottone)\b"),
+        ("browser", "Italian browser page read/find request", r"\b(?:leggi|trova|cerca)\b.{0,100}\b(?:questa|nella|sulla|la|nel|sul)?\s*(?:pagina|browser|sito)\b"),
+        ("web", "Italian weather lookup request", r"(?:^\s*che\s+tempo\s+fa\b|\b(?:controlla|mostrami|dimmi|verifica)\b.{0,100}\b(?:meteo|previsioni|tempo)\b|\b(?:meteo|previsioni)\b.{0,80}\b(?:oggi|domani|adesso|attuale)\b)"),
+        ("calendar", "Italian calendar lookup request", r"(?:\b(?:cosa|che|quali)\b.{0,100}\b(?:calendario|eventi|appuntamenti|riunioni)\b|\b(?:mostrami|elenca|controlla|verifica)\b.{0,100}\b(?:calendario|eventi|appuntamenti|riunioni)\b)"),
+        ("sessions", "Italian chat/session lookup request", r"\b(?:cerca|cercami|trova)\b.{0,80}\b(?:(?:nelle?|tra\s+le|in)\s+)?(?:mie\s+)?(?:chat|sessioni|conversazioni|cronologia)\b"),
+        ("notes", "Italian notes search request", r"\b(?:cerca|cercami|trova)\b.{0,80}\b(?:(?:nelle?|tra\s+le|in)\s+)?(?:mie\s+)?(?:note|todo|promemoria|checklist)\b"),
+        ("email", "Italian email search request", r"\b(?:cerca|cercami|trova)\b.{0,80}\b(?:(?:nella|nelle|tra\s+le|in)\s+)?(?:(?:mia|mie)\s+)?(?:posta|email|mail|casella)\b"),
+        ("notes", "Italian notes lookup request", r"\b(?:mostrami|elenca|leggi|apri|controlla)\b.{0,80}\b(?:mie\s+)?(?:note|todo|promemoria|checklist)\b"),
+        ("research", "Italian deep research request", r"\b(?:fammi|fai|avvia|esegui)\b.{0,80}\b(?:ricerca|indagine)\s+approfondita\b"),
+        ("web", "Italian web lookup request", r"^\s*(?:(?:per favore|ok|allora)[\s,.!-]+)*(?:cerca|cercami|trova|controlla|verifica)\b.{0,120}\b(?:internet|web|online)\b"),
+        ("web", "Italian generic lookup request", r"^\s*(?:(?:per favore|ok|allora)[\s,.!-]+)*(?:cerca|cercami|trova)\s+(?!(?:(?:nel|nella|nelle|tra\s+le|il|la|i|gli|le|un|una|mio|mia|miei|mie)\s+)*(?:chat|sessioni|note|email|mail|posta|file|cartelle|repo|repository|codice|documenti|galleria)\b).{2,160}$"),
+        ("web", "Italian current information request", r"\b(?:ultime|ultimo|attuale|corrente|oggi|adesso)\b.{0,100}\b(?:notizie|meteo|prezzo|quotazione|risultato)\b"),
+        ("calendar", "Italian calendar action request", r"\b(?:aggiungi|crea|sposta|programma|fissa|elimina|cancella|annulla)\b.{0,120}\b(?:calendario|evento|riunione|appuntamento)\b"),
+        ("notes", "Italian note or reminder request", r"\bricordami\b|^\s*(?:crea\s+)?(?:un\s+)?promemoria\b|\b(?:aggiungi|crea|scrivi|segna)\b.{0,120}\b(?:nota|note|todo|promemoria|elenco|checklist)\b"),
+        ("email", "Italian email action request", r"\b(?:controlla|leggi|apri|invia|manda|scrivi|rispondi|archivia|elimina|segna)\b.{0,120}\b(?:posta|email|mail|messaggi?|casella)\b"),
+        ("ui", "Italian UI control request", r"\b(?:apri|mostra|chiudi|attiva|disattiva|cambia)\b.{0,100}\b(?:impostazioni|pannello|tema|galleria|documenti|memorie|ricerca|shell|incognito)\b"),
+        ("workspace", "Italian repository action request", r"\b(?:correggi|sistema|implementa|modifica|aggiorna|analizza|testa|esegui|crea|scrivi|aggiungi)\b.{0,160}\b(?:repo|repository|codice|progetto|app|server|api|frontend|backend|test|bug|file)\b"),
+        ("workspace", "Italian file inspection request", r"^\s*(?:(?:per favore|ok|allora)[\s,.!-]+)*(?:trova|cerca|apri|leggi|controlla|ispeziona)\b.{0,120}\b(?:file|cartella|directory|repo|repository|codice|sorgente|log|diff)\b"),
+        ("shell", "Italian command execution request", r"^\s*(?:(?:per favore|ok|allora)[\s,.!-]+)*(?:esegui|avvia|riavvia|installa|ferma|uccidi)\b.{0,100}\b(?:comando|server|servizio|processo|docker|test|build|script)\b"),
+
         # Calendar/event creation. Covers "Can you add an entry to my
         # calendar?", imperatives like "add lunch to my calendar", and
         # follow-ups such as "you should be able to create that event now".

@@ -47,6 +47,11 @@ class STTService:
             return False
         if provider == "browser":
             return True  # handled client-side
+        if provider == "stream":
+            # Trascrizione in diretta: il modello sta nel ponte voce, la pagina
+            # ci parla via WebSocket (/api/stt/stream). Niente da caricare qui,
+            # e nessun file audio passa mai da questo servizio.
+            return True
         if provider == "local":
             return self._get_whisper() is not None
         if provider.startswith("endpoint:"):

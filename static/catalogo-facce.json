@@ -1,0 +1,764 @@
+{
+ "intro": "Chiedi con parole tue: il router sceglie il tool giusto. Ogni tool grande spiega come chiama gli altri e mostra esempi coi tool che usa.",
+ "categorie": [
+  {
+   "categoria": "🌍 Panoramica del mondo",
+   "facce": [
+    {
+     "nome": "osint_situazione",
+     "desc": "Cosa conta adesso, in classifica",
+     "trig": "cosa succede di importante",
+     "come": "Prende il riepilogo dei layer, le correlazioni gia' pronte e le allerte di rischio, e le mette in classifica — non le ricalcola.",
+     "sub": [
+      {
+       "nome": "get_summary",
+       "desc": "Riepilogo leggero: conteggi di tutti i layer fast+slow, nomi layer disponibili, alias, sigint_totals, versione. Punto di partenza "
+      },
+      {
+       "nome": "get_correlations",
+       "desc": "Correlazioni pre-calcolate dallo store."
+      },
+      {
+       "nome": "gt_top_alerts",
+       "desc": "Top alert GT correnti."
+      }
+     ],
+     "esempi": [
+      {
+       "q": "cosa succede di importante nel mondo",
+       "tool": [
+        "osint_situazione"
+       ]
+      },
+      {
+       "q": "dammi il quadro e riferiscimi gli avvisi delle sorveglianze",
+       "tool": [
+        "osint_situazione"
+       ]
+      }
+     ]
+    },
+    {
+     "nome": "osint_allerte",
+     "desc": "Allarmi vivi: meteo, sismi, blackout, incendi",
+     "trig": "ci sono allarmi urgenti",
+     "come": "Legge i layer di allerta e le correlazioni, ordina per gravita'. Vivo adesso, non previsione.",
+     "sub": [
+      {
+       "nome": "get_correlations",
+       "desc": "Correlazioni pre-calcolate dallo store."
+      },
+      {
+       "nome": "get_layer_slice",
+       "desc": "Preleva solo layer top-level specifici con gating per versione (letture incrementali); what_changed usa since_layer_versions per p"
+      }
+     ],
+     "esempi": [
+      {
+       "q": "ci sono allarmi urgenti in Turchia",
+       "tool": [
+        "osint_allerte"
+       ]
+      },
+      {
+       "q": "c'e' jamming GPS o allarmi aerei in Ucraina",
+       "tool": [
+        "osint_allerte"
+       ]
+      }
+     ]
+    },
+    {
+     "nome": "osint_rischio",
+     "desc": "Dove il rischio geopolitico sta salendo (modello GT)",
+     "trig": "dove sta salendo il rischio",
+     "come": "Interroga il modello GT: classifica, dossier di una regione, o ricalcolo. Guarda avanti, diverso da osint_allerte.",
+     "sub": [
+      {
+       "nome": "gt_top_alerts",
+       "desc": "Top alert GT correnti."
+      },
+      {
+       "nome": "gt_dossier",
+       "desc": "Dossier di rischio per regione (interpretazione/scenario)."
+      },
+      {
+       "nome": "gt_analyze",
+       "desc": "Rianalizza il rischio: ingesta feed o rinfresca da latest_data, ritorna heatmap/clusters o dossier regione."
+      },
+      {
+       "nome": "gt_backtest",
+       "desc": "Backtest storico del modello GT con tuning soglia di alert."
+      }
+     ],
+     "esempi": [
+      {
+       "q": "dove sta salendo il rischio geopolitico",
+       "tool": [
+        "osint_rischio"
+       ]
+      },
+      {
+       "q": "dammi il dossier di rischio del Sahel",
+       "tool": [
+        "osint_rischio"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "categoria": "📰 Notizie e articoli",
+   "facce": [
+    {
+     "nome": "osint_notizie",
+     "desc": "Notizie per luogo/soggetto/tema — e il testo vero di un articolo",
+     "trig": "ultime notizie sull'Ucraina / leggimi quell'articolo",
+     "come": "Con un soggetto aggrega tre fonti in una chiamata; con url o id scarica il corpo dell'articolo (assorbe il vecchio osint_testo).",
+     "sub": [
+      {
+       "nome": "search_news",
+       "desc": "Ricerca news da GDELT e Telegram OSINT."
+      },
+      {
+       "nome": "finnhub_news",
+       "desc": "wire finanziario"
+      },
+      {
+       "nome": "recupera_testo",
+       "desc": "scarica il corpo della pagina (nostro)"
+      }
+     ],
+     "esempi": [
+      {
+       "q": "ultime notizie sull'Ucraina",
+       "tool": [
+        "osint_notizie"
+       ]
+      },
+      {
+       "q": "cercami news su Boeing e come sta il titolo",
+       "tool": [
+        "osint_notizie",
+        "fin_mercati"
+       ]
+      },
+      {
+       "q": "leggimi cosa dice quell'articolo",
+       "tool": [
+        "osint_notizie"
+       ]
+      }
+     ]
+    },
+    {
+     "nome": "osint_web",
+     "desc": "Ricerca sul web aperto, quando i feed non sanno",
+     "trig": "chi e' il ministro della difesa della Svezia",
+     "come": "Motore di ricerca esterno (searxng), non un comando ShadowBroker. Dichiara sempre che la fonte e' il web.",
+     "sub": [
+      {
+       "nome": "searxng",
+       "desc": "ricerca web con cache e filtro URL (nostro)"
+      }
+     ],
+     "esempi": [
+      {
+       "q": "chi e' il ministro della difesa della Svezia",
+       "tool": [
+        "osint_web"
+       ]
+      },
+      {
+       "q": "cosa produce questa azienda",
+       "tool": [
+        "osint_web"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "categoria": "✈️ Cosa si muove",
+   "facce": [
+    {
+     "nome": "osint_militare",
+     "desc": "Aerei e navi militari in movimento adesso",
+     "trig": "quali forze militari si muovono",
+     "come": "find_flights/find_ships filtrati sui mezzi militari e governativi, raggruppati per ruolo.",
+     "sub": [
+      {
+       "nome": "find_flights",
+       "desc": "Ricerca server-side compatta di voli (callsign/reg/icao24/owner), navi (mmsi/imo/nome/owner yacht) o risoluzione entita' exact-fir"
+      },
+      {
+       "nome": "find_ships",
+       "desc": "Ricerca navi per mmsi/imo/name/query."
+      }
+     ],
+     "esempi": [
+      {
+       "q": "quali forze militari si muovono ora",
+       "tool": [
+        "osint_militare"
+       ]
+      },
+      {
+       "q": "ci sono aerei spia in volo sul Baltico",
+       "tool": [
+        "osint_militare"
+       ]
+      }
+     ]
+    },
+    {
+     "nome": "osint_zona",
+     "desc": "Tutto quello che c'e' intorno a un punto",
+     "trig": "cosa c'e' vicino a Odessa",
+     "come": "brief_area = entita' vicine + news di zona + layer di contesto attorno a un punto.",
+     "sub": [
+      {
+       "nome": "brief_area",
+       "desc": "Briefing di un'area: entita' vicine + news di topic + layer di contesto (meteo, terremoti, outage, SAR)."
+      },
+      {
+       "nome": "entities_near",
+       "desc": "entities_near: entita entro raggio da lat/lng. brief_area: briefing d'area (entita vicine + news su topic + layer di contesto weat"
+      }
+     ],
+     "esempi": [
+      {
+       "q": "cosa c'e' intorno a Odessa",
+       "tool": [
+        "osint_zona"
+       ]
+      },
+      {
+       "q": "dov'e' Kramatorsk e cosa c'e' nei dintorni",
+       "tool": [
+        "osint_geocode",
+        "osint_zona"
+       ]
+      }
+     ]
+    },
+    {
+     "nome": "osint_cerca",
+     "desc": "Il profilo di una entita' precisa (aereo, nave, azienda)",
+     "trig": "dov'e' Air Force One",
+     "come": "Compone profilo + contesto vicino + relazioni/sanzioni, scartando le sezioni ridondanti (−787 token).",
+     "sub": [
+      {
+       "nome": "get_entity_profile",
+       "desc": "Dossier completo di un'entita: identita, posizione, trail, messaggi datalink, news correlate e contesto vicino."
+      },
+      {
+       "nome": "correlate_entity",
+       "desc": "Costruisce evidence pack attorno a un'entita' (entita' vicine, correlazioni, SAR, outage, RF/meteo); traccia il percorso osservato"
+      },
+      {
+       "nome": "entity_expand",
+       "desc": "Risoluzione/espansione grafo entita (aircraft, vessel, company, person, ip, country): costruisce nodi+link da Wikidata SPARQL, ip-"
+      }
+     ],
+     "esempi": [
+      {
+       "q": "dov'e' Air Force One",
+       "tool": [
+        "osint_cerca"
+       ]
+      },
+      {
+       "q": "trova lo yacht di X e cosa c'e' vicino",
+       "tool": [
+        "osint_cerca"
+       ]
+      }
+     ]
+    },
+    {
+     "nome": "osint_dettaglio",
+     "desc": "La scheda intera di qualcosa gia' citato",
+     "trig": "dammi tutti i dettagli di quell'aereo",
+     "come": "Rilegge il record completo dal magazzino locale, senza richiamare la rete.",
+     "sub": [
+      {
+       "nome": "store locale",
+       "desc": "il record completo conservato al passaggio del briefing"
+      }
+     ],
+     "esempi": [
+      {
+       "q": "dammi tutti i dettagli di quell'aereo",
+       "tool": [
+        "osint_dettaglio"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "categoria": "🗺️ La mappa",
+   "facce": [
+    {
+     "nome": "osint_mappa",
+     "desc": "Guida la mappa: centra, evidenzia, livelli, preset",
+     "trig": "mostrami sulla mappa dov'e'",
+     "come": "Traduce le azioni in comandi mappa e risolve id→coordinate. 'evidenzia' non spegne cio' che l'operatore guarda.",
+     "sub": [
+      {
+       "nome": "map_focus",
+       "desc": "centra/zooma"
+      },
+      {
+       "nome": "set_layers",
+       "desc": "accende/spegne layer"
+      },
+      {
+       "nome": "place_pin",
+       "desc": "Evidenzia sulla mappa piazzando un pin intel visibile subito all'operatore."
+      },
+      {
+       "nome": "show_satellite",
+       "desc": "Mostra a schermo intero imagery Sentinel-2 (Planetary Computer) centrata su una coordinata; accoda action=show_image."
+      },
+      {
+       "nome": "show_sentinel",
+       "desc": "Mostra imagery Sentinel Hub con preset di analisi (TRUE-COLOR/FALSE-COLOR/NDVI/MOISTURE-INDEX); accoda action=show_image source=se"
+      },
+      {
+       "nome": "place_analysis_zone",
+       "desc": "Evidenzia un'area disegnando una zona di analisi OpenClaw (quadrato con report) sulla mappa; delete/clear la rimuovono."
+      },
+      {
+       "nome": "inject_data",
+       "desc": "Inietta dati custom nei layer telemetria NATIVI (compaiono come entita' sulla mappa), taggati _injected. Layer ammessi: cctv, ship"
+      }
+     ],
+     "esempi": [
+      {
+       "q": "mostrami sulla mappa dov'e'",
+       "tool": [
+        "osint_mappa"
+       ]
+      },
+      {
+       "q": "prendi le commesse militari e mostrale sulla mappa",
+       "tool": [
+        "fin_appalti",
+        "osint_mappa"
+       ]
+      },
+      {
+       "q": "accendi solo voli militari e navi",
+       "tool": [
+        "osint_mappa"
+       ]
+      }
+     ]
+    },
+    {
+     "nome": "osint_geocode",
+     "desc": "Risolve nomi di luogo in coordinate e viceversa",
+     "come": "Chiama /api/geocode: 'cerca' fa nome→lat/lng, 'inverso' fa lat/lng→nome. Da usare PRIMA di una query geografica quando hai solo un nome.",
+     "sub": [
+      {
+       "nome": "geocode/search",
+       "desc": "nome luogo → coordinate"
+      },
+      {
+       "nome": "geocode/reverse",
+       "desc": "coordinate → nome del luogo"
+      }
+     ],
+     "esempi": [
+      {
+       "q": "dove si trova Kramatorsk",
+       "tool": [
+        "osint_geocode"
+       ]
+      },
+      {
+       "q": "che posto e' 50.4, 30.5",
+       "tool": [
+        "osint_geocode"
+       ]
+      },
+      {
+       "q": "news vicino a Bakhmut (prima le coordinate)",
+       "tool": [
+        "osint_geocode",
+        "osint_notizie"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "categoria": "🛰️ Sorveglianza e storia",
+   "facce": [
+    {
+     "nome": "osint_sorveglianza",
+     "desc": "Tieni d'occhio qualcosa e fatti avvisare",
+     "trig": "avvisami se decolla un aereo militare da qui",
+     "come": "Crea/elenca/rimuove watch persistenti; track_entity risolve da se' il tipo giusto (aereo/nave/entita').",
+     "sub": [
+      {
+       "nome": "list_watches",
+       "desc": "Elenco dei watch/alert attivi."
+      },
+      {
+       "nome": "track_entity",
+       "desc": "Risolve un'entita' e crea automaticamente il watch del tipo giusto (aircraft/ship/entity)."
+      },
+      {
+       "nome": "watch_area",
+       "desc": "Crea un geofence su un'area con tipi di entita' da sorvegliare."
+      },
+      {
+       "nome": "remove_watch",
+       "desc": "Rimuove un watch per id."
+      },
+      {
+       "nome": "clear_watches",
+       "desc": "Rimuove tutti i watch."
+      }
+     ],
+     "esempi": [
+      {
+       "q": "avvisami se decolla un aereo militare da qui",
+       "tool": [
+        "osint_sorveglianza"
+       ]
+      },
+      {
+       "q": "ci sono nuovi avvisi dalle sorveglianze",
+       "tool": [
+        "osint_sorveglianza"
+       ]
+      }
+     ]
+    },
+    {
+     "nome": "osint_storico",
+     "desc": "Time Machine: com'era la mappa nel passato",
+     "trig": "com'era la situazione 3 ore fa",
+     "come": "Elenca/cattura/riproduce snapshot della mappa. Per lo storico finanziario c'e' fin_archivio.",
+     "sub": [
+      {
+       "nome": "timemachine_list",
+       "desc": "Elenco degli ultimi 20 snapshot Time Machine + stato enabled."
+      },
+      {
+       "nome": "take_snapshot",
+       "desc": "Time Machine: snapshot della telemetria corrente (full o compressed_v1), lista/playback/diff/config degli snapshot per rendering s"
+      },
+      {
+       "nome": "timemachine_playback",
+       "desc": "Riproduce/espande i dati di uno snapshot Time Machine."
+      }
+     ],
+     "esempi": [
+      {
+       "q": "com'era la situazione 3 ore fa",
+       "tool": [
+        "osint_storico"
+       ]
+      },
+      {
+       "q": "salva lo stato della mappa adesso",
+       "tool": [
+        "osint_storico"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "categoria": "🔎 Indagine tecnica",
+   "facce": [
+    {
+     "nome": "osint_recon",
+     "desc": "IP, dominio, certificati, CVE, sanzioni",
+     "trig": "chi c'e' dietro questo IP",
+     "come": "Ombrello su osint_lookup: sceglie il sotto-tool giusto in base al valore (IP → geo, dominio → DNS...).",
+     "sub": [
+      {
+       "nome": "osint_lookup:ip",
+       "desc": "Geolocalizza un IP (ip-api.com), calcola reputation (proxy/hosting/mobile, risk_level HIGH/MEDIUM/LOW) e verifica match sanzioni O"
+      },
+      {
+       "nome": "osint_lookup:dns",
+       "desc": "Risolve record DNS (A/AAAA/MX/NS/TXT/CNAME/SOA) via dns.google e produce summary con IP, mail server, nameserver."
+      },
+      {
+       "nome": "osint_lookup:whois",
+       "desc": "WHOIS/RDAP dominio (rdap.org): entita registrar, eventi (registration/expiration/last-changed), nameserver, match sanzioni; sonda "
+      },
+      {
+       "nome": "osint_lookup:certs",
+       "desc": "Certificate transparency via crt.sh: enumera certificati e sottodomini per il dominio (fino a 50 cert / 100 subdomains)."
+      },
+      {
+       "nome": "osint_lookup:bgp",
+       "desc": "Recon BGP via bgpview.io: per IP restituisce dati prefisso; per ASN restituisce anagrafica, prefissi IPv4/IPv6 e peer upstream."
+      },
+      {
+       "nome": "osint_lookup:sanctions",
+       "desc": "Ricerca in liste sanzioni OpenSanctions/OFAC SDN per nome/entita, con filtro schema opzionale e limit clampato 1-100."
+      },
+      {
+       "nome": "osint_lookup:cve",
+       "desc": "Lookup CVE via MITRE cveawg con fallback circl.lu: descrizione, CVSS, references."
+      },
+      {
+       "nome": "osint_sweep",
+       "desc": "Recon ATTIVA di sottorete: device discovery /24-/32 via proxy server-side Shodan InternetDB (porte, hostname, CPE, vulns, tag) uni"
+      }
+     ],
+     "esempi": [
+      {
+       "q": "chi c'e' dietro questo IP",
+       "tool": [
+        "osint_recon"
+       ]
+      },
+      {
+       "q": "dammi i dettagli di questo CVE",
+       "tool": [
+        "osint_recon"
+       ]
+      }
+     ]
+    },
+    {
+     "nome": "osint_cyber",
+     "desc": "Threat intel cyber: botnet C2, CISA KEV, rischio-paese",
+     "come": "Feed live: IP C2 di botnet (abuse.ch), vulnerabilita' note-sfruttate (CISA KEV), indice di rischio-paese. Diverso da osint_recon (lookup puntuale di un IP/CVE).",
+     "sub": [
+      {
+       "nome": "malware",
+       "desc": "IP C2 di botnet (abuse.ch)"
+      },
+      {
+       "nome": "cyber-threats",
+       "desc": "vulnerabilita' sfruttate (CISA KEV)"
+      },
+      {
+       "nome": "country-risk",
+       "desc": "indice rischio-paese"
+      }
+     ],
+     "esempi": [
+      {
+       "q": "quali vulnerabilita' sono sfruttate ora",
+       "tool": [
+        "osint_cyber"
+       ]
+      },
+      {
+       "q": "server malevoli attivi e quanto e' a rischio l'Ucraina",
+       "tool": [
+        "osint_cyber"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "categoria": "📈 Mercati e difesa",
+   "facce": [
+    {
+     "nome": "fin_mercati",
+     "desc": "Prezzi difesa/tech/cripto, wire, anomalia del giorno",
+     "trig": "come vanno i mercati",
+     "come": "Dal fetcher Finnhub: quotazioni watchlist + wire finanziario + l'anomalia gia' trovata (chi va contro il settore).",
+     "sub": [
+      {
+       "nome": "finnhub quotes",
+       "desc": "prezzi watchlist"
+      },
+      {
+       "nome": "finnhub news",
+       "desc": "wire finanziario"
+      }
+     ],
+     "esempi": [
+      {
+       "q": "come vanno i mercati e la difesa",
+       "tool": [
+        "fin_mercati"
+       ]
+      },
+      {
+       "q": "quali news di guerra hanno mosso i mercati",
+       "tool": [
+        "fin_mercati",
+        "osint_notizie"
+       ]
+      }
+     ]
+    },
+    {
+     "nome": "fin_appalti",
+     "desc": "Contratti federali di difesa: chi, quanto, dove",
+     "trig": "che commesse militari sono state assegnate",
+     "come": "Finnhub usa-spending: gli unici dati finanziari con luogo di esecuzione, quindi mappabili.",
+     "sub": [
+      {
+       "nome": "finnhub usa-spending",
+       "desc": "contratti federali con agenzia/importo/luogo"
+      }
+     ],
+     "esempi": [
+      {
+       "q": "che commesse militari sono state assegnate",
+       "tool": [
+        "fin_appalti"
+       ]
+      },
+      {
+       "q": "chi ha vinto i contratti piu' grossi e dove",
+       "tool": [
+        "fin_appalti"
+       ]
+      }
+     ]
+    },
+    {
+     "nome": "fin_insider",
+     "desc": "Movimenti insider e indice MSPR",
+     "trig": "qual e' l'MSPR di Palantir",
+     "come": "Solo decisioni di mercato (codici P/S) + MSPR normalizzato −100..+100.",
+     "sub": [
+      {
+       "nome": "finnhub insider",
+       "desc": "transazioni insider"
+      },
+      {
+       "nome": "MSPR",
+       "desc": "acquisti insider netti del mese, normalizzati"
+      }
+     ],
+     "esempi": [
+      {
+       "q": "qual e' l'MSPR di Palantir",
+       "tool": [
+        "fin_insider"
+       ]
+      },
+      {
+       "q": "chi sta vendendo azioni dentro la difesa",
+       "tool": [
+        "fin_insider"
+       ]
+      }
+     ]
+    },
+    {
+     "nome": "fin_archivio",
+     "desc": "Lo storico finanziario conservato",
+     "trig": "cosa e' successo a RTX nelle ultime due settimane",
+     "come": "Interroga l'archivio (ChromaDB financial_rag) che conserva notizie, picchi, contratti e insider al passaggio.",
+     "sub": [
+      {
+       "nome": "financial_rag",
+       "desc": "collezione ChromaDB dedicata, separata dai documenti personali"
+      }
+     ],
+     "esempi": [
+      {
+       "q": "cosa e' successo a RTX nelle ultime due settimane",
+       "tool": [
+        "fin_archivio"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "categoria": "📡 Radio, satellite, SIGINT",
+   "facce": [
+    {
+     "nome": "osint_radio",
+     "desc": "Scanner pubblici, KiwiSDR, ACARS/HFDL",
+     "come": "Scanner di pubblica sicurezza piu' vicini a un punto (Broadcastify/OpenMHz), i ricevitori KiwiSDR vicini, o i messaggi datalink di cabina di un aereo.",
+     "sub": [
+      {
+       "nome": "radio/nearest-list",
+       "desc": "scanner pubblici vicini"
+      },
+      {
+       "nome": "sigint/nearest-sdr",
+       "desc": "ricevitori KiwiSDR vicini"
+      },
+      {
+       "nome": "aviation/datalink",
+       "desc": "messaggi ACARS/HFDL di un aereo"
+      }
+     ],
+     "esempi": [
+      {
+       "q": "che scanner radio ascolto vicino a Roma",
+       "tool": [
+        "osint_radio"
+       ]
+      },
+      {
+       "q": "messaggi datalink del volo con matricola N12345",
+       "tool": [
+        "osint_radio"
+       ]
+      },
+      {
+       "q": "quali KiwiSDR ci sono vicino a Kyiv",
+       "tool": [
+        "osint_radio"
+       ]
+      }
+     ]
+    },
+    {
+     "nome": "osint_satellite",
+     "desc": "Analisi satellitare on-demand",
+     "come": "Anomalia termica SWIR su un punto (fuoco/esplosioni/attivita' industriale) o previsione dei passaggi satellitari su un'area (SGP4).",
+     "sub": [
+      {
+       "nome": "thermal/verify",
+       "desc": "anomalia termica SWIR (Sentinel-2)"
+      },
+      {
+       "nome": "satellites/overflights",
+       "desc": "passaggi satellitari nelle prossime N ore"
+      }
+     ],
+     "esempi": [
+      {
+       "q": "c'e' un incendio o calore anomalo qui",
+       "tool": [
+        "osint_satellite"
+       ]
+      },
+      {
+       "q": "quali satelliti passano su Kharkiv nelle prossime 12 ore",
+       "tool": [
+        "osint_satellite"
+       ]
+      }
+     ]
+    }
+   ]
+  }
+ ],
+ "conteggi": {
+  "facce": 21,
+  "sotto": 60
+ }
+}

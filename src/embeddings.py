@@ -13,6 +13,7 @@ Set EMBEDDING_URL in .env, e.g.:
 """
 
 import os
+import threading
 
 from src.constants import FASTEMBED_CACHE_DIR, EMBEDDING_ENDPOINT_FILE
 
@@ -226,6 +227,26 @@ def _load_persisted_endpoint() -> dict:
 
 
 _http_embed_down = False  # process-level latch: skip re-probing a dead endpoint
+_fastembed_clients = {}
+_fastembed_clients_lock = threading.Lock()
+
+
+def get_fastembed_client(model: Optional[str] = None) -> FastEmbedClient:
+    """Return one initialized FastEmbed client per model for this process.
+
+    RAG, semantic memory and tool indexing share the same ONNX session instead
+    of independently loading the same model several times during startup.
+    Creation remains eager whenever the selected startup profile enables
+    Odysseus; this is a reuse optimization, not lazy initialization.
+    """
+    model_name = model or os.getenv("FASTEMBED_MODEL", _DEFAULT_FASTEMBED_MODEL)
+    with _fastembed_clients_lock:
+        client = _fastembed_clients.get(model_name)
+        if client is None:
+            client = FastEmbedClient(model=model) if model is not None else FastEmbedClient()
+            client.get_sentence_embedding_dimension()
+            _fastembed_clients[model_name] = client
+        return client
 
 
 def reset_http_embed_state():
@@ -236,6 +257,8 @@ def reset_http_embed_state():
     whole process even after the endpoint comes back."""
     global _http_embed_down
     _http_embed_down = False
+    with _fastembed_clients_lock:
+        _fastembed_clients.clear()
 
 
 def get_embedding_client():
@@ -269,8 +292,7 @@ def get_embedding_client():
 
     # Fall back to local fastembed
     try:
-        client = FastEmbedClient()
-        client.get_sentence_embedding_dimension()
+        client = get_fastembed_client()
         logger.info(f"Using local FastEmbed: model={client.model}")
         return client
     except ImportError:

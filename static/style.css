@@ -41130,3 +41130,171 @@ body.theme-frosted .modal {
   .compare-grid[data-cols] { grid-template-columns: 1fr !important; overflow-y: auto; }
   .compare-pane { min-height: 60dvh; }
 }
+
+/* Avatar dock: draggable, resizable, position persisted */
+#avatar-dock {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  width: 240px;
+  height: 340px;
+  z-index: 900;
+  cursor: grab;
+  touch-action: none;
+}
+#avatar-dock.dragging { cursor: grabbing; }
+#avatar-dock canvas { width: 100%; height: 100%; display: block; pointer-events: none; }
+#avatar-dock-bar {
+  position: absolute; top: 0; right: 0;
+  display: flex; gap: 4px;
+  opacity: 0; transition: opacity .2s;
+}
+#avatar-dock:hover #avatar-dock-bar { opacity: 1; }
+#avatar-dock-bar button {
+  border: none; border-radius: 6px; cursor: pointer;
+  width: 24px; height: 24px; line-height: 1;
+  background: var(--panel, #2a2a2a);
+  color: var(--fg, #bbb);
+  font-size: 13px;
+}
+#avatar-dock-bar button:hover { opacity: 0.8; }
+#avatar-resize {
+  position: absolute; right: 0; bottom: 0;
+  width: 14px; height: 14px; cursor: nwse-resize;
+  opacity: 0; transition: opacity .2s;
+  background: linear-gradient(135deg, transparent 50%, var(--border, #666) 50%);
+}
+#avatar-dock:hover #avatar-resize { opacity: 1; }
+@media (max-width: 900px) { #avatar-dock { display: none; } }
+
+/* ── Vergilius: overlay di caricamento del modello ────────────────────────
+   Mostrato mentre llama-swap spegne un llama-server e ne accende un altro.
+   Volutamente non blocca i click: nascondere l'overlay non annulla il
+   caricamento, e l'interfaccia resta navigabile. */
+.model-loading-overlay {
+  position: fixed; inset: 0; z-index: 10050;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(2px);
+  animation: model-loading-in .18s ease-out;
+}
+@keyframes model-loading-in { from { opacity: 0; } to { opacity: 1; } }
+.model-loading-panel {
+  background: var(--bg, #111);
+  border: 1px solid var(--border, #355a66);
+  border-radius: 12px;
+  padding: 22px 30px 18px;
+  min-width: 240px;
+  display: flex; flex-direction: column; align-items: center; gap: 2px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.5);
+}
+.model-loading-panel .spinner-whirlpool { margin: 0 auto 8px; }
+.model-loading-title {
+  font-size: 13px; font-weight: 600; color: var(--fg, #ddd);
+  text-align: center;
+}
+.model-loading-sub {
+  font-size: 11px; opacity: 0.55; text-align: center; line-height: 1.4;
+  max-width: 260px;
+}
+.model-loading-elapsed {
+  font-family: monospace; font-size: 11px; opacity: 0.4; margin-top: 6px;
+}
+.model-loading-dismiss {
+  margin-top: 12px;
+  background: none; border: 1px solid var(--border, #355a66);
+  border-radius: 6px; padding: 4px 12px; cursor: pointer;
+  color: var(--fg, #ddd); font-size: 11px; opacity: 0.7;
+}
+.model-loading-dismiss:hover { opacity: 1; }
+
+/* Pastiglia "senza vista" accanto al nome del modello: l'unica cosa che
+   distingue a colpo d'occhio qwenpaw da qwenpaw-vista. */
+.model-blind-badge {
+  display: inline-flex; align-items: center;
+  margin-left: 6px; padding: 0 5px;
+  border: 1px solid var(--border, #355a66); border-radius: 4px;
+  font-size: 9px; letter-spacing: .04em; text-transform: uppercase;
+  opacity: 0.6; vertical-align: middle;
+}
+
+/* ── Vergilius: pannello ShadowBroker ────────────────────────────────────
+   Copre solo l'area della chat. Il riquadro dell'avatar e position:fixed sul
+   body, quindi resta sopra senza bisogno di accorgimenti: e esattamente il
+   comportamento voluto — cambia la mappa, l'assistente resta. */
+.sb-panel {
+  position: absolute; inset: 0; z-index: 40;
+  display: flex; flex-direction: column;
+  background: var(--bg, #0b0f10);
+}
+.sb-panel.hidden { display: none; }
+
+.sb-panel-bar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border, #355a66);
+  background: var(--panel, #111);
+  flex-shrink: 0;
+}
+.sb-panel-title {
+  font-family: monospace; font-size: 12px; font-weight: 700;
+  letter-spacing: .18em; color: var(--fg, #ddd);
+}
+.sb-panel-sub {
+  font-family: monospace; font-size: 9px; letter-spacing: .1em;
+  text-transform: uppercase; opacity: .4;
+}
+.sb-panel-status {
+  margin-left: auto; font-family: monospace; font-size: 10px; opacity: .55;
+}
+.sb-status-ok   { color: #5ec98a; opacity: .8; }
+.sb-status-warn { color: #d8a13a; opacity: .9; }
+.sb-status-bad  { color: #d2544f; opacity: .9; }
+.sb-panel-btn {
+  background: none; border: 1px solid var(--border, #355a66);
+  border-radius: 5px; color: var(--fg, #ddd);
+  cursor: pointer; padding: 2px 8px; font-size: 12px; line-height: 1.4;
+  opacity: .6;
+}
+.sb-panel-btn:hover { opacity: 1; }
+
+.sb-panel-body { flex: 1; min-height: 0; position: relative; }
+.sb-frame { width: 100%; height: 100%; border: 0; display: block; }
+
+/* Stato "non risponde": il pannello lo dice invece di mostrare un rettangolo
+   bianco, perche un iframe cross-origin non puo riferire il proprio errore. */
+.sb-offline {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 10px; padding: 24px; text-align: center;
+}
+.sb-offline-title { font-size: 14px; font-weight: 600; color: var(--fg, #ddd); }
+.sb-offline-desc { font-size: 11px; opacity: .6; max-width: 460px; line-height: 1.5; }
+.sb-offline-cmd {
+  font-family: monospace; font-size: 10.5px; text-align: left;
+  background: var(--panel, #16191a); border: 1px solid var(--border, #355a66);
+  border-radius: 8px; padding: 12px 16px; margin: 4px 0; opacity: .85;
+  white-space: pre; overflow-x: auto; max-width: 90%;
+}
+.sb-offline-retry {
+  background: none; border: 1px solid var(--border, #355a66); border-radius: 6px;
+  color: var(--fg, #ddd); cursor: pointer; padding: 5px 16px; font-size: 11px; opacity: .75;
+}
+.sb-offline-retry:hover { opacity: 1; }
+
+/* Pulsante della barra evidenziato mentre il pannello e aperto. */
+.icon-rail-btn.rail-active { color: var(--red, #9cdef2); opacity: 1; }
+
+/* Con il pannello aperto la composizione della chat non serve e ruberebbe
+   altezza alla mappa. */
+body.shadowbroker-active .chat-top-bar,
+body.shadowbroker-active #scroll-bottom-btn { display: none; }
+
+/* ```chart fences — rendered by trusted client code (charts.js + vendored
+   Chart.js). The raw-spec fallback is visible until the chart renders and
+   stays if the spec is invalid. */
+.chart-container { position: relative; height: 280px; margin: 8px 0; overflow: auto; }
+.chart-container[data-processed] { overflow: hidden; }
+.chart-container[data-processed] .chart-fallback { display: none; }
+.chart-container .chart-fallback { margin: 0; }
+.chart-container canvas { max-width: 100%; }

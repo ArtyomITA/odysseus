@@ -44,3 +44,29 @@ class TestEmbeddingClient:
 
         headers = mock_httpx.return_value.post.call_args.kwargs["headers"]
         assert "Authorization" not in headers
+
+
+def test_fastembed_client_is_reused_per_model(monkeypatch):
+    import src.embeddings as embeddings
+
+    created = []
+
+    class FakeFastEmbed:
+        def __init__(self, model=None):
+            self.model = model or "default-model"
+            created.append(self)
+
+        def get_sentence_embedding_dimension(self):
+            return 384
+
+    embeddings.reset_http_embed_state()
+    monkeypatch.setattr(embeddings, "FastEmbedClient", FakeFastEmbed)
+
+    first = embeddings.get_fastembed_client()
+    second = embeddings.get_fastembed_client()
+    other = embeddings.get_fastembed_client("other-model")
+
+    assert first is second
+    assert other is not first
+    assert len(created) == 2
+    embeddings.reset_http_embed_state()

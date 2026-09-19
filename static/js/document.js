@@ -9881,6 +9881,7 @@ import { bindMenuDismiss, dismissOrRemove } from './escMenuStack.js';
       if (markdownModule && markdownModule.renderMermaid) {
         markdownModule.renderMermaid(preview);
       }
+      window.OdysseusCharts?.renderCharts(preview);
       preview.style.display = '';
       wrap.style.display = 'none';
     } else {

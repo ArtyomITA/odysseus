@@ -187,6 +187,107 @@ class TTSService:
 
         return audio_data
 
+    # ── Streaming ──
+
+    def stream_settings(self) -> Optional[dict]:
+        """Returns the resolved endpoint config when this provider can stream,
+        None otherwise. Kokoro and browser TTS produce the whole clip at once,
+        so there is nothing to stream and the caller falls back to synthesize()."""
+        settings = self._load_settings()
+        if settings.get("tts_enabled") is False:
+            return None
+        provider = settings["tts_provider"]
+        if not (isinstance(provider, str) and provider.startswith("endpoint:")):
+            return None
+
+        from src.database import SessionLocal, ModelEndpoint
+
+        db = SessionLocal()
+        try:
+            ep = db.query(ModelEndpoint).filter(
+                ModelEndpoint.id == provider.split(":", 1)[1]
+            ).first()
+            if not ep:
+                return None
+            base_url, api_key = ep.base_url.rstrip("/"), ep.api_key
+        finally:
+            db.close()
+
+        speed = _safe_speed(settings.get("tts_speed", "1"))
+        return {
+            "url": base_url + "/audio/speech",
+            "api_key": api_key,
+            "model": settings["tts_model"],
+            "voice": settings["tts_voice"],
+            "speed": speed,
+        }
+
+    def synthesize_stream(self, text: str, use_cache: bool = True):
+        """Yields audio bytes as the engine produces them.
+
+        The point of the whole exercise: PocketTTS starts emitting WAV frames
+        almost immediately, and every layer that called .content or .blob()
+        threw that away. Here nothing is collected before it is handed on.
+
+        The cache is filled by *tee-ing* the stream — chunks are both yielded
+        and accumulated, and the file is written once the last chunk is out.
+        A stream that dies halfway writes nothing, so a truncated clip can never
+        be served from cache as if it were complete.
+        """
+        settings = self._load_settings()
+        if settings.get("tts_enabled") is False:
+            return
+        provider = settings["tts_provider"]
+        model = settings["tts_model"]
+        voice = settings["tts_voice"]
+        speed = _safe_speed(settings.get("tts_speed", "1"))
+
+        if len(text) > 5000:
+            text = text[:5000]
+
+        key = self._cache_key(text, provider, model, voice, speed)
+        if use_cache:
+            cached = self._get_cached(key)
+            if cached:
+                logger.info(f"TTS cache hit, streaming from disk ({len(text)} chars)")
+                yield cached
+                return
+
+        conf = self.stream_settings()
+        if conf is None:
+            # Not a streaming provider — one shot, still better than failing.
+            data = self.synthesize(text, use_cache=use_cache)
+            if data:
+                yield data
+            return
+
+        headers = {"Content-Type": "application/json"}
+        if conf["api_key"]:
+            headers["Authorization"] = f"Bearer {conf['api_key']}"
+        payload = {
+            "model": model, "input": text, "voice": voice,
+            "response_format": "mp3", "speed": speed,
+        }
+
+        pezzi = []
+        try:
+            with httpx.stream("POST", conf["url"], json=payload, headers=headers,
+                              timeout=httpx.Timeout(120.0, connect=5.0)) as r:
+                r.raise_for_status()
+                for pezzo in r.iter_bytes():
+                    if pezzo:
+                        pezzi.append(pezzo)
+                        yield pezzo
+        except Exception as e:
+            logger.error(f"Streaming TTS failed: {e}")
+            return
+
+        if use_cache and pezzi:
+            try:
+                self._put_cache(key, b"".join(pezzi))
+            except Exception as e:
+                logger.warning(f"Could not cache streamed TTS: {e}")
+
     def synthesize_to_base64(self, text: str) -> Optional[str]:
         import base64
         audio = self.synthesize(text)

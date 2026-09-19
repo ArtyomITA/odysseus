@@ -910,6 +910,24 @@ export function roleTimestamp(when) {
 }
 
 /**
+ * Togli i tag emozione dal testo mostrato.
+ *
+ * Il preset dell'Avatar 2D istruisce il modello a premettere un tag come
+ * `[neutral]` a ogni risposta (vedi avatarPersona.js). Quel tag serve a
+ * avatarCore.js, che lo LEGGE dallo stream ma non lo toglie mai dal testo:
+ * finiva dritto nella bolla di chat, e col profilo Lite (avatar spento)
+ * restava li' senza che nulla lo consumasse.
+ *
+ * Si tolgono SOLO i nomi emozione noti, mai un generico `[parola]`:
+ * altrimenti sparirebbero i link markdown `[testo](url)` e le note `[1]`.
+ */
+const EMOTION_TAG_RE = /(^|\n)[ \t]*\[(?:neutral|neutro|calmo|joy|gioia|felice|felicita|anger|rabbia|arrabbiato|sadness|tristezza|triste|surprise|sorpresa|sorpreso|fear|paura|disgust|disgusto|smirk|ghigno|sarcasmo)\][ \t]*/gi;
+
+export function stripEmotionTags(text) {
+  return (text || '').replace(EMOTION_TAG_RE, '$1');
+}
+
+/**
  * Strip tool invocation blocks from text before rendering.
  */
 export function stripToolBlocks(text) {
@@ -924,6 +942,7 @@ export function stripToolBlocks(text) {
   cleaned = cleaned.replace(QWEN_ROLE_MARKER_RE, '');
   cleaned = cleaned.replace(QWEN_BARE_MARKER_RE, ' ');
   cleaned = cleaned.replace(TOOL_NARRATION_RE, '');
+  cleaned = stripEmotionTags(cleaned);
   cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
   return cleaned.trim();
 }
@@ -2448,6 +2467,7 @@ export function addMessage(role, content, modelName, metadata) {
         box.querySelectorAll('pre code:not(.hljs)').forEach(b => window.hljs.highlightElement(b));
       }
       if (markdownModule.renderMermaid) markdownModule.renderMermaid(box);
+      window.OdysseusCharts?.renderCharts(box);
       if (pendingAskUser) {
         // Session history is rendered oldest-to-newest.  A later user message
         // removes this card; if there is none, the pending choice survives a
@@ -2764,6 +2784,7 @@ export function addMessage(role, content, modelName, metadata) {
     if (role === 'assistant' && markdownModule.renderMermaid) {
       markdownModule.renderMermaid(wrap);
     }
+    if (role === 'assistant') window.OdysseusCharts?.renderCharts(wrap);
     return wrap;
   } catch (error) {
     console.error('Error in addMessage:', error);
@@ -2787,6 +2808,7 @@ const chatRenderer = {
   updateSessionCostUI,
   roleTimestamp,
   stripToolBlocks,
+  stripEmotionTags,
   copyMessageText,
   safeToolScreenshotSrc,
   safeDisplayImageSrc,

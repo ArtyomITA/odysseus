@@ -8,17 +8,20 @@ relevant ones per user message.
 
 import logging
 import hashlib
+import math
 import re
 import time
+import unicodedata
+from collections import Counter
 from typing import Dict, List, Optional, Set
 
 from src.embedding_lanes import (
     LANE_CUSTOM,
     LANE_FASTEMBED,
     build_embedding_lanes,
-    dedupe_results,
     migrate_legacy_collection,
 )
+from src.browser_tooling_constants import BROWSER_CORE_TOOL_NAMES
 
 try:
     import numpy as np
@@ -140,7 +143,65 @@ BUILTIN_TOOL_DESCRIPTIONS: Dict[str, str] = {
     "edit_image": "Edit an image in the gallery: upscale (increase resolution), remove background (rembg), inpaint (fill selected area), or harmonize (blend edits). Specify image ID and action.",
     "trigger_research": "Start a deep research job on any topic — appears in the Deep Research sidebar, streams progress, produces a detailed report. Use for 'research X', 'look into Y', 'do deep research on Z', 'investigate'. NOT a scheduled task — it runs now and surfaces in the sidebar.",
     "manage_bg_jobs": "Inspect and control detached background `bash` jobs (the ones started with a `#!bg` marker). action='list' shows this chat's jobs (id/status/age/command); action='output' returns a job's captured output so far (check on a long-running job, or re-read a finished one); action='kill' stops a runaway job by id. Use for 'is the background job done', 'check on that job', 'show the build output', 'kill the background job', 'stop the bg task'. output/kill need a job_id from list.",
+    "browser_open": "Open or navigate an isolated browser to an http/https URL. Returns an accessibility tree with exact element refs. Italian: apri sito pagina link, naviga, vai su YouTube.",
+    "browser_read": "Read the current browser page as a compact accessibility tree with exact refs. Italian: leggi pagina, cosa c'e nel sito.",
+    "browser_find": "Find text in the current browser page snapshot and return matching nodes with refs. Italian: trova nella pagina, cerca nel sito.",
+    "browser_click": "Click an exact current browser snapshot ref. Italian: clicca link pulsante elemento.",
+    "browser_type": "Type text into an editable browser element by exact ref and optionally submit. Italian: digita, scrivi nel campo, compila.",
+    "browser_back": "Go back one page in browser history. Italian: torna indietro pagina precedente.",
+    "browser_more": "Expose one uncommon browser category for the next round: navigation, forms, debug, visual, storage, developer, or explicitly requested unsafe Playwright code.",
 }
+
+
+_BILINGUAL_ALIASES: Dict[str, str] = {
+    "web_search": "cerca cercare internet web online ultime notizie meteo prezzo controlla verifica",
+    "web_fetch": "apri leggi scarica pagina sito link url",
+    "list_email_accounts": "posta email casella account gmail",
+    "list_emails": "posta email inbox casella non lette controlla leggi",
+    "read_email": "leggi apri messaggio posta email",
+    "send_email": "invia manda scrivi email posta messaggio",
+    "reply_to_email": "rispondi risposta email posta messaggio",
+    "manage_calendar": "calendario evento riunione appuntamento agenda aggiungi elimina sposta",
+    "manage_notes": "nota note promemoria ricordami todo elenco checklist",
+    "manage_tasks": "attivita pianificata ricorrente ogni giorno automaticamente programma",
+    "manage_settings": "impostazioni preferenze configura cambia attiva disattiva",
+    "ui_control": "apri pannello impostazioni galleria documenti posta cambia tema attiva disattiva",
+    "list_sessions": "chat conversazioni sessioni cronologia elenco",
+    "manage_session": "chat conversazione rinomina archivia elimina apri",
+    "read_file": "leggi file codice sorgente log",
+    "grep": "cerca testo file codice trova simbolo",
+    "ls": "elenca cartella directory file",
+    "browser_open": "browser naviga apri sito pagina link url vai youtube chrome firefox",
+    "browser_read": "browser leggi pagina sito contenuto",
+    "browser_find": "browser trova cerca pagina sito testo elemento",
+    "browser_click": "browser clicca premi link bottone pulsante elemento",
+    "browser_type": "browser digita scrivi campo compila modulo invia",
+    "browser_back": "browser indietro precedente torna",
+    "browser_more": "browser schede form debug screenshot cookie storage sviluppatore",
+}
+
+
+def _normalise_lexical(text: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", str(text or ""))
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch)).lower()
+
+
+def _lexical_tokens(text: str) -> List[str]:
+    return re.findall(r"[a-z0-9_]+", _normalise_lexical(text))
+
+
+_LEXICAL_QUERY_STOPWORDS = frozenset({
+    "a", "an", "the", "to", "for", "my", "me", "please", "do",
+    "run", "use", "make", "get", "show", "check", "create",
+    "il", "lo", "la", "i", "gli", "le", "un", "una", "per", "mio",
+    "mia", "mi", "fammi", "puoi", "potresti",
+})
+
+
+def _routing_document(name: str, description: str, extra: str = "") -> str:
+    aliases = _BILINGUAL_ALIASES.get(name, "")
+    suffix = " ".join(part for part in (aliases, extra) if part)
+    return f"Tool: {name}\n{description}" + (f"\nRouting aliases: {suffix}" if suffix else "")
 
 
 class ToolIndex:
@@ -158,7 +219,9 @@ class ToolIndex:
         migrate_legacy_collection(COLLECTION_NAME, self._lanes)
         self._fingerprint = ""
         self._mcp_generation = -1
+        self._mcp_disabled_signature = ()
         self._healthy = True
+        self._lexical_docs: Dict[str, str] = {}
         logger.info("ToolIndex initialized (lanes=%s)", [lane.name for lane in self._lanes])
 
     @property
@@ -175,14 +238,17 @@ class ToolIndex:
 
     def index_builtin_tools(self):
         """Index all built-in tool descriptions."""
+        if not hasattr(self, "_lexical_docs"):
+            self._lexical_docs = {}
         docs = []
         ids = []
         metadatas = []
         for name, desc in BUILTIN_TOOL_DESCRIPTIONS.items():
-            doc_text = f"Tool: {name}\n{desc}"
+            doc_text = _routing_document(name, desc)
             docs.append(doc_text)
             ids.append(f"builtin_{name}")
             metadatas.append({"tool_name": name, "tool_type": "builtin"})
+            self._lexical_docs[name] = doc_text
 
         if not docs:
             return
@@ -228,7 +294,14 @@ class ToolIndex:
 
         # Get current MCP generation to avoid redundant reindexing
         gen = getattr(mcp_mgr, '_generation', 0)
-        if gen == self._mcp_generation:
+        disabled_signature = tuple(sorted(
+            (str(server_id), tuple(sorted(str(name) for name in (names or ()))))
+            for server_id, names in (disabled_map or {}).items()
+        ))
+        if (
+            gen == self._mcp_generation
+            and disabled_signature == getattr(self, "_mcp_disabled_signature", ())
+        ):
             return
 
         # Remove old MCP entries
@@ -240,42 +313,53 @@ class ToolIndex:
             except Exception:
                 pass
 
-        # Get current MCP tools
+        if not hasattr(self, "_lexical_docs"):
+            self._lexical_docs = {}
+        self._lexical_docs = {
+            name: doc for name, doc in self._lexical_docs.items()
+            if not name.startswith("mcp__")
+        }
+
+        # Index the structured inventory directly. Built-in Python MCP tools
+        # already have native descriptions, and raw Playwright tools are hidden
+        # behind the compact browser adapters/browser_more gateway.
         try:
-            all_tools = mcp_mgr.get_tool_descriptions_for_prompt(disabled_map or {})
+            all_tools = mcp_mgr.get_all_tools(disabled_map or {})
         except Exception:
-            all_tools = ""
+            all_tools = []
 
-        if not all_tools:
-            self._mcp_generation = gen
-            return
-
-        # Parse MCP tool descriptions from the prompt text
         docs = []
         ids = []
         metadatas = []
-        current_server = ""
-        for line in all_tools.strip().split("\n"):
-            line = line.strip()
-            # Track which server section we're in (for context in descriptions)
-            if line.startswith("**") and line.endswith(":**"):
-                current_server = line.strip("*: ")
-            elif line.startswith("- ") and ":" in line:
-                # Format: "- tool_name: description"
-                name_desc = line[2:].split(":", 1)
-                if len(name_desc) == 2:
-                    name = name_desc[0].strip()
-                    desc = name_desc[1].strip()
-                    # Include server identity in the indexed text so RAG can
-                    # distinguish "list_emails for server-a" from "list_emails for server-b"
-                    server_ctx = f" (server: {current_server})" if current_server else ""
-                    doc_text = f"Tool: {name}{server_ctx}\n{desc}"
-                    docs.append(doc_text)
-                    ids.append(f"mcp_{name}")
-                    metadatas.append({"tool_name": name, "tool_type": "mcp"})
+        for item in sorted(
+            all_tools or [],
+            key=lambda row: (str(row.get("server_id") or ""), str(row.get("name") or "")),
+        ):
+            server_id = str(item.get("server_id") or "")
+            if item.get("is_disabled"):
+                continue
+            if server_id == "builtin_browser" or mcp_mgr.is_builtin(server_id):
+                continue
+            name = str(item.get("qualified_name") or "")
+            if not name:
+                continue
+            desc = str(item.get("description") or "")
+            props = ((item.get("input_schema") or {}).get("properties") or {})
+            param_names = " ".join(sorted(str(key) for key in props))
+            server_ctx = str(item.get("server_name") or server_id)
+            doc_text = _routing_document(
+                name,
+                f"{desc} (server: {server_ctx})",
+                f"parameters {param_names}" if param_names else "",
+            )
+            docs.append(doc_text)
+            ids.append(f"mcp_{name}")
+            metadatas.append({"tool_name": name, "tool_type": "mcp"})
+            self._lexical_docs[name] = doc_text
 
         if not docs:
             self._mcp_generation = gen
+            self._mcp_disabled_signature = disabled_signature
             return
 
         indexed = False
@@ -294,40 +378,154 @@ class ToolIndex:
             logger.warning("MCP tool indexing failed in all embedding lanes")
             return
         self._mcp_generation = gen
+        self._mcp_disabled_signature = disabled_signature
         logger.info(f"Indexed {len(docs)} MCP tools")
 
+    def _ensure_lexical_docs(self) -> Dict[str, str]:
+        docs = getattr(self, "_lexical_docs", None)
+        if docs:
+            return docs
+        docs = {}
+        # Supports older persisted indexes and unit tests constructed via
+        # __new__: reconstruct the lexical corpus from any healthy lane.
+        for lane in getattr(self, "_lanes", []):
+            try:
+                rows = lane.collection.get(include=["documents", "metadatas"])
+                for doc, meta in zip(
+                    (rows or {}).get("documents") or [],
+                    (rows or {}).get("metadatas") or [],
+                ):
+                    name = str((meta or {}).get("tool_name") or "")
+                    if name and doc and name not in docs:
+                        docs[name] = str(doc)
+            except Exception:
+                continue
+        self._lexical_docs = docs
+        return docs
+
+    @staticmethod
+    def _semantic_query(query: str) -> str:
+        normalised = _normalise_lexical(query)
+        concepts = {
+            "posta": "email inbox mailbox",
+            "non lette": "unread email",
+            "calendario": "calendar event schedule",
+            "riunione": "meeting event",
+            "promemoria": "reminder note",
+            "ricordami": "remind note",
+            "cerca": "search find",
+            "internet": "web online",
+            "notizie": "news current latest",
+            "meteo": "weather forecast",
+            "prezzo": "price current",
+            "apri": "open navigate",
+            "sito": "website page",
+            "pagina": "page website",
+            "clicca": "click element",
+            "compila": "fill form type",
+            "impostazioni": "settings preferences",
+            "disattiva": "disable turn off",
+            "attiva": "enable turn on",
+        }
+        # Token/phrase boundaries matter here: e.g. ``disattiva`` contains
+        # ``attiva`` but means the opposite.  A substring check polluted the
+        # semantic query with both "disable" and "enable".
+        extra = [
+            english
+            for italian, english in concepts.items()
+            if re.search(rf"(?<!\w){re.escape(italian)}(?!\w)", normalised)
+        ]
+        return str(query or "") + (" " + " ".join(extra) if extra else "")
+
+    def _bm25_rank(self, query: str, limit: int) -> List[str]:
+        docs = self._ensure_lexical_docs()
+        q_tokens = [
+            token for token in _lexical_tokens(self._semantic_query(query))
+            if token not in _LEXICAL_QUERY_STOPWORDS
+        ]
+        if not docs or not q_tokens:
+            return []
+        tokenised = {name: _lexical_tokens(doc) for name, doc in docs.items()}
+        tokenised = {name: toks for name, toks in tokenised.items() if toks}
+        if not tokenised:
+            return []
+        n_docs = len(tokenised)
+        avg_len = sum(len(tokens) for tokens in tokenised.values()) / n_docs
+        doc_freq = Counter()
+        for tokens in tokenised.values():
+            doc_freq.update(set(tokens))
+        k1, b = 1.2, 0.75
+        scores = {}
+        for name, tokens in tokenised.items():
+            counts = Counter(tokens)
+            score = 0.0
+            for token in set(q_tokens):
+                tf = counts.get(token, 0)
+                if not tf:
+                    continue
+                df = doc_freq[token]
+                idf = math.log(1.0 + (n_docs - df + 0.5) / (df + 0.5))
+                denom = tf + k1 * (1.0 - b + b * len(tokens) / max(avg_len, 1.0))
+                score += idf * (tf * (k1 + 1.0) / denom)
+            if score > 0:
+                scores[name] = score
+        canonical = {name: idx for idx, name in enumerate(docs)}
+        return [
+            name for name, _score in sorted(
+                scores.items(),
+                key=lambda item: (-item[1], canonical.get(item[0], 10**9), item[0]),
+            )[:limit]
+        ]
+
     def retrieve(self, query: str, k: int = 8) -> List[str]:
-        """Retrieve the top-K most relevant tool names for a query."""
-        rows = []
-        lane_priority = {LANE_CUSTOM: 0, LANE_FASTEMBED: 1}
+        """Hybrid bilingual BM25 + embedding retrieval using weighted RRF.
+
+        Cosine scores from different embedding models are not calibrated and
+        must never be compared directly. Rank fusion preserves each lane's
+        ordering and rewards agreement instead.
+        """
+        if k <= 0:
+            return []
+        pool = max(24, 3 * k)
+        fused: Dict[str, float] = {}
+        lexical = self._bm25_rank(query, pool)
+        for rank, name in enumerate(lexical, 1):
+            fused[name] = fused.get(name, 0.0) + 2.0 / (60.0 + rank)
+
+        semantic_query = self._semantic_query(query)
         for lane in self._lanes:
             try:
                 count = lane.count()
                 if count == 0:
                     continue
                 results = lane.collection.query(
-                    query_embeddings=lane.encode([query]),
-                    n_results=min(k, count),
-                    include=["metadatas", "distances"],
+                    query_embeddings=lane.encode([semantic_query]),
+                    n_results=min(pool, count),
+                    include=["metadatas"],
                 )
                 if not results or not results.get("metadatas"):
                     continue
-                distances = results.get("distances") or []
-                for list_idx, meta_list in enumerate(results["metadatas"]):
-                    distance_list = distances[list_idx] if list_idx < len(distances) else []
-                    for idx, meta in enumerate(meta_list):
-                        name = meta.get("tool_name", "")
-                        if name:
-                            distance = distance_list[idx] if idx < len(distance_list) else 1.0
-                            rows.append({
-                                "tool_name": name,
-                                "score": round(1.0 - distance, 4),
-                                "embedding_lane": lane.name,
-                            })
+                weight = 1.0 if lane.name == LANE_CUSTOM else 0.75
+                seen = set()
+                ranked = []
+                for meta_list in results["metadatas"]:
+                    for meta in meta_list:
+                        name = str((meta or {}).get("tool_name") or "")
+                        if name and name not in seen:
+                            seen.add(name)
+                            ranked.append(name)
+                for rank, name in enumerate(ranked, 1):
+                    fused[name] = fused.get(name, 0.0) + weight / (60.0 + rank)
             except Exception as e:
                 logger.warning("Tool retrieval failed in %s lane: %s", lane.name, e)
-        rows.sort(key=lambda row: (-row["score"], lane_priority.get(row["embedding_lane"], 99)))
-        return [row["tool_name"] for row in dedupe_results(rows, id_key="tool_name", limit=k)]
+        docs = self._ensure_lexical_docs()
+        canonical = {name: idx for idx, name in enumerate(docs)}
+        return [
+            name for name, _score in sorted(
+                fused.items(),
+                key=lambda item: (-item[1], canonical.get(item[0], 10**9), item[0]),
+            )[:k]
+        ]
 
     # Structural recurring-schedule intent. Typo-resilient (matches "every dya"
     # via "every <word>"), and catches bare clock times ("at 7:30 am", "7am").
@@ -350,9 +548,11 @@ class ToolIndex:
         # request (e.g. "visit <url> and tell me the title"), force-including the
         # whole email toolset and crowding out the relevant tools — the model then
         # believed it had only email tools and refused web/other tasks (#1707).
-        frozenset({"email", "emails", "mail", "mails", "gmail", "googlemail", "message", "messages", "send", "reply", "replies", "inbox", "unread"}):
+        frozenset({"email", "emails", "mail", "mails", "gmail", "googlemail", "message", "messages", "send", "reply", "replies", "inbox", "unread",
+                   "posta", "casella", "messaggio", "messaggi", "invia", "manda", "rispondi", "non lette", "non letti"}):
             {"list_email_accounts", "list_emails", "read_email", "scan_email_unsubscribes", "unsubscribe_email", "send_email", "reply_to_email", "bulk_email", "delete_email", "archive_email", "mark_email_read", "resolve_contact", "ui_control"},
-        frozenset({"calendar", "event", "meeting", "schedule", "appointment"}):
+        frozenset({"calendar", "event", "meeting", "schedule", "appointment",
+                   "calendario", "evento", "riunione", "appuntamento", "agenda"}):
             {"manage_calendar"},
         # Detached background `bash` jobs (#!bg): check on / read output / kill.
         frozenset({"background job", "background jobs", "bg job", "bg jobs",
@@ -360,8 +560,13 @@ class ToolIndex:
                    "check on that job", "job output", "kill the job",
                    "kill the background", "stop the background", "running job"}):
             {"manage_bg_jobs"},
-        frozenset({"note", "todo", "reminder", "remind", "checklist", "remember to"}):
+        frozenset({"note", "todo", "reminder", "remind", "checklist", "remember to",
+                   "nota", "promemoria", "ricordami", "elenco"}):
             {"manage_notes"},
+        frozenset({"browser", "naviga", "vai su", "apri il sito", "apri la pagina",
+                   "apri sito", "apri pagina", "clicca", "compila", "digita",
+                   "nel sito", "nella pagina", "playwright"}):
+            set(BROWSER_CORE_TOOL_NAMES),
         # Chat/session management. "rename" alone maps to documents below, so a
         # request like "rename the last 12 sessions/chats" needs these session
         # keywords to surface the right tools (NOT app_api — /api/sessions is
@@ -412,11 +617,14 @@ class ToolIndex:
                    "find info online", "find information online",
                    "find info", "find information", "online about",
                    "on the internet", "google", "latest", "current", "news",
-                   "weather", "forecast", "stock price", "price of"}):
+                   "weather", "forecast", "stock price", "price of",
+                   "cerca su internet", "cerca online", "cerca nel web",
+                   "su internet", "notizie", "ultime", "meteo", "prezzo attuale"}):
             {"web_search", "web_fetch"},
         frozenset({"research", "reserach", "reasearch", "look into", "investigate",
                    "deep dive", "deep research", "find out about", "study up on",
-                   "report on", "do research", "look up everything"}):
+                   "report on", "do research", "look up everything",
+                   "ricerca approfondita", "approfondisci", "indaga", "investiga"}):
             {"trigger_research"},
         # Settings-change intent — "change my…/set my…/use X for…/turn on…".
         frozenset({"change my", "set my", "use the voice", "change the voice",

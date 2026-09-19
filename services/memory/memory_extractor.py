@@ -357,14 +357,15 @@ async def extract_and_store(
                 model,
                 extraction_messages,
                 temperature=0.1,
-                # A reasoning model spends most of its budget on <think> tokens
-                # BEFORE emitting the JSON, so the old 500 truncated the response
-                # before any JSON appeared → every run logged "0 candidates". The
-                # audit path hit the same wall and raised to 16384; extraction's
-                # output (a short facts list) is small, so an ample ceiling is
-                # enough once thinking has room.
-                max_tokens=4096,
+                # This is a compact JSON classification task. llama.cpp b10549
+                # honours the per-request template switch below, so no hidden
+                # reasoning budget is needed before the JSON.
+                max_tokens=256,
                 headers=headers,
+                timeout=45,
+                max_retries=1,
+                workload="background",
+                enable_thinking=False,
             )
 
             # Parse JSON, tolerating reasoning-model noise (<think> blocks, a

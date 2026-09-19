@@ -522,6 +522,8 @@ async def _direct_fallback(
     progress_cb: Optional[Callable[[Dict], Awaitable[None]]] = None,
     session_id: Optional[str] = None,
     owner: Optional[str] = None,
+    disabled_tools: Optional[set] = None,
+    allow_browser_unsafe: bool = False,
 ) -> Optional[Dict]:
     _subproc_env = {
         **os.environ,
@@ -537,6 +539,8 @@ async def _direct_fallback(
             "subproc_env": _subproc_env,
             "session_id": session_id,
             "owner": owner,
+            "disabled_tools": set(disabled_tools or ()),
+            "allow_browser_unsafe": bool(allow_browser_unsafe),
         }
 
         from src.agent_tools import TOOL_HANDLERS
@@ -575,6 +579,7 @@ async def execute_tool_block(
     progress_cb: Optional[Callable[[Dict], Awaitable[None]]] = None,
     workspace: Optional[str] = None,
     tool_policy: Optional[Any] = None,
+    allow_browser_unsafe: bool = False,
 ) -> Tuple[str, Dict]:
     """Execute a single tool block. Returns (description, result_dict).
 
@@ -591,6 +596,7 @@ async def execute_tool_block(
             owner=owner,
             progress_cb=progress_cb,
             tool_policy=tool_policy,
+            allow_browser_unsafe=allow_browser_unsafe,
         )
         return output
     finally:
@@ -604,6 +610,7 @@ async def _execute_tool_block_impl(
     owner: Optional[str] = None,
     progress_cb: Optional[Callable[[Dict], Awaitable[None]]] = None,
     tool_policy: Optional[Any] = None,
+    allow_browser_unsafe: bool = False,
 ) -> Tuple[str, Dict]:
     """Execute a single tool block. Returns (description, result_dict).
 
@@ -682,6 +689,21 @@ async def _execute_tool_block_impl(
         desc = f"{tool}: BLOCKED"
         result = {"error": f"Tool '{tool}' is disabled by user.", "exit_code": 1}
         logger.info(f"Tool blocked by user: {tool}")
+        return desc, result
+
+    if (
+        tool == "mcp__builtin_browser__browser_run_code_unsafe"
+        and not allow_browser_unsafe
+    ):
+        desc = f"{tool}: BLOCKED"
+        result = {
+            "error": (
+                "Unsafe Playwright code requires an explicit user request "
+                "in the current turn."
+            ),
+            "exit_code": 1,
+        }
+        logger.warning("Unsafe browser tool blocked without explicit user intent")
         return desc, result
 
     if tool_policy and any(tool_policy.blocks(name) for name in policy_names):
@@ -940,7 +962,20 @@ async def _execute_tool_block_impl(
                 if tool.startswith("mcp__email__") and owner:
                     args = dict(args)
                     args[_EMAIL_MCP_OWNER_ARG] = owner
-                result = await mcp.call_tool(tool, args)
+                if tool.startswith("mcp__builtin_browser__"):
+                    from src.agent_tools.browser_tools import execute_raw_browser_tool
+                    result = await execute_raw_browser_tool(
+                        tool[len("mcp__builtin_browser__"):],
+                        args,
+                        {
+                            "session_id": session_id,
+                            "owner": owner,
+                            "disabled_tools": set(disabled_tools or ()),
+                            "allow_browser_unsafe": bool(allow_browser_unsafe),
+                        },
+                    )
+                else:
+                    result = await mcp.call_tool(tool, args)
         else:
             desc = f"mcp: {tool}"
             result = {"error": "MCP manager not available", "exit_code": 1}
@@ -949,7 +984,15 @@ async def _execute_tool_block_impl(
     elif tool in dynamic_handlers:
         first_line = content.split(chr(10))[0][:80]
         desc = f"registry: {tool} {first_line}".strip()
-        res = await _direct_fallback(tool, content, progress_cb=progress_cb)
+        res = await _direct_fallback(
+            tool,
+            content,
+            progress_cb=progress_cb,
+            session_id=session_id,
+            owner=owner,
+            disabled_tools=disabled_tools,
+            allow_browser_unsafe=allow_browser_unsafe,
+        )
 
         if isinstance(res, tuple):
             desc, result = res

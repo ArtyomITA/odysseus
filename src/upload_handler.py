@@ -352,7 +352,19 @@ class UploadHandler:
             return True
             
         return False
-    
+
+    def is_video_file(self, filename: str, content_type: str = None) -> bool:
+        """Vergilius: video in chat (descritti frame per frame dagli occhi Holo).
+        `.webm` resta audio per estensione (registrazioni del microfono): conta
+        come video solo se il mime dice video/*."""
+        video_extensions = {'.mp4', '.mov', '.mkv', '.m4v', '.avi'}
+        _, ext = os.path.splitext(filename.lower())
+        if ext in video_extensions:
+            return True
+        if content_type and content_type.startswith('video/'):
+            return True
+        return False
+
     def is_safe_file_type(self, content_type: str, filename: str) -> bool:
         """Check if file type is safe to store and serve."""
         dangerous_types = {
