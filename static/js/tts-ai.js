@@ -22,6 +22,14 @@ class AITTSManager {
     // buchi piu' avanti. Dal secondo pezzo si torna alle soglie normali,
     // altrimenti la voce suona spezzettata per tutta la risposta.
     static MIN_FIRST_SPEAK_CHARS = 6;
+    // Estremi ragionevoli per la velocita' di lettura: sotto 0.5 la voce
+    // strascica fino a diventare incomprensibile, sopra 2 e' un cinguettio.
+    // Una impostazione scritta a mano (o da un agente) puo' contenere di tutto.
+    static SPEED_MIN = 0.5;
+    static SPEED_MAX = 2.0;
+    // Nessun avanzamento per questo tempo, a scaricamento finito, vuol dire che
+    // `ended` non e' arrivato: la coda riparte lo stesso invece di piantarsi.
+    static STALLO_MS = 3000;
 
     constructor() {
         this.currentAudio = null;
@@ -30,6 +38,7 @@ class AITTSManager {
         this.useBrowserTTS = false;
         this.browserVoice = '';
         this.playbackSpeed = 1;
+        this._fermaBoccaBrowser = null;  // chiude la bocca della voce del browser
         this._provider = 'disabled';
         this.autoPlay = false;
         this.cache = new Map(); // Client-side audio cache
@@ -256,6 +265,38 @@ class AITTSManager {
         }
     }
 
+    /**
+     * Velocita' di lettura chiesta dall'utente, ridotta a un numero sensato.
+     *
+     * Viene da /api/tts/stats, cioe' dalla stessa `tts_speed` che il pannello
+     * impostazioni scrive. Il ponte la accetta e la butta via: PocketTTS non ha
+     * nessun parametro di velocita'. L'unico posto dove l'impostazione puo'
+     * avere effetto e' qui, sull'elemento che suona.
+     */
+    _velocita() {
+        var v = Number(this.playbackSpeed);
+        if (!isFinite(v) || v <= 0) return 1;
+        return Math.min(AITTSManager.SPEED_MAX, Math.max(AITTSManager.SPEED_MIN, v));
+    }
+
+    /**
+     * Applica la velocita' a un elemento audio, qualunque sia il fornitore.
+     *
+     * Prima lo faceva solo il percorso `local`, quindi con PocketTTS
+     * l'impostazione non faceva assolutamente niente. `preservesPitch` tiene il
+     * timbro della voce mentre cambia la durata: senza, a 1.5x si sente Paperino.
+     * I due nomi con prefisso servono ai motori vecchi, che ignorano l'altro.
+     */
+    _applicaVelocita(audio) {
+        var v = this._velocita();
+        try {
+            audio.preservesPitch = true;
+            audio.webkitPreservesPitch = true;
+            audio.mozPreservesPitch = true;
+        } catch (_) { /* proprieta' assente: pazienza, cambia il timbro */ }
+        if (v !== 1) audio.playbackRate = v;
+    }
+
     _findBrowserVoice() {
         if (!this.browserVoice) return null;
         const voices = window.speechSynthesis.getVoices();
@@ -281,6 +322,7 @@ class AITTSManager {
             const audioUrl = await this.synthesize(text);
 
             this.currentAudio = new Audio(audioUrl);
+            this._applicaVelocita(this.currentAudio);
             window.OdysseusAudioDevices?.applyOutputDevice(this.currentAudio);
             // L'avatar e' un di piu': se inciampa non deve portarsi dietro la
             // voce. Un errore qui dentro faceva fallire tutta la riproduzione.
@@ -297,22 +339,104 @@ class AITTSManager {
         }
     }
 
+    /**
+     * Bocca dell'avatar mentre parla la voce del browser (percorso B).
+     *
+     * Con `speechSynthesis` non esiste nessun elemento <audio> e nessun nodo
+     * Web Audio da intercettare: l'audio lo suona il sistema operativo e la
+     * pagina non lo vede. Quindi l'ampiezza non si misura, si inventa — ma
+     * inventata sul ritmo vero delle parole, non a caso: ogni evento `boundary`
+     * e' l'inizio di una parola, quindi un colpo di apertura che poi si
+     * richiude da solo.
+     *
+     * Ci sono motori (Chrome con voci remote) che `boundary` non lo emettono
+     * mai: dopo mezzo secondo di silenzio si passa a un andamento a tempo, ~4
+     * sillabe al secondo, che e' sempre meglio di una bocca ferma.
+     *
+     * Restituisce la funzione da chiamare per smettere.
+     */
+    _boccaBrowser(utterance) {
+        var avatar = window.OdysseusAvatar;
+        if (!avatar || typeof avatar.pushLivello !== 'function') return function() {};
+
+        var vivo = true;
+        var livello = 0;
+        var parole = 0;
+        var t0 = performance.now();
+
+        var spingi = function(v) {
+            try { avatar.pushLivello(Math.max(0, Math.min(1, v))); } catch (_) {}
+        };
+
+        var passo = function() {
+            // La condizione d'uscita vera e' questa, non solo `vivo`: se
+            // l'enunciato viene annullato, `end` puo' non arrivare mai e il
+            // ciclo resterebbe acceso per sempre a spingere zeri.
+            if (!vivo || !window.speechSynthesis.speaking) {
+                vivo = false;
+                spingi(0);
+                return;
+            }
+            var ora = performance.now();
+            if (parole === 0 && ora - t0 > 500) {
+                livello = 0.30 + 0.35 * Math.abs(Math.sin(ora / 120));
+            } else {
+                livello *= 0.86;   // rilascio: la parola si spegne in ~200 ms
+            }
+            spingi(livello);
+            requestAnimationFrame(passo);
+        };
+
+        try {
+            utterance.addEventListener('boundary', function() {
+                parole++;
+                livello = 0.85;
+            });
+        } catch (_) { /* motore senza boundary: resta l'andamento a tempo */ }
+
+        requestAnimationFrame(passo);
+        return function() { vivo = false; spingi(0); };
+    }
+
     _playBrowser(plainText) {
         return new Promise((resolve, reject) => {
             const utterance = new SpeechSynthesisUtterance(plainText);
             const voice = this._findBrowserVoice();
             if (voice) utterance.voice = voice;
-            utterance.rate = this.playbackSpeed;
+            utterance.rate = this._velocita();
 
-            utterance.onend = () => {
+            // Fuori dalla coda (play() diretta) gli eventi non li segnala
+            // nessuno: il microfono resterebbe aperto mentre l'assistente
+            // parla. Dentro la coda ci pensa gia' _processQueue.
+            var segnala = !this._processing;
+            var fermaBocca = null;
+            const chiudi = () => {
+                if (fermaBocca) { fermaBocca(); fermaBocca = null; }
+                this._fermaBoccaBrowser = null;
                 this.isPlaying = false;
+                if (segnala) { segnala = false; this._segnala('tts-end'); }
+            };
+
+            utterance.onstart = () => {
+                fermaBocca = this._boccaBrowser(utterance);
+                this._fermaBoccaBrowser = fermaBocca;
+            };
+            utterance.onend = () => {
+                chiudi();
                 resolve();
             };
             utterance.onerror = (e) => {
-                this.isPlaying = false;
+                chiudi();
                 reject(new Error('Browser TTS error: ' + e.error));
             };
+            utterance.onpause = () => {
+                if (fermaBocca) { fermaBocca(); fermaBocca = null; }
+            };
+            utterance.onresume = () => {
+                if (!fermaBocca) fermaBocca = this._boccaBrowser(utterance);
+            };
 
+            if (segnala) this._segnala('tts-start');
             window.speechSynthesis.speak(utterance);
             this.isPlaying = true;
         });
@@ -345,6 +469,11 @@ class AITTSManager {
 
         if (this.useBrowserTTS) {
             window.speechSynthesis.cancel();
+            // `cancel()` non garantisce l'evento `end`: la bocca va chiusa a mano.
+            if (this._fermaBoccaBrowser) {
+                try { this._fermaBoccaBrowser(); } catch (_) {}
+                this._fermaBoccaBrowser = null;
+            }
             this.isPlaying = false;
         }
         if (this.currentAudio) {
@@ -368,6 +497,37 @@ class AITTSManager {
             // start synthesising it now instead of at hand-over.
             this._prefetch(this._queue[1]);
         }
+    }
+
+    /**
+     * Mette in coda un testo intero, tagliato come quello che arriva in diretta.
+     *
+     * E' quello che usa il pulsante "leggi ad alta voce". Prima gli passava il
+     * messaggio intero a `enqueue()`: PocketTTS taglia a 50 token per pezzo e
+     * oltre quella soglia SALTA le parole senza dirlo, quindi di un messaggio
+     * lungo si sentiva solo l'inizio. Stesso tagliatore e stessa coda della
+     * lettura automatica: un pezzo che parte prima e nessuna parola persa.
+     */
+    enqueueSpezzato(text, button, resetFn) {
+        var plainText = this.extractPlainText(text);
+        if (!plainText) return;
+
+        // Lo spazio in fondo serve al tagliatore: taglia solo quando dopo la
+        // punteggiatura c'e' uno spazio, e l'ultima frase non ne ha.
+        var conSpazio = plainText.trim() + ' ';
+        var pezzi = this._spezza(conSpazio);
+        var consumati = pezzi.join('').length;
+        var coda = conSpazio.substring(consumati).trim();
+
+        var accumulato = '';
+        for (var k = 0; k < pezzi.length; k++) {
+            accumulato += pezzi[k];
+            if (accumulato.trim().length < AITTSManager.MIN_SPEAK_CHARS) continue;
+            this.enqueue(accumulato.trim(), button, resetFn);
+            accumulato = '';
+        }
+        var ultimo = (accumulato + ' ' + coda).trim();
+        if (ultimo) this.enqueue(ultimo, button, resetFn);
     }
 
     /**
@@ -487,9 +647,11 @@ class AITTSManager {
                     // and throw away the head start.
                     const audio = item._audio || new Audio(audioUrl);
                     item._audio = null;
-                    if (this._provider === 'local' && this.playbackSpeed !== 1) {
-                        audio.playbackRate = this.playbackSpeed;
-                    }
+                    // Vale per tutti i fornitori, non solo per `local`:
+                    // l'analizzatore dell'avatar legge il grafo Web Audio a
+                    // valle dell'elemento, quindi continua a ricevere campioni
+                    // anche a velocita' diversa da 1.
+                    this._applicaVelocita(audio);
                     this.currentAudio = audio;
                     // Queued playback is the path the read-aloud button and
                     // auto-speak use, so the avatar has to be tapped here too.
@@ -499,20 +661,49 @@ class AITTSManager {
                     // accessorio, la voce no.
                     try { window.OdysseusAvatar?.attachAudio(audio); }
                     catch (e) { console.warn('avatar: aggancio fallito', e); }
-                    audio.onended = () => {
+                    // Guardia contro l'`ended` che non arriva.
+                    //
+                    // Il WAV che arriva dal ponte non ha una lunghezza vera
+                    // (e' un flusso: le dimensioni valgono 0xFFFFFFFF), quindi
+                    // `duration` non dice niente e ci sono lettori che, a
+                    // scaricamento finito, restano fermi senza emettere
+                    // `ended`. Prima bastava per piantare la coda per il resto
+                    // della risposta: la voce "a volte non parte".
+                    //
+                    // Il controllo scatta solo quando il download e' FINITO
+                    // (networkState IDLE) e il tempo di riproduzione non
+                    // avanza: durante la sintesi una pausa e' normale e non
+                    // deve troncare la frase.
+                    var chiuso = false;
+                    var vigile = null;
+                    var ultimoTempo = -1;
+                    var fermoDa = 0;
+                    const concludi = (fn, arg) => {
+                        if (chiuso) return;
+                        chiuso = true;
+                        if (vigile) clearInterval(vigile);
                         this.isPlaying = false;
                         if (this.currentAudio === audio) this.currentAudio = null;
-                        resolve();
+                        fn(arg);
                     };
-                    audio.onerror = (e) => {
-                        this.isPlaying = false;
-                        if (this.currentAudio === audio) this.currentAudio = null;
-                        reject(new Error('Audio playback error'));
-                    };
-                    audio.onpause = () => {
-                        if (this.currentAudio !== audio) {
-                            resolve();
+                    vigile = setInterval(() => {
+                        if (audio.ended) { concludi(resolve); return; }
+                        var fermo = audio.currentTime === ultimoTempo;
+                        ultimoTempo = audio.currentTime;
+                        if (fermo && !audio.paused && audio.networkState === 2) {
+                            fermoDa += 500;
+                            if (fermoDa >= AITTSManager.STALLO_MS) {
+                                console.warn('TTS: nessun `ended`, passo al pezzo seguente');
+                                concludi(resolve);
+                            }
+                        } else {
+                            fermoDa = 0;
                         }
+                    }, 500);
+                    audio.onended = () => concludi(resolve);
+                    audio.onerror = () => concludi(reject, new Error('Audio playback error'));
+                    audio.onpause = () => {
+                        if (this.currentAudio !== audio) concludi(resolve);
                     };
                     audio.play().then(() => {
                         this.isPlaying = true;
@@ -778,7 +969,8 @@ export function addAITTSButton(messageElement, text) {
             return;
         }
 
-        mgr.enqueue(text, playButton, resetButton);
+        // Spezzettato, non intero: vedi enqueueSpezzato().
+        mgr.enqueueSpezzato(text, playButton, resetButton);
     });
 
     actions.appendChild(playButton);

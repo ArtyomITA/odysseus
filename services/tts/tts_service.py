@@ -42,7 +42,11 @@ class TTSService:
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._kokoro = None  # lazy-init
-        
+        # Motivo dell'ultimo fallimento di sintesi, da mostrare a chi chiama:
+        # un 500 vuoto e' indistinguibile da "il tasto non funziona".
+        self.last_error = None
+
+
         try:
             self.max_cache_bytes = int(os.getenv("ODYSSEUS_TTS_CACHE_MAX_BYTES", 500 * 1024 * 1024))
         except ValueError:
@@ -186,12 +190,20 @@ class TTSService:
         }
 
         try:
-            r = httpx.post(url, json=payload, headers=headers, timeout=60)
+            # 60 s non bastano per un paragrafo: il ponte lo spezza in frasi e
+            # le sintetizza in fila, quindi il tempo cresce con la lunghezza.
+            # Scaduto il tempo si tornava None, che a valle diventa un 500 senza
+            # spiegazione — cioe' silenzio. Ora il motivo arriva fino all'utente
+            # (vedi self.last_error).
+            r = httpx.post(url, json=payload, headers=headers,
+                           timeout=httpx.Timeout(180.0, connect=5.0))
             r.raise_for_status()
             logger.info(f"API TTS: {len(r.content)} bytes from {base_url}")
+            self.last_error = None
             return r.content
         except Exception as e:
             logger.error(f"API TTS synthesis failed: {e}")
+            self.last_error = f"{type(e).__name__}: {e}"
             return None
 
     # ── Public interface ──
@@ -333,6 +345,7 @@ class TTSService:
                         yield pezzo
         except Exception as e:
             logger.error(f"Streaming TTS failed: {e}")
+            self.last_error = f"{type(e).__name__}: {e}"
             return
 
         if use_cache and pezzi:

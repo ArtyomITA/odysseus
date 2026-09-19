@@ -51,8 +51,14 @@ def setup_tts_routes(tts_service):
         try:
             primo = next(sorgente)
         except StopIteration:
-            raise HTTPException(status_code=500,
-                                detail={"message": "Synthesis failed"})
+            # Il motivo vero (timeout, motore spento, endpoint sbagliato) viene
+            # dal servizio: senza, l'utente vede solo un pulsante che non fa
+            # niente e nessuno sa dove guardare.
+            motivo = getattr(tts_service, "last_error", None)
+            raise HTTPException(
+                status_code=502 if motivo else 500,
+                detail={"message": f"Synthesis failed: {motivo}" if motivo
+                        else "Synthesis failed"})
 
         is_mp3 = primo[:3] == b"ID3" or (
             len(primo) >= 2 and primo[0] == 0xFF and (primo[1] & 0xE0) == 0xE0)
@@ -101,9 +107,13 @@ def setup_tts_routes(tts_service):
             else:  # audio format
                 audio_data = tts_service.synthesize(request.text)
                 if not audio_data:
+                    # Stesso motivo del percorso in streaming: il fallimento
+                    # deve arrivare all'interfaccia con la sua causa.
+                    motivo = getattr(tts_service, "last_error", None)
                     raise HTTPException(
-                        status_code=500,
-                        detail={"message": "Synthesis failed"}
+                        status_code=502 if motivo else 500,
+                        detail={"message": f"Synthesis failed: {motivo}" if motivo
+                                else "Synthesis failed"}
                     )
                 
                 # Detect format from magic bytes (MP3: ID3 tag or sync word ff e0+)

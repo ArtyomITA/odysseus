@@ -33,10 +33,39 @@ try {
   say('expressions: ' + (settings.expressions?.length ?? 'n/a'));
   say('motion groups: ' + Object.keys(settings.motions || {}).join(',') || 'none');
 
+  // I parametri della bocca sono per modello: mao_pro muove `ParamA`, non il
+  // `ParamMouthOpenY` che copiano tutti gli esempi. Provarlo a nome fisso vuol
+  // dire scrivere su un parametro che non esiste e dire "tutto ok" — che e' il
+  // motivo per cui questa pagina passava mentre la bocca restava ferma. Si
+  // legge il gruppo LipSync del modello, esattamente come fa avatarRenderer.js.
+  const core = model.internalModel.coreModel;
+  const idsBocca = model.internalModel.motionManager?.lipSyncIds?.length
+    ? [...model.internalModel.motionManager.lipSyncIds]
+    : [];
+  say('parametri bocca (gruppo LipSync): ' + (idsBocca.join(',') || 'NESSUNO'));
+
+  if (idsBocca.length === 0) {
+    throw new Error('il modello non dichiara un gruppo LipSync: nessun parametro da muovere');
+  }
+
+  // Prova onesta: si scrive un valore e si rilegge. Un id inesistente in
+  // Cubism non lancia nessun errore, restituisce semplicemente sempre lo stesso
+  // valore — ed e' l'unico modo per accorgersene.
+  for (const id of idsBocca) {
+    const prima = core.getParameterValueById(id);
+    core.setParameterValueById(id, 0.9);
+    const dopo = core.getParameterValueById(id);
+    if (!(Math.abs(dopo - 0.9) < 0.01)) {
+      throw new Error(`il parametro ${id} non cambia (letto ${dopo} dopo aver scritto 0.9)`);
+    }
+    core.setParameterValueById(id, prima);
+    say(`parametro ${id}: scrivibile (ok)`);
+  }
+
   model.internalModel.on('beforeModelUpdate', () => {
-    model.internalModel.coreModel.setParameterValueById('ParamMouthOpenY', 0.5);
+    for (const id of idsBocca) core.setParameterValueById(id, 0.5);
   });
-  say('beforeModelUpdate hook: ok');
+  say('beforeModelUpdate hook: ok (usa ' + idsBocca.join(',') + ')');
 
   say('ESITO: TUTTO OK');
 } catch (e) {
