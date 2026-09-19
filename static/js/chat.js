@@ -1902,7 +1902,7 @@ import { loadPanel } from './panels.js';
 	      try {
 	        if (window.OdysseusShadowBroker?.modoAttivo()) fd.append('osint_mode', 'true');
 	        if (window.OdysseusShadowBroker?.financialAttivo()) fd.append('financial_mode', 'true');
-	        // Vergilius: la vista deriva dal MODELLO (ling-vista = Ling + occhi
+	        // Vergilius: la vista deriva dal MODELLO (lfm-vista = LFM + occhi
 	        // Holo), non da un toggle. Computer/Browser nel menu "+" scelgono
 	        // quali tool di azione forzare insieme agli occhi.
 	        if (window.OdysseusVista?.attiva()) {

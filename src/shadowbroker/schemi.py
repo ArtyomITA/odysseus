@@ -712,8 +712,8 @@ REGOLE_OSINT = (
 
 # Variante "libere" (19 set 2026) per modelli obbedienti come LFM2.5: stessi FATTI delle regole
 # piene (ricette, codici, colori, contratto del grafico), senza MUST/NEVER/ZERO ne' ripetizioni.
-# Misurato: su LFM i divieti scritti per Ling diventano rinunce (calcoli rifiutati). Scelta con
-# VERGILIUS_REGOLE_PROFILO=libere; default "piene" = testo storico, Ling non cambia.
+# Misurato: su LFM i divieti scritti per il modello precedente diventano rinunce (calcoli
+# rifiutati). Scelta con VERGILIUS_REGOLE_PROFILO=libere; default "piene" = testo storico.
 REGOLE_FINANCE_LIBERE = (
     "Answer in Italian (these notes are in English, replies are not).\n"
     "- Financial profile. Live data: `fin_mercati` (prices, spikes paired with "

@@ -138,10 +138,41 @@ def test_italian_youtube_intent_survives_light_auto_escalation():
     assert "_allow_browser_for_web_turn = True" in source
 
 
-def test_ling_family_has_native_tool_support_without_mutable_db_flag():
+def test_lfm_family_has_native_tool_support_without_mutable_db_flag():
     source = (Path(__file__).resolve().parent.parent / "src" / "agent_loop.py").read_text(encoding="utf-8")
-    assert '_model_basename == "ling"' in source
-    assert '_model_basename.startswith("ling-")' in source
+    assert '_model_basename == "lfm"' in source
+    assert '_model_basename.startswith(("lfm-", "lfm2"))' in source
+    # Ling/Bailing were removed from the project: no name-based rule survives.
+    assert '"ling"' not in source
+    assert "bailing" not in source.lower()
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["lfm", "lfm-vista", "lfm-uncensored", "org/LFM2.5-2.6B"],
+)
+def test_lfm_ids_get_native_tool_calling_by_name(model):
+    """LFM2.5 is the default model: every id shape must reach the native path.
+
+    An endpoint URL with no ModelEndpoint row is used on purpose, so the answer
+    comes from the name rule and not from a stored supports_tools flag.
+    """
+    from src.agent_loop import _agent_route_tool_mode
+
+    is_api_model, _ollama, _compat = _agent_route_tool_mode(
+        "http://127.0.0.1:59999/v1", model
+    )
+    assert is_api_model is True
+
+
+@pytest.mark.parametrize("model", ["ling", "ling-vista", "org/Ling-3.0-tiny", "bailing-moe"])
+def test_ling_no_longer_gets_native_tool_calling_by_name(model):
+    from src.agent_loop import _agent_route_tool_mode
+
+    is_api_model, _ollama, _compat = _agent_route_tool_mode(
+        "http://127.0.0.1:59999/v1", model
+    )
+    assert is_api_model is False
 
 
 def test_disabled_tools_respects_missing_vs_explicit_toggles():

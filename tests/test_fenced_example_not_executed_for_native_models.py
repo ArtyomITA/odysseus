@@ -44,9 +44,27 @@ def _types(chunks):
     return out
 
 
-def _patch_common(monkeypatch, exec_calls):
+def _isolate_data_dir(monkeypatch, tmp_path):
+    """Point the skills store at an empty tmp dir.
+
+    Without this the loop reads the developer's live DATA_DIR: any saved skill
+    makes the skills index enter the prompt as untrusted context, which arms the
+    external-untrusted-context tool gate and makes `bash` require approval —
+    the tool-channel assertions below would then fail for a reason that has
+    nothing to do with tool parsing. Same convention as
+    tests/test_skill_index_prompt_injection.py.
+    """
+    import src.constants as _constants
+    monkeypatch.setattr(_constants, "DATA_DIR", str(tmp_path / "data"), raising=False)
+    al._cached_base_prompt = None
+    al._cached_base_prompt_key = None
+
+
+def _patch_common(monkeypatch, exec_calls, tmp_path=None):
     # Skip RAG/tool-index, MCP, and settings lookups; keep the real loop body,
     # _resolve_tool_blocks, and parse_tool_blocks intact.
+    if tmp_path is not None:
+        _isolate_data_dir(monkeypatch, tmp_path)
     monkeypatch.setattr(al, "get_setting", lambda key, default=None: default, raising=False)
     monkeypatch.setattr(al, "get_mcp_manager", lambda: None, raising=False)
     monkeypatch.setattr(al, "estimate_tokens", lambda *a, **k: 10, raising=False)
@@ -96,9 +114,9 @@ def _run_loop(monkeypatch, model, deltas, native_calls=None, max_rounds=2, endpo
 # 1. Native model, illustrative ```bash fence, NO native tool_calls
 #    -> must NOT be executed.
 # ---------------------------------------------------------------------------
-def test_native_model_illustrative_bash_fence_not_executed(monkeypatch):
+def test_native_model_illustrative_bash_fence_not_executed(monkeypatch, tmp_path):
     exec_calls = []
-    _patch_common(monkeypatch, exec_calls)
+    _patch_common(monkeypatch, exec_calls, tmp_path)
     guide_only = (
         "Here is the command you would run locally:\n\n"
         "```bash\nnpm run plan:articles\n```\n\n"
@@ -114,9 +132,9 @@ def test_native_model_illustrative_bash_fence_not_executed(monkeypatch):
 # 2. Native model that DOES emit a real native tool_calls entry
 #    -> that call IS resolved/executed normally (untouched native path).
 # ---------------------------------------------------------------------------
-def test_native_model_real_native_tool_call_is_executed(monkeypatch):
+def test_native_model_real_native_tool_call_is_executed(monkeypatch, tmp_path):
     exec_calls = []
-    _patch_common(monkeypatch, exec_calls)
+    _patch_common(monkeypatch, exec_calls, tmp_path)
     native_calls = [{"name": "bash", "arguments": json.dumps({"command": "echo hi"})}]
     events = _run_loop(
         monkeypatch, "gpt-4o",
@@ -133,9 +151,9 @@ def test_native_model_real_native_tool_call_is_executed(monkeypatch):
 # 3. Non-native / textual-only model using the legitimate fenced format it
 #    depends on -> still correctly parsed and executed (regression check).
 # ---------------------------------------------------------------------------
-def test_non_native_model_fenced_tool_call_still_executed(monkeypatch):
+def test_non_native_model_fenced_tool_call_still_executed(monkeypatch, tmp_path):
     exec_calls = []
-    _patch_common(monkeypatch, exec_calls)
+    _patch_common(monkeypatch, exec_calls, tmp_path)
     # Neither this model name nor this endpoint host match any of the
     # native-capable keyword/host checks, so _is_api_model resolves to False
     # and the model must rely on the textual fenced-block convention to
@@ -156,9 +174,9 @@ def test_non_native_model_fenced_tool_call_still_executed(monkeypatch):
 #    ```json guide-only examples) run through the real resolution path for a
 #    native model -> confirm zero tool actions resolved.
 # ---------------------------------------------------------------------------
-def test_issue_3222_repro_guide_only_response_resolves_no_tool_actions(monkeypatch):
+def test_issue_3222_repro_guide_only_response_resolves_no_tool_actions(monkeypatch, tmp_path):
     exec_calls = []
-    _patch_common(monkeypatch, exec_calls)
+    _patch_common(monkeypatch, exec_calls, tmp_path)
     repro = (
         "Here is the command you would run locally:\n\n"
         "```bash\nnpm run plan:articles\n```\n\n"

@@ -247,13 +247,13 @@ def supports_vision(endpoint_url: str, model: str, load: bool = False) -> Option
 
 
 def vista_esterna(model: str) -> bool:
-    """Vergilius: un profilo `*-vista` SENZA proiettore (es. `ling-vista`) vede
+    """Vergilius: un profilo `*-vista` SENZA proiettore (es. `lfm-vista`) vede
     attraverso gli occhi esterni (Holo, src/vista). Diverso dalla vista nativa
     (`qwenpaw-vista`, mmproj): qui le immagini NON vanno al modello — le
     descrive Holo — quindi `vision` resta False e questo flag dice alla UI
     "ha la vista" e al warmup "avvia gli occhi"."""
     m = (model or "").lower().rsplit("/", 1)[-1]
-    return m.endswith("-vista") and m.startswith(("ling", "lfm"))
+    return m.endswith("-vista") and m.startswith("lfm")
 
 
 def status(endpoint_url: str, model: str) -> Dict[str, Any]:

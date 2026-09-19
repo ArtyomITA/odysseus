@@ -25,9 +25,9 @@ def test_llamaswap_context_uses_ready_upstream_props(monkeypatch):
         lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("direct /slots must be skipped")),
     )
     assert model_context._query_context_length(
-        "http://127.0.0.1:8012/v1", "ling-vista"
+        "http://127.0.0.1:8012/v1", "lfm-vista"
     ) == (49152, True)
-    assert calls == [("http://127.0.0.1:8012/v1", "ling-vista", False)]
+    assert calls == [("http://127.0.0.1:8012/v1", "lfm-vista", False)]
 
 
 def test_production_runtime_flags_preserve_live_prefix_cache():
@@ -40,7 +40,7 @@ def test_production_runtime_flags_preserve_live_prefix_cache():
     assert "--no-cache-prompt" not in config
 
 
-def test_holo_warmup_is_post_ling_and_deduplicated():
+def test_holo_warmup_is_post_model_and_deduplicated():
     routes = (ROOT / "routes" / "model_routes.py").read_text(encoding="utf-8")
     client = (ROOT / "src" / "vista" / "client.py").read_text(encoding="utf-8")
     assert 'llamaswap.model_state(base, model) == "ready"' in routes
@@ -315,7 +315,7 @@ def test_model_warmup_route_deduplicates_same_generation_watcher(monkeypatch):
 
         @staticmethod
         def avvia_in_background(*, expected_generation=None):
-            raise AssertionError("watcher must wait for Ling")
+            raise AssertionError("watcher must wait for il modello")
 
     started = []
 
@@ -346,8 +346,8 @@ def test_model_warmup_route_deduplicates_same_generation_watcher(monkeypatch):
         state=SimpleNamespace(),
         app=SimpleNamespace(state=SimpleNamespace(auth_manager=None)),
     )
-    payload = {"endpoint_url": endpoint_url, "model": "ling-vista"}
+    payload = {"endpoint_url": endpoint_url, "model": "lfm-vista"}
 
     assert warmup(request, payload) == {"swap": True, "state": "starting"}
     assert warmup(request, payload) == {"swap": True, "state": "starting"}
-    assert [thread.name for thread in started] == ["vista-after-ling"]
+    assert [thread.name for thread in started] == ["vista-after-modello"]

@@ -2,6 +2,13 @@
 
 Aggiornato al 1 agosto 2026.
 
+> **Nota 19 set 2026**: modello predefinito da allora è **LFM2.5-2.6B**
+> (Liquid AI), non più QwenPaw 9B come sotto. Vedi
+> [02-modello-e-hardware.md](02-modello-e-hardware.md) e
+> [10-decisioni-e-alternative-scartate.md](10-decisioni-e-alternative-scartate.md)
+> per i dettagli aggiornati. Righe sotto non riscritte, restano il verbale
+> del 1 agosto.
+
 ## Cosa funziona
 
 | Componente | Stato | Note |

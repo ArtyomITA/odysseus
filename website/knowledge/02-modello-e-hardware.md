@@ -1,5 +1,34 @@
 # Modello e hardware: vincoli, scelte, misure
 
+> **Nota 19 set 2026.** Modello predefinito ora **LFM2.5-2.6B** (Liquid AI),
+> non più QwenPaw-Flash-9B. Tutto sotto
+> descrive l'hardware (sempre valido) e il modello dell'epoca, QwenPaw
+> (superato). Riassunto dell'attuale:
+>
+> - **LFM2.5-2.6B Q8_0 GGUF** (2.87 GB) + drafter speculativo ufficiale
+>   **LFM2.5-2.6B-DSpark Q8_0** (0.36 GB, deve restare Q8_0: F16 dimezza la
+>   velocità su Pascal). Profilo llama-swap `lfm` (alias vista `lfm-vista`).
+> - **Contesto 49152**, **VRAM ≈ 4.8 GB**.
+> - Campionamento (valori ufficiali Liquid): temp 0.1, top-k 50,
+>   repeat-penalty 1.1.
+> - Speculative decoding: `--spec-type draft-dspark --spec-draft-n-max 3`
+>   (non 10 come da raccomandazione Liquid: su Pascal 10 rallenta la prosa
+>   del 23%).
+> - Misurato su questa GTX 1080: prefill 1940 tok/s (i modelli precedenti erano
+>   molto più lenti in prefill, ≈850), decodifica 64 tok/s, 78-100 tok/s con
+>   DSpark attivo. Suite allucinazioni: 48/48 turni con lo strumento giusto,
+>   0 invenzioni.
+> - Leve specifiche del modello in `vergilius-lfm.env`, caricato dal boot
+>   quando `VERGILIUS_MODELLO=lfm` in `vergilius.env`.
+> - Licenza: **LFM Open License v1.0** (basata su Apache-2.0, uso commerciale
+>   libero sotto 10M USD di ricavi annui). Pesi non inclusi nel repo, scaricati
+>   da Hugging Face; si accetta la licenza scaricando.
+>
+> Dettagli architetturali di QwenPaw sotto (attenzione lineare, scala A0-A4,
+> misure Q4/Q5) **non sono stati riverificati su LFM2.5-2.6B**: lasciati come
+> riferimento storico, non applicare alla configurazione attuale senza
+> rimisurare.
+
 ## L'hardware
 
 - **GPU: GTX 1080, 8GB GDDR5X**, architettura Pascal (capacità calcolo 6.1).
@@ -14,7 +43,7 @@
   ultima risorsa, non una leva.**
 - Windows 11. Desktop con applicazioni aperte ruba **~1.1GB di VRAM**.
 
-## Il modello scelto: QwenPaw-Flash-9B
+## Il modello scelto: QwenPaw-Flash-9B (superato, vedi nota in cima)
 
 Finetune di Qwen3.5-9B fatto dal team AgentScope (Alibaba) **specificamente per
 agenti autonomi**: invocazione strumenti, comandi terminale, gestione

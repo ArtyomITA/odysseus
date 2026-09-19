@@ -1712,8 +1712,8 @@ def setup_model_routes(model_discovery):
         from src import llamaswap
         out = llamaswap.status(base, model)
         # Status is deliberately read-only. A late poll for a previously
-        # selected ling-vista profile must never resurrect Holo after the user
-        # has switched back to plain Ling.
+        # selected lfm-vista profile must never resurrect Holo after the user
+        # has switched back to plain LFM.
         return out
 
     @router.post("/model-runtime/warmup")
@@ -1744,8 +1744,8 @@ def setup_model_routes(model_discovery):
                 daemon=True,
             ).start()
             state = "starting"
-        # Vergilius: `ling-vista` = Ling + occhi esterni (Holo su CPU). Holo
-        # parte SOLO dopo che Ling e' ready (nel route status sopra); il loader
+        # Vergilius: `lfm-vista` = LFM + occhi esterni (Holo su CPU). Holo
+        # parte SOLO dopo che LFM e' ready (nel route status sopra); il loader
         # lato UI aspetta entrambi. Scegliere un profilo senza -vista spegne
         # gli occhi: niente RAM sprecata e modalita' vista coerente col modello.
         try:
@@ -1767,7 +1767,7 @@ def setup_model_routes(model_discovery):
                         if _new_watcher:
                             _vista_watcher_keys.add(_watcher_key)
                     if _new_watcher:
-                        def _avvia_occhi_dopo_ling() -> None:
+                        def _avvia_occhi_dopo_modello() -> None:
                             try:
                                 deadline = _time.monotonic() + 360.0
                                 while _time.monotonic() < deadline:
@@ -1784,8 +1784,8 @@ def setup_model_routes(model_discovery):
                                     _vista_watcher_keys.discard(_watcher_key)
 
                         _vista_threading.Thread(
-                            target=_avvia_occhi_dopo_ling,
-                            name="vista-after-ling",
+                            target=_avvia_occhi_dopo_modello,
+                            name="vista-after-modello",
                             daemon=True,
                         ).start()
             else:

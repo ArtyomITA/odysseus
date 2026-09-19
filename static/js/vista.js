@@ -1,6 +1,6 @@
 /* Vista — gli occhi di Vergilius (Holo VLM locale, CPU).
  *
- * La vista si sceglie DAI MODELLI: `ling-vista` nel picker = Ling + Holo. Il
+ * La vista si sceglie DAI MODELLI: `lfm-vista` nel picker = LFM + Holo. Il
  * loader e' quello del picker (modelLoading.js aspetta anche `occhi_pronti`),
  * l'avvio/stop di Holo lo fa il server nel warmup (model_routes.py).
  *
@@ -23,7 +23,7 @@
   }
   function attiva() {
     var m = modelloCorrente().split('/').pop();
-    return /^(ling|lfm)/.test(m) && /-vista$/.test(m);
+    return /^lfm/.test(m) && /-vista$/.test(m);
   }
   function computer() { try { return attiva() && localStorage.getItem(PREF_PC) === '1'; } catch (_) { return false; } }
   function browser()  { try { return attiva() && localStorage.getItem(PREF_BR) === '1'; } catch (_) { return false; } }

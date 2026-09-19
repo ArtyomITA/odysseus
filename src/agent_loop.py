@@ -65,7 +65,6 @@ from src.tool_approvals import (
 from src.tool_utils import _truncate, get_mcp_manager
 from src.agent_tools import (
     parse_tool_blocks,
-    parse_reasoning_tool_calls,
     strip_tool_blocks,
     execute_tool_block,
     format_tool_result,
@@ -601,7 +600,8 @@ def _last_user_text(messages) -> str:
 
 # ── Leve per modelli piccoli/obbedienti (LFM2.5-2.6B) ────────────────────
 # Tre helper puri, testabili senza modello vivo. Ognuno e' dietro un env che
-# di default riproduce il comportamento storico (profilo Ling invariato).
+# di default riproduce il comportamento storico (profilo del modello precedente
+# invariato).
 
 # Soglia storica del nudge "intento senza azione". Oltre questa lunghezza la
 # risposta non e' piu' un annuncio ma un testo finale: si nudgia solo se la
@@ -1513,17 +1513,14 @@ def _agent_route_tool_mode(
     except Exception as exc:
         logger.debug("endpoint supports_tools lookup failed: %s", exc)
 
-    # Vergilius: Ling / Bailing (Ling-3.0-tiny e derivati) parlano il canale
-    # native function-calling ma il loro nome non contiene nessuna delle
-    # parole chiave sotto. Confronto sul basename, cosi' `org/Ling-3.0` passa.
+    # Vergilius: i modelli locali parlano il canale native function-calling ma
+    # il loro nome non contiene nessuna delle parole chiave sotto. Confronto
+    # sul basename, cosi' `org/LFM2.5-2.6B` passa.
     _model_basename = model_lc.rsplit("/", 1)[-1]
     model_supports_tools = (
-        _model_basename == "ling"
-        or _model_basename.startswith("ling-")
-        or "bailing" in _model_basename
         # Liquid AI LFM2 / LFM2.5: tool call native Pythoniche, convertite dal parser di llama.cpp
         # (verificato sul binario b10549, 19 set 2026).
-        or _model_basename == "lfm"
+        _model_basename == "lfm"
         or _model_basename.startswith(("lfm-", "lfm2"))
         or any(kw in model_lc for kw in (
         "gpt-4", "gpt-5", "gpt-o", "claude", "gemini", "gemma",
@@ -2775,14 +2772,19 @@ def _build_system_prompt(
         # Skill index is user-editable (name + description), so it must never
         # live in the trusted system role and is NOT cached. Always recompute
         # when the cache hits.
-        _, _skill_index_block = _build_base_prompt(
+        # Tuple unpacked defensively: _build_base_prompt gained a third element
+        # (the local-provenance index block) and tests monkeypatch it with a
+        # 2-tuple stub.
+        _base = _build_base_prompt(
             disabled_tools, mcp_mgr, needs_admin, relevant_tools,
             mcp_disabled_map=mcp_disabled_map, compact=compact, owner=owner,
             suppress_local_context=suppress_local_context,
             suppress_skills=suppress_skills,
         )
+        _skill_index_block = _base[1]
+        _skill_index_trusted_block = _base[2] if len(_base) > 2 else ""
     else:
-        agent_prompt, _skill_index_block = _build_base_prompt(
+        _base = _build_base_prompt(
             disabled_tools,
             mcp_mgr,
             needs_admin,
@@ -2793,6 +2795,9 @@ def _build_system_prompt(
             suppress_local_context=suppress_local_context,
             suppress_skills=suppress_skills,
         )
+        agent_prompt = _base[0]
+        _skill_index_block = _base[1]
+        _skill_index_trusted_block = _base[2] if len(_base) > 2 else ""
         if not active_document:
             _cached_base_prompt = agent_prompt
             _cached_base_prompt_key = cache_key
@@ -2832,6 +2837,9 @@ def _build_system_prompt(
     # the trusted system role. Bound up front so the insert block below can
     # always check it.
     _skills_message = None
+    # Twin of _skills_message carrying only local-provenance skills, wrapped
+    # with arm_tool_gate=False. Stays None unless ODYSSEUS_SKILLS_INDEX_TRUSTED=1.
+    _skills_trusted_message = None
     _email_style_message = None
     _integ_message = None
     _mcp_desc_message = None
@@ -3183,7 +3191,6 @@ def _build_system_prompt(
                     max_items=_skill_max_injected,
                     min_confidence=_skill_min_conf,
                 ) if _skill_max_injected > 0 else []
-                lines = [""]
                 if relevant_skills:
                     # Bump the "uses" counter on every skill we actually surface
                     # to the agent — otherwise every skill shows "0 times" no
@@ -3193,30 +3200,19 @@ def _build_system_prompt(
                             sm.record_use(_sk.get('name', ''), owner=owner)
                         except Exception:
                             pass
-                    lines.append("## Relevant skills for this request")
-                    lines.append("These skills are matched to your current request. Each is a "
-                                 "procedure proven to work. Follow them step by step. To see "
-                                 "the full SKILL.md (more detail, pitfalls, verification "
-                                 "steps), call `manage_skills` with action='view' and the "
-                                 "skill name.")
-                    for sk in relevant_skills:
-                        src_tag = ""
-                        if sk.get("source") == "teacher-escalation":
-                            tm = sk.get("teacher_model") or "teacher"
-                            src_tag = f" _(learned from {tm})_"
-                        lines.append(f"\n### {sk.get('name','?')}{src_tag}")
-                        if sk.get("description"):
-                            lines.append(sk["description"])
-                        if sk.get("when_to_use"):
-                            lines.append(f"_When to use:_ {sk['when_to_use']}")
-                        proc = sk.get("procedure") or []
-                        if proc:
-                            lines.append("Procedure:")
-                            for i, step in enumerate(proc, 1):
-                                lines.append(f"  {i}. {step}")
-                        pitfalls = sk.get("pitfalls") or []
-                        if pitfalls:
-                            lines.append("Pitfalls: " + "; ".join(pitfalls))
+                # Same provenance split as the index: a matched skill that was
+                # imported from a URL carries external text and must keep arming
+                # the gate, so it stays in the untrusted block.
+                _trusted_split = _skills_index_trusted_enabled()
+                if _trusted_split:
+                    _local_skills = [s for s in relevant_skills
+                                     if _skill_provenance_is_local(s)]
+                    _other_skills = [s for s in relevant_skills
+                                     if not _skill_provenance_is_local(s)]
+                else:
+                    _local_skills, _other_skills = [], list(relevant_skills)
+                lines = _render_matched_skills_lines(_other_skills)
+                _trusted_lines = _render_matched_skills_lines(_local_skills)
                 # SECURITY: do NOT concatenate the skills block into the
                 # trusted system role. Skill content (name, description,
                 # when_to_use, procedure, pitfalls) is user-editable via
@@ -3232,7 +3228,7 @@ def _build_system_prompt(
                 # Also include the skill INDEX (one-line-per-skill catalogue
                 # from _build_base_prompt) — its name + description fields
                 # are equally user-editable.
-                if relevant_skills or _skill_index_block:
+                if _other_skills or _skill_index_block:
                     _skills_text = "\n".join(lines)
                     if _skill_index_block:
                         _skills_text = _skill_index_block + "\n\n" + _skills_text
@@ -3242,6 +3238,21 @@ def _build_system_prompt(
                     )
                 else:
                     _skills_message = None
+                # Local-provenance half: identical wrapper (role=user,
+                # metadata.trusted=False, guard-escaped) minus the tool-gate
+                # arming. tool_capabilities.messages_contain_external_untrusted_context
+                # treats tool_gate_untrusted=False as an authoritative opt-out.
+                if _trusted_split and (_local_skills or _skill_index_trusted_block):
+                    _trusted_text = "\n".join(_trusted_lines)
+                    if _skill_index_trusted_block:
+                        _trusted_text = (
+                            _skill_index_trusted_block + "\n\n" + _trusted_text
+                        )
+                    _skills_trusted_message = untrusted_context_message(
+                        "skills (local)",
+                        _trusted_text,
+                        arm_tool_gate=False,
+                    )
         except Exception as _sk_err:
             logger.debug(f"skill injection failed (non-fatal): {_sk_err}")
 
@@ -3330,6 +3341,7 @@ def _build_system_prompt(
         _integ_message,
         _mcp_desc_message,
         _skills_message,
+        _skills_trusted_message,
         _datetime_message,
     ):
         if injected:
@@ -3352,12 +3364,16 @@ def _build_system_prompt(
     if _skills_message:
         merged.insert(last_user_idx, _skills_message)
         last_user_idx += 1
+    if _skills_trusted_message:
+        merged.insert(last_user_idx, _skills_trusted_message)
+        last_user_idx += 1
     if _datetime_message:
         merged.insert(last_user_idx, _datetime_message)
     # Onda 4 / E08c: marca i blocchi iniettati davanti all'ultimo user, cosi' la
     # persistenza del turno (_history_tail_for_persist) prende SOLO questi.
     for _blk in (_doc_message, _email_message, _email_style_message, _integ_message,
-                 _mcp_desc_message, _skills_message, _datetime_message):
+                 _mcp_desc_message, _skills_message, _skills_trusted_message,
+                 _datetime_message):
         if isinstance(_blk, dict):
             _blk["_pre"] = True
 
@@ -3370,6 +3386,116 @@ _ADMIN_TOOLS = {
     "manage_documents", "manage_settings", "create_session", "list_sessions",
     "send_to_session", "pipeline", "ask_teacher", "list_models",
 }
+
+# ── Vergilius: provenienza dell'indice skill (ODYSSEUS_SKILLS_INDEX_TRUSTED) ──
+# Upstream wraps the whole skills block in untrusted_context_message(), whose
+# default arm_tool_gate=True arms the external-untrusted-context gate for the
+# rest of the run. With at least one saved skill that fires on round 1 of every
+# chat, so EXECUTE_CODE / WRITE_PRIVATE tools sit behind an approval prompt even
+# in a conversation that never touched anything external.
+#
+# With ODYSSEUS_SKILLS_INDEX_TRUSTED=1 the block is SPLIT by provenance: entries
+# whose on-disk record proves first-party authorship are wrapped with
+# arm_tool_gate=False (still role=user, still metadata.trusted=False, still
+# guard-escaped — the #788 prompt-injection hardening is untouched, only the
+# tool gate is not armed). Everything else — above all a skill IMPORTED from a
+# URL (services/memory/skill_importer.py) — keeps the gate-arming wrapper.
+#
+# Default "0" = upstream behaviour, byte-identical.
+_LOCAL_SKILL_SOURCES = frozenset({"user", "learned"}) | frozenset(
+    # Vergilius: provenienze in piu' che il proprietario dichiara fidate, senza falsificare il campo
+    # `source` delle skill (es. "community" per pacchetti pubblici installati e riletti a mano).
+    # `imported` non e' mai accettata: l'import da URL resta contenuto esterno.
+    s.strip().casefold()
+    for s in (_os.getenv("ODYSSEUS_SKILLS_TRUSTED_SOURCES", "") or "").split(",")
+    if s.strip() and s.strip().casefold() != "imported"
+)
+
+
+def _skills_index_trusted_enabled() -> bool:
+    """Read the env on every call so tests/monkeypatch can flip it."""
+    return _os.getenv("ODYSSEUS_SKILLS_INDEX_TRUSTED", "0") == "1"
+
+
+def _skill_provenance_is_local(skill: Any) -> bool:
+    """True only when the skill record PROVES local, first-party authorship.
+
+    `source` is the only provenance field a skill carries (skill_format.Skill,
+    frontmatter `source:`). `import_bundle_from_files` force-stamps
+    source="imported" and category="imported" on anything fetched from a URL,
+    so an imported skill can never reach this branch. Anything else — a
+    seeded/community pack, a teacher-escalation draft written by a remote
+    teacher model, a legacy record with no source — is treated as NOT local and
+    keeps arming the gate. Never guess: unknown provenance == untrusted.
+    """
+    if not isinstance(skill, dict):
+        return False
+    if (skill.get("source") or "").strip().casefold() not in _LOCAL_SKILL_SOURCES:
+        return False
+    # Defence in depth: a backup restore re-stamps source="user" on every row it
+    # writes (routes/backup_routes.py), so an imported skill could be laundered
+    # through an export/import round trip. Category and the "Imported from
+    # <url>" note the importer appends to the body survive that path.
+    if (skill.get("category") or "").strip().casefold() == "imported":
+        return False
+    if "imported from " in str(skill.get("body_extra") or "").casefold():
+        return False
+    return True
+
+
+def _render_matched_skills_lines(skills) -> list:
+    """Render the matched-skills block (full procedures) for `skills`."""
+    lines = [""]
+    if not skills:
+        return lines
+    lines.append("## Relevant skills for this request")
+    lines.append("These skills are matched to your current request. Each is a "
+                 "procedure proven to work. Follow them step by step. To see "
+                 "the full SKILL.md (more detail, pitfalls, verification "
+                 "steps), call `manage_skills` with action='view' and the "
+                 "skill name.")
+    for sk in skills:
+        src_tag = ""
+        if sk.get("source") == "teacher-escalation":
+            tm = sk.get("teacher_model") or "teacher"
+            src_tag = f" _(learned from {tm})_"
+        lines.append(f"\n### {sk.get('name','?')}{src_tag}")
+        if sk.get("description"):
+            lines.append(sk["description"])
+        if sk.get("when_to_use"):
+            lines.append(f"_When to use:_ {sk['when_to_use']}")
+        proc = sk.get("procedure") or []
+        if proc:
+            lines.append("Procedure:")
+            for i, step in enumerate(proc, 1):
+                lines.append(f"  {i}. {step}")
+        pitfalls = sk.get("pitfalls") or []
+        if pitfalls:
+            lines.append("Pitfalls: " + "; ".join(pitfalls))
+    return lines
+
+
+def _render_skill_index_block(entries) -> str:
+    """Render the level-0 one-line-per-skill catalogue for `entries`."""
+    if not entries:
+        return ""
+    lines = ["## Available skills",
+             "Procedures the assistant should consult before doing domain work. "
+             "Fetch the full procedure with `manage_skills` action=view name=<name> "
+             "when one looks relevant. Entries tagged `(draft)` were written by the "
+             "teacher-escalation loop after a prior failure — treat them as authoritative "
+             "guidance; if you follow one and it works, that's a good signal the procedure "
+             "is correct."]
+    by_cat: dict[str, list] = {}
+    for s in entries:
+        by_cat.setdefault(s["category"], []).append(s)
+    for cat in sorted(by_cat):
+        lines.append(f"\n**{cat}**")
+        for s in by_cat[cat]:
+            badge = " *(draft)*" if s.get("status") == "draft" else ""
+            lines.append(f"- `{s['name']}` — {s['description']}{badge}")
+    return "\n\n" + "\n".join(lines)
+
 
 def _build_base_prompt(
     disabled_tools,
@@ -3433,6 +3559,7 @@ def _build_base_prompt(
     # The caller wraps it in untrusted_context_message and ships it as a
     # user-role message — same treatment as the matched-skills block.
     skill_index_block = ""
+    skill_index_trusted_block = ""
     if not suppress_local_context and not suppress_skills:
         try:
             from services.memory.skills import SkillsManager
@@ -3440,28 +3567,25 @@ def _build_base_prompt(
             _sm = SkillsManager(DATA_DIR)
             active_tools = list(set(TOOL_SECTIONS.keys()) - set(disabled or []))
             skill_idx = _sm.index_for(owner=owner, active_toolsets=active_tools)
-            if skill_idx:
-                lines = ["## Available skills",
-                         "Procedures the assistant should consult before doing domain work. "
-                         "Fetch the full procedure with `manage_skills` action=view name=<name> "
-                         "when one looks relevant. Entries tagged `(draft)` were written by the "
-                         "teacher-escalation loop after a prior failure — treat them as authoritative "
-                         "guidance; if you follow one and it works, that's a good signal the procedure "
-                         "is correct."]
-                by_cat: dict[str, list] = {}
-                for s in skill_idx:
-                    by_cat.setdefault(s["category"], []).append(s)
-                for cat in sorted(by_cat):
-                    lines.append(f"\n**{cat}**")
-                    for s in by_cat[cat]:
-                        badge = " *(draft)*" if s.get("status") == "draft" else ""
-                        lines.append(f"- `{s['name']}` — {s['description']}{badge}")
-                skill_index_block = "\n\n" + "\n".join(lines)
+            if skill_idx and _skills_index_trusted_enabled():
+                # Split by provenance; the local half is rendered separately so
+                # the caller can ship it without arming the tool gate.
+                _local_names = {
+                    s.get("name")
+                    for s in _sm.load(owner=owner)
+                    if _skill_provenance_is_local(s)
+                }
+                _local_idx = [s for s in skill_idx if s.get("name") in _local_names]
+                _other_idx = [s for s in skill_idx if s.get("name") not in _local_names]
+                skill_index_trusted_block = _render_skill_index_block(_local_idx)
+                skill_index_block = _render_skill_index_block(_other_idx)
+            elif skill_idx:
+                skill_index_block = _render_skill_index_block(skill_idx)
         except Exception as _e:
             # Skill index is a soft enhancement — never fail prompt assembly on it.
             logger.debug(f"Skill-index injection skipped: {_e}")
 
-    return agent_prompt, skill_index_block
+    return agent_prompt, skill_index_block, skill_index_trusted_block
 
 
 
@@ -3471,9 +3595,7 @@ def _resolve_tool_blocks(
     round_num: int,
     is_api_model: bool = False,
     allow_fenced_for_api: bool = False,
-    round_reasoning: str = "",
     allowed_tool_names: Optional[Set[str]] = None,
-    reasoning_allowed_tool_names: Optional[Set[str]] = None,
 ):
     """Choose native function calls or fenced code block parsing. Returns (tool_blocks, used_native)."""
     used_native = False
@@ -3539,53 +3661,6 @@ def _resolve_tool_blocks(
             logger.warning(
                 "Agent round %s rejected unadvertised tool call(s): %s",
                 round_num, rejected,
-            )
-
-    # Some reasoning parsers route a COMPLETE tool call into reasoning_content
-    # instead of the structured channel. Recover only when content/native paths
-    # found nothing, only from bounded explicit markup, and only for tools that
-    # were actually advertised this round. Partial calls and zero-schema rounds
-    # remain inert.
-    reasoning_allowlist = (
-        allowed_tool_names
-        if reasoning_allowed_tool_names is None
-        else reasoning_allowed_tool_names
-    )
-    if (
-        not tool_blocks
-        and not native_tool_calls
-        and round_reasoning
-        and reasoning_allowlist
-        and len(round_reasoning) <= 64_000
-    ):
-        recovered_calls = parse_reasoning_tool_calls(round_reasoning)
-        recovered_calls = [
-            (block, arguments) for block, arguments in recovered_calls
-            if block.tool_type in reasoning_allowlist
-            or (
-                block.tool_type.startswith("mcp__email__")
-                and block.tool_type[len("mcp__email__"):] in reasoning_allowlist
-            )
-        ]
-        if recovered_calls:
-            tool_blocks = [block for block, _arguments in recovered_calls]
-            # Bailing's native template expects the following observation as
-            # role=tool, paired with an assistant tool_calls entry.  Treat a
-            # complete, schema-allowlisted call recovered from
-            # reasoning_content as native for history threading; otherwise the
-            # next Ling round sees its own action as a generic user message.
-            converted_calls = [
-                {
-                    "id": f"recovered_{round_num}_{idx}",
-                    "name": block.tool_type,
-                    "arguments": arguments,
-                }
-                for idx, (block, arguments) in enumerate(recovered_calls)
-            ]
-            used_native = True
-            logger.info(
-                "Agent round %s recovered %s complete advertised tool call(s) from reasoning",
-                round_num, len(recovered_calls),
             )
 
     resp_preview = round_response[:200].replace('\n', '\\n') if round_response else "(empty)"
@@ -4843,7 +4918,7 @@ async def stream_agent_loop(
     # tentativo piu' in alto lasciava passare +5 tool di skill a turni alterni
     # (12 <-> 17) e il prefisso cambiava lo stesso (dump-B2).
     # Perche': il tool-RAG sceglie un set diverso a ogni turno (baseline: 12 -> 18
-    # -> 14 -> 19, 6 prefissi su 40 richieste); su Ling (memoria ibrida) ogni
+    # -> 14 -> 19, 6 prefissi su 40 richieste); sul modello precedente (memoria ibrida) ogni
     # cambio nel blocco `# Tools` diverge prima del primo checkpoint = riprocesso
     # pieno di 7-15k token (39-onda4-precondizioni-esiti.md). Il primo turno della
     # sessione fissa set e ordine; i turni dopo lo riusano. Espansione solo per
@@ -5156,7 +5231,7 @@ async def stream_agent_loop(
     _grounding_retry_count = 0   # Onda 4 / H4-retry: un solo rilancio per turno
     # 3 come Cline/Roo: il loro contatore di errori consecutivi prima
     # dell'escalation e' il riferimento di settore.
-    # Leve per modelli obbedienti (LFM): default = comportamento storico tarato su Ling.
+    # Leve per modelli obbedienti (LFM): default = comportamento storico tarato sul modello precedente.
     _MAX_INTENT_NUDGES = max(0, int(_os.getenv("ODYSSEUS_INTENT_NUDGE_MAX", "3") or 3))
     _NUDGE_FORCE_TOOL = _os.getenv("ODYSSEUS_INTENT_NUDGE_FORCE", "1") == "1"
     _NUDGE_FUTURO = _os.getenv("ODYSSEUS_INTENT_NUDGE_FUTURO", "1") == "1"
@@ -6082,7 +6157,6 @@ async def stream_agent_loop(
             round_num,
             is_api_model=(_is_api_model and not guide_only),
             allow_fenced_for_api=_ody_doc_finetune_mode,
-            round_reasoning=round_reasoning,
             allowed_tool_names=(
                 set(disabled_tools or set())
                 if _force_answer or guide_only
@@ -6094,24 +6168,7 @@ async def stream_agent_loop(
                     | set(disabled_tools or set())
                 )
             ),
-            reasoning_allowed_tool_names=(
-                set()
-                if _force_answer or guide_only
-                else (
-                    set(_tool_names_sent)
-                    if _is_api_model
-                    else (set(_relevant_tools or TOOL_TAGS) | {"ask_user", "update_plan"})
-                    - set(disabled_tools or set())
-                )
-            ),
         )
-        if used_native and not native_tool_calls and converted_calls:
-            # The recovered call is represented structurally in converted_calls
-            # below.  Remove only its complete wrapper from preserved thinking
-            # so Bailing's template cannot render the same action twice.
-            round_reasoning = strip_tool_blocks(
-                round_reasoning, skip_fenced=True
-            ).strip()
         if _ody_doc_stream_create_mode and tool_blocks:
             create_idx = next(
                 (idx for idx, block in enumerate(tool_blocks) if block.tool_type == "create_document"),

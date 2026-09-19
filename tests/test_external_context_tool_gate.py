@@ -1422,8 +1422,20 @@ def test_document_stream_events_are_derived_from_authorized_block():
     ]
 
 
-def test_authorized_document_stream_precedes_completed_update(monkeypatch):
+def test_authorized_document_stream_precedes_completed_update(monkeypatch, tmp_path):
     import src.agent_loop as agent_loop
+
+    # Isolate the skills store: any skill saved in the developer's live
+    # DATA_DIR enters the prompt as untrusted context and arms the gate, so
+    # update_document (WRITE_PRIVATE) would need approval and this test would
+    # fail for a reason unrelated to document streaming. Same convention as
+    # tests/test_skill_index_prompt_injection.py.
+    import src.constants as _constants
+    monkeypatch.setattr(
+        _constants, "DATA_DIR", str(tmp_path / "data"), raising=False
+    )
+    agent_loop._cached_base_prompt = None
+    agent_loop._cached_base_prompt_key = None
 
     monkeypatch.setattr(
         agent_loop,

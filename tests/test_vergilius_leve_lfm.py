@@ -1,7 +1,7 @@
 """Leve per modelli piccoli/obbedienti (LFM2.5-2.6B), tutte env-gated.
 
-Tre interruttori, tutti con default = comportamento storico (il profilo Ling
-non deve cambiare di un byte):
+Tre interruttori, tutti con default = comportamento storico (il profilo del
+modello precedente non deve cambiare di un byte):
 
 * ``ODYSSEUS_INTENT_NUDGE_MAX_CHARS`` (default 400) — soglia di lunghezza del
   nudge "intento senza azione"; oltre i 400 la promessa deve stare in coda.

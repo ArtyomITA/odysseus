@@ -2,7 +2,7 @@
 src/shadowbroker/schemi.py: description in inglese che dice QUANDO, esempi
 utente in italiano, sotto i 110 token; regole in positivo, lingua in testa e coda.
 
-Il cervello (Ling) non vede: ogni tool ritorna testo/JSON gia' interpretato da
+Il cervello (LFM) non vede: ogni tool ritorna testo/JSON gia' interpretato da
 Holo. Le domande composte vanno scomposte in piu' chiamate (misurato: il VLM
 risponde solo alla prima parte di un prompt con piu' domande).
 """

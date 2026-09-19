@@ -77,7 +77,7 @@ def test_italian_browser_and_web_actions_promote_to_agent():
 
 def test_italian_personal_searches_route_to_their_local_domains():
     expected = {
-        "Cerca nelle mie chat la conversazione su Ling": "sessions",
+        "Cerca nelle mie chat la conversazione su LFM": "sessions",
         "Trova nelle mie note il promemoria per domani": "notes",
         "Cerca nella mia posta il messaggio di Luca": "email",
     }
@@ -94,8 +94,8 @@ def test_italian_read_lookup_and_research_requests_promote():
         "Cosa ho in calendario domani?": "calendar",
         "Quali appuntamenti ho oggi?": "calendar",
         "Mostrami le mie note": "notes",
-        "Fammi una ricerca approfondita su Ling": "research",
-        "Cerca Ling 3.0": "web",
+        "Fammi una ricerca approfondita su LFM": "research",
+        "Cerca LFM 3.0": "web",
     }
     for prompt, category in expected.items():
         intent = classify_tool_intent(prompt)
@@ -104,7 +104,7 @@ def test_italian_read_lookup_and_research_requests_promote():
 
 
 def test_italian_generic_lookup_excludes_local_personal_targets():
-    for prompt in ("Cerca nelle chat CUDA", "Cerca nelle mie chat Ling", "Cerca nelle note Ling"):
+    for prompt in ("Cerca nelle chat CUDA", "Cerca nelle mie chat LFM", "Cerca nelle note LFM"):
         assert classify_tool_intent(prompt).category != "web"
     local = classify_tool_intent("Trova il file config.yaml")
     assert local.needs_tools and local.category == "workspace"

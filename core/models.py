@@ -197,7 +197,7 @@ class Session:
         ``get_context_messages`` returns prose only — ``ChatMessage`` has no
         ``tool_calls`` field, so a turn where the model called a tool replays
         as if it had answered out of its own knowledge. Over a few turns that
-        is few-shot priming to *not* call tools. Measured on Ling-3.0-tiny,
+        is few-shot priming to *not* call tools. Measured on the previous model,
         same conversation and same final question, 8 repetitions each:
         prose history 0/8 calls and 5 fabricated answers; this one 6/8 calls
         and 1 fabrication.

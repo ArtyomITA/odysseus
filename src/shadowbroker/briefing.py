@@ -24,7 +24,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.shadowbroker import geo, sagome, testo as mod_testo
-from src.shadowbroker.client import get_client
 from src.shadowbroker.store import get_store
 
 logger = logging.getLogger(__name__)
@@ -160,10 +159,20 @@ def situazione(quanti: int = 8, con_testo: bool = False) -> Dict[str, Any]:
     motivazioni, non righe grezze da interpretare.
     """
     store = get_store()
-    client = get_client()
 
-    conteggi = store.riepilogo()
-    dati = store.carica_molti(["gdelt", "threat_level", "correlations", "news"])
+    # Un solo giro HTTP a cache fredda. Riepilogo, i quattro layer e la
+    # classifica GT sono indipendenti fra loro — nessuno usa il risultato di un
+    # altro — quindi partono insieme sul canale batch, che lato ShadowBroker li
+    # esegue in parallelo. Se il batch cade, `istantanea` torna da sola alle tre
+    # chiamate singole di prima; un singolo comando caduto degrada solo la sua
+    # sezione, come prima.
+    istantanea = store.istantanea(
+        ["gdelt", "threat_level", "correlations", "news"],
+        extra=[{"cmd": "gt_top_alerts", "args": {}}],
+    )
+    conteggi = istantanea["conteggi"]
+    dati = istantanea["layer"]
+    gt, gt_errore = istantanea["extra"][0]
 
     fuori: Dict[str, Any] = {"tipo": "situazione_globale", "ora_utc": _ora().isoformat(timespec="seconds")}
 
@@ -208,7 +217,8 @@ def situazione(quanti: int = 8, con_testo: bool = False) -> Dict[str, Any]:
     # GT: classifica per regione. Le regioni arrivano come coordinate grezze,
     # qui diventano nomi.
     try:
-        gt = client.comando("gt_top_alerts", {})
+        if gt_errore:
+            raise RuntimeError(gt_errore)
         allerte = (gt or {}).get("alerts") or []
         if allerte:
             fuori["regioni_a_rischio"] = [{

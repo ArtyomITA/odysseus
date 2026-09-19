@@ -7,7 +7,6 @@ Supports fenced code blocks, [TOOL_CALL] blocks, and XML-style <invoke> blocks.
 
 import ast
 import bisect
-import html
 import json
 import logging
 import re
@@ -112,20 +111,6 @@ _XML_TOOL_CALL_CLOSE_RE = re.compile(
     r"</(?:[\w]+:)?(?:tool_call|function_call)>",
     re.IGNORECASE,
 )
-
-# Ling/GLM-style complete wrapper emitted by some llama.cpp chat templates:
-#   <tool_call>browser_open
-#   <arg_key>url</arg_key><arg_value>https://example.com</arg_value>
-#   </tool_call>
-# The outer wrapper uses the standard delimiters above; these tokens parse its
-# body with a strictly forward scan (no nested/lazy regex over untrusted text).
-_LING_TOOL_NAME_RE = re.compile(
-    r"\s*([A-Za-z_][A-Za-z0-9_-]*(?:__[A-Za-z0-9_-]+)*)"
-)
-_LING_ARG_KEY_OPEN_RE = re.compile(r"\s*<arg_key>\s*", re.IGNORECASE)
-_LING_ARG_KEY_CLOSE_RE = re.compile(r"\s*</arg_key>\s*", re.IGNORECASE)
-_LING_ARG_VALUE_OPEN_RE = re.compile(r"\s*<arg_value>\s*", re.IGNORECASE)
-_LING_ARG_VALUE_CLOSE_RE = re.compile(r"\s*</arg_value>\s*", re.IGNORECASE)
 _XML_INVOKE_RE = re.compile(
     r'<invoke\s+name=["\'](\w+)["\']>\s*([\s\S]*?)</invoke>',
     re.IGNORECASE,
@@ -879,71 +864,6 @@ def _parse_tool_call_block(raw: str) -> Optional[ToolBlock]:
     return None
 
 
-def _decode_ling_arg_value(raw: str):
-    value = html.unescape(raw).strip()
-    if not value:
-        return ""
-    # Preserve normal strings, but recover booleans/numbers/arrays/objects that
-    # the chat template serialised inside arg_value tags.
-    try:
-        return json.loads(value)
-    except (json.JSONDecodeError, TypeError):
-        return value
-
-
-def _parse_ling_key_value_call_with_arguments(
-    body: str,
-) -> Optional[Tuple[ToolBlock, str]]:
-    """Parse one complete Ling ``tool_call`` body, rejecting ambiguity."""
-    if not isinstance(body, str) or len(body) > 64_000:
-        return None
-    name_match = _LING_TOOL_NAME_RE.match(body)
-    if not name_match:
-        return None
-    tool_name = name_match.group(1)
-    pos = name_match.end()
-    args = {}
-
-    while True:
-        while pos < len(body) and body[pos].isspace():
-            pos += 1
-        if pos >= len(body):
-            break
-
-        key_open = _LING_ARG_KEY_OPEN_RE.match(body, pos)
-        if not key_open:
-            return None
-        key_close = _LING_ARG_KEY_CLOSE_RE.search(body, key_open.end())
-        if not key_close:
-            return None
-        key = body[key_open.end():key_close.start()].strip()
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,63}", key):
-            return None
-        if key in args:  # duplicate keys make the intended call ambiguous
-            return None
-
-        value_open = _LING_ARG_VALUE_OPEN_RE.match(body, key_close.end())
-        if not value_open:
-            return None
-        value_close = _LING_ARG_VALUE_CLOSE_RE.search(body, value_open.end())
-        if not value_close:
-            return None
-        args[key] = _decode_ling_arg_value(
-            body[value_open.end():value_close.start()]
-        )
-        pos = value_close.end()
-
-    from src.tool_schemas import function_call_to_tool_block
-    arguments = json.dumps(args, ensure_ascii=False)
-    block = function_call_to_tool_block(tool_name, arguments)
-    return (block, arguments) if block else None
-
-
-def _parse_ling_key_value_call(body: str) -> Optional[ToolBlock]:
-    parsed = _parse_ling_key_value_call_with_arguments(body)
-    return parsed[0] if parsed else None
-
-
 def _parse_xml_invoke(name, body) -> Optional[ToolBlock]:
     """Parse an <invoke name="tool"><parameter ...>...</parameter></invoke> call.
 
@@ -1361,36 +1281,6 @@ def _iter_xml_direct(text):
     return _iter_backref_blocks(text, _XML_DIRECT_OPEN_RE, _XML_DIRECT_CLOSE_ANY_RE, ci=True)
 
 
-def parse_reasoning_tool_blocks(text: str) -> List[ToolBlock]:
-    """Parse only complete, explicit Ling/Bailing reasoning tool wrappers.
-
-    Reasoning is not an execution channel.  The broad compatibility parser
-    also recognises unwrapped OpenAI JSON and plain ``ui_control ...`` prose;
-    using it here could turn an internal sentence into an action.  Recovery is
-    deliberately limited to the exact complete wrapper documented by the
-    Bailing V3 template and produced by llama.cpp issue #27462.
-    """
-    if not isinstance(text, str) or not text or len(text) > 64_000:
-        return []
-    return [block for block, _arguments in parse_reasoning_tool_calls(text)]
-
-
-def parse_reasoning_tool_calls(text: str) -> List[Tuple[ToolBlock, str]]:
-    """Strict reasoning recovery with canonical original JSON arguments."""
-    if not isinstance(text, str) or not text or len(text) > 64_000:
-        return []
-    calls: List[Tuple[ToolBlock, str]] = []
-    for _ms, inner_start, inner_end, _me in _iter_delimited(
-        text, _XML_TOOL_CALL_OPEN_RE, _XML_TOOL_CALL_CLOSE_RE
-    ):
-        parsed = _parse_ling_key_value_call_with_arguments(
-            text[inner_start:inner_end]
-        )
-        if parsed:
-            calls.append(parsed)
-    return calls
-
-
 def parse_tool_blocks(text: str, skip_fenced: bool = False) -> List[ToolBlock]:
     """Extract executable tool blocks from LLM response text.
 
@@ -1398,11 +1288,10 @@ def parse_tool_blocks(text: str, skip_fenced: bool = False) -> List[ToolBlock]:
     1. ```bash ... ``` fenced code blocks (standard)
     2. [TOOL_CALL] ... [/TOOL_CALL] blocks (some models)
     3. XML-style <tool_call>/<invoke> blocks
-    4. Ling/GLM <tool_call>NAME<arg_key>... format
-    5. <tool_code> blocks (MiniMax-M2.5 style)
-    6. StepFun Step-3 native <｜tool▁call▁begin｜> tokens
-    7. DeepSeek DSML markup (normalized to <invoke> first)
-    8. Non-native local model fallback: prose mentioning web_search followed by
+    4. <tool_code> blocks (MiniMax-M2.5 style)
+    5. StepFun Step-3 native <｜tool▁call▁begin｜> tokens
+    6. DeepSeek DSML markup (normalized to <invoke> first)
+    7. Non-native local model fallback: prose mentioning web_search followed by
        bare JSON args, e.g. {"query":"...", "time_filter":"week"}
 
     `skip_fenced`: when True, Pattern 1 (fenced ```bash/```python/```json code
@@ -1495,10 +1384,6 @@ def parse_tool_blocks(text: str, skip_fenced: bool = False) -> List[ToolBlock]:
                 block = _parse_json_tool_call_body(body)
                 if block:
                     blocks.append(block)
-                continue
-            ling_block = _parse_ling_key_value_call(body)
-            if ling_block:
-                blocks.append(ling_block)
                 continue
             for inv_name, inv_body in _iter_xml_invoke(body):
                 block = _parse_xml_invoke(inv_name, inv_body)

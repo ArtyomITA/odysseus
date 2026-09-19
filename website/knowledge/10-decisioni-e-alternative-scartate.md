@@ -7,7 +7,11 @@ valutazione fra sei mesi.
 
 ## Il modello
 
-**Scelto: QwenPaw-Flash-9B** (finetune agentico di Qwen3.5-9B).
+**Superato due volte, vedi in fondo alla sezione.** Scelta attuale (19 set
+2026): **LFM2.5-2.6B**. Quanto segue (QwenPaw-Flash-9B) resta come verbale
+della prima scelta.
+
+**Scelto (superato): QwenPaw-Flash-9B** (finetune agentico di Qwen3.5-9B).
 
 | Alternativa | Perché no |
 |---|---|
@@ -18,7 +22,44 @@ valutazione fra sei mesi.
 | prism-ml Bonsai (1-bit) | accuratezza dichiarata **contestata pubblicamente**, richiede un fork non ufficiale di llama.cpp, supporto Pascal non confermato |
 
 **Aggiunto dopo: variante heretic**, senza rifiuti. Non predefinita: si
-sceglie dal menu quando serve.
+sceglie dal menu quando serve. Resta disponibile ancora oggi (profili
+`heretic`/`heretic-vista`), indipendente dai due cambi di modello sotto.
+
+### 22 ago 2026: Ling-3.0-tiny sostituisce QwenPaw-Flash-9B come predefinito
+
+Cambio non documentato all'epoca in questo file (solo in memoria di
+progetto); registrato qui per completezza. MoE 7,9B totali/1,3B attivi:
+su Pascal (compute-bound, niente tensor core) il vantaggio dell'attivazione
+ridotta si sente pieno. QwenPaw resta come variante heretic (uncensored).
+
+### 19 set 2026: LFM2.5-2.6B sostituisce Ling-3.0-tiny come predefinito
+
+**Scelto: LFM2.5-2.6B** (Liquid AI) Q8_0 GGUF + drafter speculativo ufficiale
+LFM2.5-2.6B-DSpark Q8_0, profilo llama-swap `lfm` (alias `lfm-vista`).
+
+| Motivo | Dettaglio |
+|---|---|
+| Sceglie gli strumenti giusti | 48/48 turni della suite allucinazioni con lo strumento corretto, 0 invenzioni |
+| Non serve grondare di regole restrittive | i controlli scritti per Ling (rilancio "grounding", regole "mai/deve" molto rigide) su LFM facevano rifiutare aritmetica legittima; con LFM bastano regole più leggere |
+| Più veloce | prefill 1940 tok/s contro ~850 di Ling; decodifica 64 tok/s, 78-100 con DSpark; turno agente mediano 30-45 s contro 47 s di Ling |
+| Scarica meno | download predefinito ora ~4,2 GB (LFM 2,9 + drafter 0,4 + Holo-3.1-0.8B ~0,9) contro ~7,3 GB di prima |
+| Licenza libera | LFM Open License v1.0 (basata su Apache-2.0, uso commerciale libero sotto 10M USD di ricavi annui) |
+
+Contropartita: pensa sempre (`<think>` imposto dal template); il tetto al
+ragionamento nei giri con strumenti lo mette Odysseus (budget 256 token).
+
+Varianti
+uncensored, solo su richiesta esplicita dell'utente: `--con-heretic`
+(QwenPaw 9B heretic) e `--con-lfm-uncensored` (LFM2.5-2.6B-Uncensored di
+SC117, modificato da terzi, non release Liquid AI).
+
+Leve specifiche del modello in `vergilius-lfm.env`, caricato dal boot quando
+`VERGILIUS_MODELLO=lfm` in `vergilius.env` (dopo `vergilius.env` e
+`vergilius-hardware.env`).
+
+### 20 set 2026: Ling rimosso del tutto dal progetto
+
+20 set 2026: Ling rimosso del tutto dal progetto (modelli, parser, configurazione): LFM lo supera su ogni misura.
 
 ---
 

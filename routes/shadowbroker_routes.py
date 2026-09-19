@@ -145,7 +145,8 @@ def _register(router: APIRouter) -> None:
 
         porta_api = urlparse(shadowbroker_api()).port or 8000
         porta_ui = urlparse(shadowbroker_url()).port or 3000
-        base = os.getenv("SHADOWBROKER_DIR", "d:/assistenteeee/shadowbroker")
+        _radice = os.getenv("VERGILIUS_DIR") or os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        base = os.getenv("SHADOWBROKER_DIR", os.path.join(_radice, "shadowbroker"))
         cartella_backend = os.path.join(base, "backend")
         cartella_frontend = os.path.join(base, "frontend")
         # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
@@ -193,13 +194,16 @@ def _register(router: APIRouter) -> None:
 
         script = os.getenv(
             "VERGILIUS_SPEGNI_SCRIPT",
-            r"d:\assistenteeee\scripts\spegni-tutto.ps1",
+            os.path.join(os.getenv("VERGILIUS_DIR") or os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")),
+                         "scripts", "spegni-tutto.ps1"),
         )
         if not os.path.exists(script):
             return {"ok": False, "detail": f"script non trovato: {script}"}
         comando = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
                    "-File", script, "-TranneOdysseus"]
-        log_spegni = open(r"d:\assistenteeee\logs\spegni.log", "ab")
+        _cartella_log = os.path.join(os.getenv("VERGILIUS_DIR") or os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")), "logs")
+        os.makedirs(_cartella_log, exist_ok=True)
+        log_spegni = open(os.path.join(_cartella_log, "spegni.log"), "ab")
         try:
             # NO_WINDOW | NEW_PROCESS_GROUP | BREAKAWAY_FROM_JOB.
             # NON DETACHED_PROCESS: powershell senza console muore in culla

@@ -56,7 +56,7 @@ PARLI  ─► AudioWorklet 16 kHz, pezzi da 100 ms
       ▼
 Odysseus :7000 ── costruisce il prompt: sistema + skill + memoria + strumenti
       │
-      ├─► llama-swap :8012 ─► llama-server ─► QwenPaw sulla GTX 1080
+      ├─► llama-swap :8012 ─► llama-server ─► LFM2.5-2.6B sulla GTX 1080 (predefinito dal 19 set 2026; schema sotto e file 02 restano scritti con QwenPaw, modello dell'epoca)
       │
       ├─► Windows-MCP (stdio) ─► controllo del PC
       │
@@ -93,5 +93,6 @@ secondi su 6. Misure in
    MB di RAM, **zero VRAM**, RTF 0,5 con 2 thread.
 4. **Modifiche al core minime e reversibili.** Dove possibile si usano punti di
    estensione ufficiali (skill, preset, MCP) invece di toccare codice.
-5. **Il contesto è la risorsa scarsa.** 48K token con modello da 9B: ogni
-   strumento, skill e risultato di ricerca va pesato.
+5. **Il contesto è la risorsa scarsa.** ~48K token (predefinito attuale
+   LFM2.5-2.6B, ctx 49152): ogni strumento, skill e risultato di ricerca va
+   pesato.

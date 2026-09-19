@@ -3,7 +3,7 @@ screenshot. Bloccante (urllib): va chiamato da thread (come _Base.execute).
 
 Processo Holo:
 - porta dedicata (VISTA_PORT, default 8095), CUDA_VISIBLE_DEVICES="" cosi'
-  la VRAM della 1080 resta tutta a Ling (misurato: zero contesto CUDA);
+  la VRAM della 1080 resta tutta al cervello testuale (misurato: zero contesto CUDA);
 - --reasoning off + --chat-template-kwargs enable_thinking=false AL LANCIO
   (per-request e' ignorato silenziosamente da llama.cpp);
 - --image-min-tokens 1024 (warning llama.cpp: sotto, il grounding Qwen-VL
@@ -28,9 +28,24 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 DEFAULT_PORT = 8095
-DEFAULT_SERVER = r"d:\assistenteeee\llama-cuda124-new\llama-server.exe"
-DEFAULT_MODELLO = r"d:\assistenteeee\models\vlm\Holo-3.1-0.8B.Q6_K.gguf"
-DEFAULT_MMPROJ = r"d:\assistenteeee\models\vlm\Holo-3.1-0.8B.mmproj-f16.gguf"
+# Radice di Vergilius = la cartella che contiene odysseus/ (questo file sta in odysseus/src/vista/).
+# Sovrascrivibile con VERGILIUS_DIR; i singoli percorsi restano sovrascrivibili con le loro variabili.
+_RADICE = os.environ.get("VERGILIUS_DIR") or os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+
+
+def _server_predefinito() -> str:
+    # il binario CUDA 12.4 dedicato agli occhi se c'e', altrimenti la release in llama/
+    for cartella in ("llama-cuda124-new", "llama"):
+        candidato = os.path.join(_RADICE, cartella, "llama-server.exe")
+        if os.path.exists(candidato):
+            return candidato
+    return os.path.join(_RADICE, "llama", "llama-server.exe")
+
+
+DEFAULT_SERVER = _server_predefinito()
+DEFAULT_MODELLO = os.path.join(_RADICE, "models", "vlm", "Holo-3.1-0.8B.Q6_K.gguf")
+DEFAULT_MMPROJ = os.path.join(_RADICE, "models", "vlm", "Holo-3.1-0.8B.mmproj-f16.gguf")
 DEFAULT_THREADS = "6"
 
 _TIMEOUT_CHIAMATA = 90.0
@@ -264,7 +279,7 @@ class VistaClient:
                                      headers={"Content-Type": "application/json"})
         try:
             # llama-server has one CPU-heavy Holo slot; serialising calls avoids
-            # two chats oversubscribing the 4300GE and delaying Ling.
+            # two chats oversubscribing the 4300GE and delaying the main model.
             with self._inference_lock:
                 with urllib.request.urlopen(req, timeout=_TIMEOUT_CHIAMATA) as r:
                     d = json.loads(r.read().decode())

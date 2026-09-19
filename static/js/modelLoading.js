@@ -189,7 +189,7 @@ export async function warmup(m) {
     } catch (_) { /* transient; keep polling */ }
 
     if (status && status.state === 'ready') {
-      // Vergilius: ling-vista = Ling + occhi esterni (Holo su CPU). Il loader
+      // Vergilius: lfm-vista = LFM + occhi esterni (Holo su CPU). Il loader
       // resta aperto finche' anche gli occhi rispondono: il primo prefill di
       // Holo paga 10-19s di init encoder, meglio qui che al primo messaggio.
       if (status.vista_esterna && !status.occhi_pronti) {
@@ -206,7 +206,7 @@ export async function warmup(m) {
       if (token === _activeToken) _closeOverlay();
       return fallback;
     }
-    // ling-vista in caricamento: il badge "vista" e' gia' corretto ora.
+    // lfm-vista in caricamento: il badge "vista" e' gia' corretto ora.
     if (status && status.vista_esterna) _publish(modelId, status);
 
     if (!shown && Date.now() - startedAt > SHOW_AFTER_MS) {
@@ -257,7 +257,7 @@ function _syncBadge() {
     if (existing) existing.remove();
     return;
   }
-  // Vergilius: vista esterna (ling-vista): gli occhi sono Holo, non un mmproj.
+  // Vergilius: vista esterna (lfm-vista): gli occhi sono Holo, non un mmproj.
   // Badge positivo "vista" con lo stesso stile del "senza vista".
   const esterna = !!caps.vista_esterna;
   if (existing && existing.dataset.kind === (esterna ? 'vista' : 'cieco')) return;

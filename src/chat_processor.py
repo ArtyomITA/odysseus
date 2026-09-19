@@ -516,9 +516,33 @@ class ChatProcessor:
             except Exception as e:
                 logger.debug(f"Skills index unavailable: {e}")
                 idx = []
-            if idx:
+            # Vergilius: with ODYSSEUS_SKILLS_INDEX_TRUSTED=1 the index is split
+            # by provenance and the local-only half is wrapped with
+            # arm_tool_gate=False, so a first-party skill library does not arm
+            # the external-untrusted-context tool gate on round 1 of every chat.
+            # Imported / unknown-provenance skills keep the gate-arming wrapper.
+            _local_names: set = set()
+            _split = False
+            if idx and os.getenv("ODYSSEUS_SKILLS_INDEX_TRUSTED", "0") == "1":
+                try:
+                    from src.agent_loop import _skill_provenance_is_local
+                    _local_names = {
+                        s.get("name")
+                        for s in self.skills_manager.load(owner=owner)
+                        if _skill_provenance_is_local(s)
+                    }
+                    _split = True
+                except Exception as e:  # pragma: no cover - defensive
+                    logger.debug(f"Skills-index provenance split skipped: {e}")
+            for _trusted_half in ((False, True) if _split else (False,)):
+                _subset = [
+                    s for s in idx
+                    if not _split or ((s.get("name") in _local_names) is _trusted_half)
+                ]
+                if not _subset:
+                    continue
                 by_cat: Dict[str, list] = {}
-                for s in idx:
+                for s in _subset:
                     by_cat.setdefault(s.get("category") or "general", []).append(s)
                 lines = ["[Available skills — call manage_skills(action='view', name='...') to load one when relevant]"]
                 for cat in sorted(by_cat):
@@ -527,8 +551,10 @@ class ChatProcessor:
                         desc = s.get("description") or ""
                         lines.append(f"    - {s['name']}: {desc}" if desc else f"    - {s['name']}")
                 preface.append(untrusted_context_message(
-                    "available skills index",
+                    "available skills index (local)" if _trusted_half
+                    else "available skills index",
                     "\n".join(lines),
+                    arm_tool_gate=not _trusted_half,
                 ))
 
         return preface, rag_sources, web_sources

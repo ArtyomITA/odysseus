@@ -180,8 +180,6 @@ ToolBlock = namedtuple("ToolBlock", ["tool_type", "content"])
 # Parsing
 from src.tool_parsing import (  # noqa: E402, F401
     parse_tool_blocks,
-    parse_reasoning_tool_blocks,
-    parse_reasoning_tool_calls,
     strip_tool_blocks,
     _TOOL_NAME_MAP,
     _TOOL_BLOCK_RE,

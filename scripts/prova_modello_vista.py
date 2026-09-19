@@ -1,4 +1,4 @@
-"""Banco diretto modalita' Vista: Ling sceglie il tool giusto fra gli occhi
+"""Banco diretto modalita' Vista: il modello sceglie il tool giusto fra gli occhi
 (vista_*), Windows-MCP e browser? Stessa forma di prova_modello_finanza.py:
 schemi reali + REGOLE_VISTA in coda al system, tool_choice auto, temp 0.2.
 
@@ -12,7 +12,7 @@ sys.path.insert(0, r"d:\assistenteeee\odysseus")
 sys.stdout.reconfigure(encoding="utf-8")
 
 LLAMA = "http://127.0.0.1:8012/v1/chat/completions"
-MODELLO = sys.argv[1] if len(sys.argv) > 1 else "ling"
+MODELLO = sys.argv[1] if len(sys.argv) > 1 else "lfm"
 VARIANTE = sys.argv[2] if len(sys.argv) > 2 else "lite"   # lite (default) | piena
 
 # Schemi MCP "finti" ma fedeli (nome nudo: nel loop sono mcp__<id>__Nome)

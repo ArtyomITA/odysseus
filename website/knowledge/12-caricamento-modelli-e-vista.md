@@ -4,6 +4,15 @@ Aggiunto il 1 agosto 2026. Risponde a due domande poste esplicitamente:
 *"quando cambio modello dal dropdown deve esserci un loading"* e *"quando sto
 senza vista non devo avere l'opzione di screenshot"*.
 
+> **Nota 19 set 2026**: i profili sotto (`qwenpaw`, `qwenpaw-vista`, `heretic`,
+> `heretic-vista`) sono quelli del 1 agosto. Predefinito oggi è `lfm` (alias
+> `lfm-vista`, LFM2.5-2.6B). `heretic`/`heretic-vista` (QwenPaw 9B heretic)
+> restano invariati. Il rilevamento vista descritto sotto (consultare
+> llama-swap `/props` prima dell'euristica sul nome) resta il meccanismo
+> principale; l'euristica su `is_vision_model()` riconosce anche i nomi che
+> iniziano per `lfm` come possibili profili vista, in aggiunta alle
+> sottostringhe `vision`/`vl`/`llava`/`gemma3` citate sotto.
+
 ---
 
 ## 1. Cosa succede davvero quando cambi modello

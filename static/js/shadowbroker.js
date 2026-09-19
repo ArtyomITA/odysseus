@@ -90,9 +90,9 @@ function _renderOffline(cfg) {
   const pre = document.createElement('pre');
   pre.className = 'sb-offline-cmd';
   pre.textContent =
-    'cd d:\\assistenteeee\\shadowbroker\\backend\n'
+    'cd shadowbroker\\backend\n'
     + 'venv\\Scripts\\python.exe main.py\n\n'
-    + 'cd d:\\assistenteeee\\shadowbroker\\frontend\n'
+    + 'cd shadowbroker\\frontend\n'
     + 'npm run dev:frontend';
   box.appendChild(pre);
 

@@ -41,10 +41,10 @@ def test_e2e_endpoint_selection_honors_explicit_model():
     module = _load("pre4_e2e_endpoint", ROOT / "scripts" / "prova_e2e_onda4.py")
     endpoint, model = module.select_endpoint(
         {"items": [{"id": "a", "default": True, "model": "old"}]},
-        "ling-vista",
+        "lfm-vista",
     )
     assert endpoint["id"] == "a"
-    assert model == "ling-vista"
+    assert model == "lfm-vista"
 
 
 def test_slot_probe_classification_requires_large_isolation_delta():

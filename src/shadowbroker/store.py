@@ -27,7 +27,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from src.shadowbroker.client import ShadowBrokerClient, get_client
+from src.shadowbroker.client import LAYER_GEOMETRICI, ShadowBrokerClient, get_client
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +119,25 @@ def _appiattisci(grezzo: Any) -> List[Dict[str, Any]]:
     return fuori
 
 
+def _esito_batch(cmd: str, grezzo: Any) -> Tuple[Any, Optional[str]]:
+    """Un elemento di `client.batch()` -> `(dati, errore)`.
+
+    `batch()` non alza eccezioni per il singolo comando: un sotto-comando
+    fallito arriva come dizionario con `ok: False` (il backend costruisce
+    `{"cmd", "ok": False, "detail"}` sia per il comando sconosciuto sia per
+    quello esploso in esecuzione). Qui si traduce nello **stesso** messaggio
+    che avrebbe alzato `comando()`, cosi' chi legge non distingue fra il
+    percorso batch e quello sequenziale — e un comando caduto degrada solo la
+    propria parte.
+    """
+    if isinstance(grezzo, dict) and grezzo.get("ok") is False:
+        dettaglio = grezzo.get("detail") or grezzo.get("message") or "errore ignoto"
+        return None, f"ShadowBroker '{cmd}': {dettaglio}"
+    if grezzo is None:
+        return None, f"ShadowBroker '{cmd}': nessun risultato nel batch"
+    return grezzo, None
+
+
 class LayerStore:
     def __init__(self, client: Optional[ShadowBrokerClient] = None):
         self._client = client or get_client()
@@ -180,10 +199,7 @@ class LayerStore:
         """Piu' layer, riusando quelli ancora buoni e chiedendo il resto in una
         sola richiesta."""
         da_chiedere = [n for n in nomi if forza or self.scaduto(n)]
-        fuori: Dict[str, List[Dict[str, Any]]] = {}
-        for n in nomi:
-            if n not in da_chiedere:
-                fuori[n] = self._dati.get(n, [])
+        blocco: Dict[str, Any] = {}
         if da_chiedere:
             try:
                 blocco = self._client.layers(da_chiedere)
@@ -191,18 +207,128 @@ class LayerStore:
                 logger.warning("[shadowbroker] lettura multipla fallita (%s), passo a una alla volta: %s",
                                da_chiedere, e)
                 blocco = {}
-            for n in da_chiedere:
-                if n in blocco:
-                    elementi = _appiattisci(blocco[n])
-                    for e in elementi:
-                        e["_id"] = _identificativo(n, e)
-                        e["_layer"] = n
-                    with self._lock:
-                        self._indicizza(n, elementi)
-                    fuori[n] = elementi
-                else:
-                    fuori[n] = self.carica(n, forza=True)
+        return self._assorbi(nomi, da_chiedere, blocco)
+
+    def _assorbi(self, nomi: List[str], da_chiedere: List[str],
+                 blocco: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+        """Mette in magazzino il blocco appena letto e compone la risposta.
+
+        Un layer che il blocco non porta (errore, layer geometrico escluso
+        dalla lettura multipla) si ricarica da solo: una chiamata in piu' per
+        quel layer, non un briefing monco.
+        """
+        fuori: Dict[str, List[Dict[str, Any]]] = {}
+        for n in nomi:
+            if n not in da_chiedere:
+                fuori[n] = self._dati.get(n, [])
+        for n in da_chiedere:
+            if n in blocco:
+                elementi = _appiattisci(blocco[n])
+                for e in elementi:
+                    e["_id"] = _identificativo(n, e)
+                    e["_layer"] = n
+                with self._lock:
+                    self._indicizza(n, elementi)
+                fuori[n] = elementi
+            else:
+                fuori[n] = self.carica(n, forza=True)
         return fuori
+
+    # ── lettura in un solo giro ──────────────────────────────────────────
+
+    def istantanea(self, nomi: List[str], extra: Optional[List[Dict[str, Any]]] = None,
+                   con_riepilogo: bool = True,
+                   forza: bool = False) -> Dict[str, Any]:
+        """Riepilogo + layer scaduti + comandi indipendenti in UN round-trip.
+
+        Un briefing a cache fredda faceva tre richieste HTTP in fila
+        (`get_summary`, `get_layer_slice`, poi il comando del briefing): sono
+        indipendenti fra loro — nessuna usa il risultato dell'altra — quindi
+        viaggiano insieme su `/api/ai/channel/batch`, che lato loro le esegue
+        in parallelo.
+
+        Niente `compact` e niente playbook lato server: `get_layer_slice`
+        resta quello non compatto, perche' la versione compatta butta via
+        `lat`/`lng` e `link`.
+
+        Ritorna::
+
+            {"conteggi": {layer: n}, "layer": {nome: [elementi]},
+             "extra": [(dati, errore), ...]}      # uno per comando in `extra`
+
+        Le regole di cache non cambiano: si chiedono solo i layer scaduti, e
+        quelli ancora buoni non toccano la rete. Se il batch cade, o risponde
+        in una forma inattesa, si torna alle chiamate singole di prima.
+        """
+        extra = [dict(c) for c in (extra or [])]
+        da_chiedere = [n for n in nomi if forza or self.scaduto(n)]
+        # I layer geometrici non si mescolano agli altri (vedi client.layers):
+        # restano fuori dal batch e si caricano da soli.
+        sicuri = [n for n in da_chiedere if n not in LAYER_GEOMETRICI]
+
+        comandi: List[Dict[str, Any]] = []
+        i_riepilogo: Optional[int] = None
+        i_layer: Optional[int] = None
+        if con_riepilogo:
+            i_riepilogo = len(comandi)
+            comandi.append({"cmd": "get_summary", "args": {"compact": True}})
+        if sicuri:
+            i_layer = len(comandi)
+            comandi.append({"cmd": "get_layer_slice", "args": {"layers": sicuri}})
+        i_extra = len(comandi)
+        comandi.extend(extra)
+
+        risultati: Optional[List[Any]] = None
+        if len(comandi) >= 2:
+            try:
+                r = self._client.batch(comandi)
+                if isinstance(r, list) and len(r) == len(comandi):
+                    risultati = r
+                else:
+                    logger.warning(
+                        "[shadowbroker] batch: attesi %d risultati, ricevuto %s; "
+                        "passo alle chiamate singole", len(comandi),
+                        f"{len(r)} risultati" if isinstance(r, list) else type(r).__name__)
+            except Exception as e:
+                logger.warning("[shadowbroker] batch fallito (%s), passo alle chiamate singole", e)
+        if risultati is None:
+            return self._istantanea_sequenziale(nomi, extra, con_riepilogo, forza)
+
+        conteggi: Dict[str, int] = {}
+        if i_riepilogo is not None:
+            dati, errore = _esito_batch("get_summary", risultati[i_riepilogo])
+            if errore:
+                logger.warning("[shadowbroker] riepilogo fallito: %s", errore)
+            elif isinstance(dati, dict):
+                grezzi = dati.get("counts") or {}
+                conteggi = {k: v for k, v in grezzi.items() if isinstance(v, int)}
+
+        blocco: Dict[str, Any] = {}
+        if i_layer is not None:
+            dati, errore = _esito_batch("get_layer_slice", risultati[i_layer])
+            if errore:
+                logger.warning("[shadowbroker] lettura multipla fallita (%s), passo a una alla volta: %s",
+                               sicuri, errore)
+            elif isinstance(dati, dict):
+                blocco = dati.get("layers") or {}
+
+        esiti = [_esito_batch(str(c.get("cmd") or "?"), risultati[i_extra + k])
+                 for k, c in enumerate(extra)]
+        return {"conteggi": conteggi, "layer": self._assorbi(nomi, da_chiedere, blocco),
+                "extra": esiti}
+
+    def _istantanea_sequenziale(self, nomi: List[str], extra: List[Dict[str, Any]],
+                                con_riepilogo: bool, forza: bool) -> Dict[str, Any]:
+        """Il percorso di prima: una richiesta per pezzo. Ripiego del batch."""
+        conteggi = self.riepilogo() if con_riepilogo else {}
+        strato = self.carica_molti(nomi, forza=forza)
+        esiti: List[Tuple[Any, Optional[str]]] = []
+        for c in extra:
+            try:
+                esiti.append((self._client.comando(str(c.get("cmd") or ""), c.get("args") or {}), None))
+            except Exception as e:
+                esiti.append((None, str(e)))
+        return {"conteggi": conteggi, "layer": strato, "extra": esiti}
 
     def dettaglio(self, identificativo: str) -> Optional[Dict[str, Any]]:
         """L'elemento **intero**, senza nessuna riduzione.

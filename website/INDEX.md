@@ -18,7 +18,7 @@ se si arriva nuovi.
 | # | Documento | Contenuto |
 |---|---|---|
 | 01 | [Panoramica dello stack](knowledge/01-panoramica-stack.md) | servizi, porte, struttura delle cartelle, flusso di una richiesta, principi guida |
-| 02 | [Modello e hardware](knowledge/02-modello-e-hardware.md) | vincoli della GTX 1080, perché QwenPaw, la scala di configurazioni A0-A4, **tutte le misure fatte**, ottimizzazioni applicate e non |
+| 02 | [Modello e hardware](knowledge/02-modello-e-hardware.md) | vincoli della GTX 1080; predefinito attuale **LFM2.5-2.6B** (19 set 2026, vedi nota in cima al file); sotto, storico QwenPaw: perché QwenPaw, la scala di configurazioni A0-A4, **tutte le misure fatte**, ottimizzazioni applicate e non |
 | 03 | [Modifiche al core](knowledge/03-modifiche-al-core.md) | **registro completo** di cosa abbiamo toccato di Odysseus, file nuovi, e la procedura per riapplicare dopo un aggiornamento |
 | 04 | [Avatar Live2D](knowledge/04-avatar-live2d.md) | architettura, da dove vengono gli stati, emozioni, labiale, perché non MCP, licenze |
 | 05 | [Voce: sintesi e trascrizione](knowledge/05-voce-tts-stt.md) | tutto in streaming: PocketTTS senza buffer, Nemotron-3.5 in diretta, fine turno automatica, filtro emoji, dispositivi audio |

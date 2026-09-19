@@ -35,7 +35,7 @@ Tre errori trovati e chiusi, in fondo a questa pagina.
 
 | Strumento | Ruolo |
 |---|---|
-| `fin_mercati` | quotazioni difesa/tech/cripto + notizie + **l'anomalia già trovata**; con `titolo` quota UN titolo per nome/ticker (Finnhub `/search` + `/quote`), oppure `disponibile: false` col motivo (27 ago 2026, caso Leonardo) |
+| `fin_mercati` | quotazioni difesa/tech/cripto + notizie + **l'anomalia già trovata**; con `titolo` quota UN titolo per nome/ticker (Finnhub `/search` + `/quote`), oppure `disponibile: false` col motivo (27 ago 2026, caso Leonardo). Ora risolve anche ticker italiani/europei: albero di titoli noti, con ripiego su Yahoo senza chiave quando il piano gratuito Finnhub non copre il mercato |
 | `fin_appalti` | contratti federali con **il luogo**: unici dati economici mappabili |
 | `fin_insider` | movimenti degli interni con **MSPR**, indice da -100 a +100 |
 | `fin_archivio` | **il passato**: archivio RAG di notizie, picchi, contratti, insider |
@@ -43,6 +43,10 @@ Tre errori trovati e chiusi, in fondo a questa pagina.
 | `osint_notizie` | per incrociare con geopolitica **e leggere il testo** di un articolo (url/id) |
 | `osint_dettaglio` | scheda intera di qualcosa già citato |
 | `osint_web` | background che wire e archivio non hanno: «chi è il CEO», «cosa produce X» |
+
+**Nuovo (19 set 2026): `calcola`**, strumento generale (non specifico di
+Financial) per aritmetica esatta: utile qui per conti su quotazioni,
+percentuali e MSPR senza affidarsi al modello a memoria.
 
 Mappa e notizie **non sono aggiunta di comodo**: «questa commessa dove sta» e
 «che notizie la spiegano» sono esattamente le domande per cui profilo esiste.

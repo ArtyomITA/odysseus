@@ -85,9 +85,12 @@ STATI_USA: Dict[str, Tuple[float, float]] = {
 
 # ── chiave e chiamate ────────────────────────────────────────────────────
 
+# ShadowBroker sta accanto a odysseus/ (questo file: odysseus/src/shadowbroker/). SHADOWBROKER_DIR lo sposta.
+_SB_DIR = os.environ.get("SHADOWBROKER_DIR") or os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", "shadowbroker"))
 _PERCORSI_CHIAVE = (
-    "d:/assistenteeee/shadowbroker/backend/data/operator_api_keys.env",
-    "d:/assistenteeee/shadowbroker/backend/.env",
+    os.path.join(_SB_DIR, "backend", "data", "operator_api_keys.env"),
+    os.path.join(_SB_DIR, "backend", ".env"),
 )
 _chiave_cache: Optional[str] = None
 

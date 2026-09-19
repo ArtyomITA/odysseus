@@ -40,12 +40,17 @@ ntfy" e lo fa. Chiavi API restano di sola lettura.
 
 ## La nostra configurazione attuale
 
+Aggiornato 19 set 2026: `default_model`/`utility_model`/`vision_model` sotto
+usavano `qwenpaw`/`qwenpaw-vista` (modello dell'epoca di questo file); il
+predefinito attuale è **LFM2.5-2.6B**, profilo llama-swap `lfm` (vista
+`lfm-vista`).
+
 ```json
 {
   "default_endpoint_id": "<id dell'endpoint llama-swap>",
-  "default_model": "qwenpaw",
-  "utility_model": "qwenpaw",
-  "vision_model": "qwenpaw-vista",
+  "default_model": "lfm",
+  "utility_model": "lfm",
+  "vision_model": "lfm-vista",
   "vision_enabled": true,
   "search_provider": "duckduckgo",
   "tts_enabled": true,
@@ -93,12 +98,12 @@ Campi che contano: `base_url`, `endpoint_kind` (`auto`|`local`|`api`|`proxy`),
 
 **`supports_tools` è importante**: Odysseus usa tool calling nativo solo se è
 `true` **oppure** se il nome del modello matcha lista di parole chiave (qwen3,
-claude, gemini...). I nostri nomi profilo (`qwenpaw`, `heretic`) **non
-matchano**, va messo a mano. Altrimenti ripiega su protocollo testuale a
-blocchi di codice.
+claude, gemini...). I nomi profilo `lfm`, `lfm-vista`, `lfm2*` sono nella
+lista; qualunque altro nome locale **non matcha** e va messo a mano.
+Altrimenti ripiega su protocollo testuale a blocchi di codice.
 
 I due endpoint registrati:
-1. **llama-swap** su `http://127.0.0.1:8012/v1` — i 4 profili modello
+1. **llama-swap** su `http://127.0.0.1:8012/v1` — i profili modello
 2. **ponte voce** su `http://127.0.0.1:8013/v1` — sintesi e trascrizione, con
    i suoi due modelli **nascosti dal menu** via `hidden_models`
 
@@ -107,23 +112,29 @@ I due endpoint registrati:
 File: `d:\assistenteeee\llama-swap\config.yaml`. Avviato con `--watch-config`:
 **modifiche al file si applicano senza riavviare**.
 
-In cima due macro valide per tutti i profili:
+In cima una macro valida per tutti i profili:
 ```yaml
 macros:
   comune: "--n-gpu-layers 999 -fa on --cache-type-k q8_0 --cache-type-v q8_0 --no-mmap --mlock"
-  campionamento: "--temp 1.0 --top-p 0.95 --top-k 20 --presence-penalty 1.5"
 ```
-Cambiando lì, cambia dappertutto.
+Cambiando lì, cambia dappertutto. Il campionamento (`campionamento: --temp 1.0
+--top-p 0.95 --top-k 20 --presence-penalty 1.5`, tarato su QwenPaw heretic) non
+è più unico dal 19 set 2026: ogni modello ha la propria leva, letta da un file
+`vergilius-<modello>.env` (es. `vergilius-lfm.env`), caricato dal boot quando
+`VERGILIUS_MODELLO=<modello>` in `vergilius.env`. Per LFM2.5-2.6B: temp 0.1,
+top-k 50, repeat-penalty 1.1 (valori ufficiali Liquid).
 
 | Profilo | Modello | Contesto | Vista |
 |---|---|---|---|
-| `qwenpaw` | base | 48K | no |
-| `qwenpaw-vista` | base | 32K | sì, proiettore su RAM |
-| `heretic` | senza rifiuti | 48K | no |
-| `heretic-vista` | senza rifiuti | 32K | sì, proiettore BF16 su RAM |
+| `lfm` (alias `lfm-vista`) | **LFM2.5-2.6B Q8_0 (predefinito)** + drafter DSpark Q8_0 (`--spec-type draft-dspark --spec-draft-n-max 3`) | 49152 | l'alias serve solo a Odysseus per avviare gli occhi (Holo-3.1-0.8B su CPU); stesso processo |
+| `lfm-uncensored` (alias `lfm-uncensored-vista`) | LFM2.5-2.6B senza rifiuti (SC117, facoltativo, `--con-lfm-uncensored`, non di Liquid AI) | 49152 | idem |
+| `heretic` | QwenPaw-Flash-9B heretic (uncensored, non toccato da questo cambio) | 49152 | no |
+| `heretic-vista` | idem | 32768 | sì, proiettore BF16 su RAM |
 
-Profilo Q5 commentato nel file: a parità VRAM costringe a 8K di contesto,
-guadagno non lo giustifica.
+Nomi profilo `qwenpaw`/`qwenpaw-vista` (base, non heretic) descritti in
+versioni precedenti di questo file non esistono più in `config.yaml`: il
+predefinito non heretic è ora `lfm`. Profilo Q5 commentato nel file: a parità
+di VRAM costringeva il contesto a 8K, guadagno non lo giustificava.
 
 Tre modi per modificare le configurazioni:
 1. **chiederlo in chat all'assistente** ("porta heretic a 32K") — ha gli
