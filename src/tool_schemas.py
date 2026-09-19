@@ -1327,6 +1327,13 @@ try:
 except Exception as _e:  # pragma: no cover
     logger.warning("Schemi vista non caricati: %s", _e)
 
+# Vergilius: calcolatrice generale (un modello piccolo sbaglia l'aritmetica a piu' cifre).
+try:
+    from src.agent_tools.calc_tools import CALC_TOOL_SCHEMAS as _CALC_SCHEMAS
+    FUNCTION_TOOL_SCHEMAS.extend(_CALC_SCHEMAS)
+except Exception as _e:  # pragma: no cover
+    logger.warning("Schema calcolatrice non caricato: %s", _e)
+
 
 # ---------------------------------------------------------------------------
 # Converter: native function call -> ToolBlock

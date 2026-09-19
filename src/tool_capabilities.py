@@ -260,6 +260,63 @@ _register(
     # retain the action effect while treating every successful result as data.
     result_integrity=ResultIntegrity.EXTERNAL_UNTRUSTED,
 )
+_register(
+    {
+        "osint_situazione", "osint_notizie", "osint_militare", "osint_allerte",
+        "osint_zona", "osint_dettaglio", "osint_cerca", "osint_recon",
+        "osint_web", "osint_rischio", "osint_storico", "osint_geocode",
+        "osint_cyber", "osint_radio", "osint_satellite",
+        "fin_mercati", "fin_appalti", "fin_insider", "fin_archivio",
+    },
+    ToolEffect.BROKERED_NETWORK_READ,
+    # ShadowBroker OSINT/financial feeds: brokered reads of external sources
+    # (news, geodata, satellite, market data); treat every result as untrusted.
+    result_integrity=ResultIntegrity.EXTERNAL_UNTRUSTED,
+)
+_register(
+    {"osint_mappa", "osint_sorveglianza", "osint_sar"},
+    ToolEffect.BROKERED_NETWORK_READ,
+    ToolEffect.UI_SIDE_EFFECT,
+    # osint_mappa drives the map panel (centra/livelli/evidenzia); osint_sorveglianza
+    # persists/removes watched targets. Both resolve external place/feed data first.
+    result_integrity=ResultIntegrity.EXTERNAL_UNTRUSTED,
+)
+_register(
+    {"vista_video", "vista_immagine", "vista_schermo", "vista_trova"},
+    ToolEffect.READ_PRIVATE,
+    # VLM "eyes" tools: read the user's uploaded media or live screen content;
+    # the described content can carry injected instructions.
+    result_integrity=ResultIntegrity.EXTERNAL_UNTRUSTED,
+)
+_register(
+    {"browser_open"},
+    ToolEffect.BROKERED_NETWORK_READ,
+    ToolEffect.NETWORK_EGRESS,
+    result_integrity=ResultIntegrity.EXTERNAL_UNTRUSTED,
+)
+_register(
+    {"browser_read", "browser_find", "browser_back"},
+    ToolEffect.BROKERED_NETWORK_READ,
+    result_integrity=ResultIntegrity.EXTERNAL_UNTRUSTED,
+)
+_register(
+    {"browser_click", "browser_type"},
+    ToolEffect.BROKERED_NETWORK_READ,
+    ToolEffect.UI_SIDE_EFFECT,
+    # Clicking/typing can trigger navigation or form submission on the page.
+    result_integrity=ResultIntegrity.EXTERNAL_UNTRUSTED,
+)
+_register(
+    {"browser_more"},
+    ToolEffect.READ_PUBLIC,
+    # Progressive disclosure of the raw browser MCP tool schemas; no network
+    # access and no page content involved.
+)
+_register(
+    {"calcola"},
+    ToolEffect.READ_PUBLIC,
+    # Pure local arithmetic on model-supplied numbers; no I/O, no external data.
+)
 
 
 TOOL_CAPABILITIES: Mapping[str, ToolCapabilities] = MappingProxyType(dict(_REGISTRY))

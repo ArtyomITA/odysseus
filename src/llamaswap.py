@@ -253,7 +253,7 @@ def vista_esterna(model: str) -> bool:
     descrive Holo — quindi `vision` resta False e questo flag dice alla UI
     "ha la vista" e al warmup "avvia gli occhi"."""
     m = (model or "").lower().rsplit("/", 1)[-1]
-    return m.endswith("-vista") and m.startswith("ling")
+    return m.endswith("-vista") and m.startswith(("ling", "lfm"))
 
 
 def status(endpoint_url: str, model: str) -> Dict[str, Any]:

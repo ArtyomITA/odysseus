@@ -592,10 +592,92 @@ def _last_user_text(messages) -> str:
         # messaggi automatici dell'harness, non domande dell'utente: contesto data/ora,
         # nudge, rilancio grounding. Senza questo filtro le "entita'" venivano estratte dal
         # testo del rilancio stesso ('Grounding', 'Rewrite', 'ONLY', 'Automated').
-        if _cl.startswith(("[Context", "[Grounding check]", "[ERROR]")) or "(Automated message" in c:
+        if (_cl.startswith(("[Context", "[Grounding check]", "[ERROR]", "[state]"))
+                or "(Automated message" in c or c.rstrip().endswith("(Automated.)")):
             continue
         return c
     return ""
+
+
+# ── Leve per modelli piccoli/obbedienti (LFM2.5-2.6B) ────────────────────
+# Tre helper puri, testabili senza modello vivo. Ognuno e' dietro un env che
+# di default riproduce il comportamento storico (profilo Ling invariato).
+
+# Soglia storica del nudge "intento senza azione". Oltre questa lunghezza la
+# risposta non e' piu' un annuncio ma un testo finale: si nudgia solo se la
+# promessa sta IN CODA (ultimi _NUDGE_CODA_CHARS caratteri).
+_NUDGE_CHARS_STORICI = 400
+_NUDGE_CODA_CHARS = 300
+
+
+def _nudge_max_chars() -> int:
+    """Soglia di lunghezza del nudge intento-senza-azione (default storico 400)."""
+    try:
+        return max(0, int(_os.getenv("ODYSSEUS_INTENT_NUDGE_MAX_CHARS", "400") or 400))
+    except ValueError:
+        return _NUDGE_CHARS_STORICI
+
+
+def _promessa_in_coda(text: str, match, max_chars: int = _NUDGE_CHARS_STORICI) -> bool:
+    """True se il testo senza tool call e' ancora una promessa da nudgiare.
+
+    `match` e' un match di _INTENT_RE/_FUTURO_RE oppure direttamente l'indice
+    di inizio (int), cosi' l'helper e' testabile senza regex.
+
+    Sotto i 400 caratteri vale la regola storica (solo la lunghezza). Sopra i
+    400 — possibile solo alzando ODYSSEUS_INTENT_NUDGE_MAX_CHARS — si richiede
+    che la frase d'intento cada negli ultimi 300 caratteri: una risposta finale
+    lunga che cita un intento a meta' testo non va nudgiata.
+    """
+    if not text or match is None:
+        return False
+    start = match if isinstance(match, int) else match.start()
+    if len(text) >= max_chars:
+        return False
+    if len(text) < _NUDGE_CHARS_STORICI:
+        return True
+    return start >= len(text) - _NUDGE_CODA_CHARS
+
+
+# LFM2.5-2.6B dopo 5+ giri di tool emette a volte una coppia di marker VUOTA
+# (HF LiquidAI/LFM2.5-2.6B, discussione #18). A seconda del parser llama.cpp
+# arriva come testo letterale coi marker e niente in mezzo, oppure come tool
+# call nativa senza nome di funzione.
+_TOOLCALL_VUOTA_RE = re.compile(
+    r"<\|tool_call_start\|>\s*(?:\[\s*\])?\s*<\|tool_call_end\|>"
+)
+
+
+def _toolcall_vuota(text: str, native_calls=None):
+    """(trovata, testo_ripulito) per la tool call vuota di LFM2.5."""
+    testo = text or ""
+    ripulito, quante = _TOOLCALL_VUOTA_RE.subn("", testo)
+    trovata = quante > 0
+    if not trovata:
+        for tc in (native_calls or []):
+            if isinstance(tc, dict) and not str(tc.get("name") or "").strip():
+                trovata = True
+                break
+    return trovata, ripulito
+
+
+# Escalation browser: da un adattatore che fallisce alla categoria specialista
+# che ha piu' probabilita' di sbloccarlo. Le categorie esistono tutte in
+# BROWSER_SPECIALIST_CATEGORIES (browser_tools.py): "forms", "navigation",
+# "debug". "unsafe" non e' e non deve mai essere raggiungibile da qui.
+_BROWSER_ESCALATION_CATEGORIE = {
+    "browser_type": "forms",
+    "browser_open": "navigation",
+    "browser_back": "navigation",
+    "browser_click": "debug",
+    "browser_find": "debug",
+    "browser_read": "debug",
+}
+
+
+def _categoria_escalation(tool_name: str) -> Optional[str]:
+    """Categoria browser_more da sbloccare dopo 2 fallimenti dell'adattatore."""
+    return _BROWSER_ESCALATION_CATEGORIE.get(str(tool_name or ""))
 
 
 # Onda 4 / E12 (27 ago 2026): dedup delle chiamate identiche nello stesso
@@ -1434,11 +1516,15 @@ def _agent_route_tool_mode(
     # Vergilius: Ling / Bailing (Ling-3.0-tiny e derivati) parlano il canale
     # native function-calling ma il loro nome non contiene nessuna delle
     # parole chiave sotto. Confronto sul basename, cosi' `org/Ling-3.0` passa.
-    model_basename = model_lc.rsplit("/", 1)[-1]
+    _model_basename = model_lc.rsplit("/", 1)[-1]
     model_supports_tools = (
-        model_basename == "ling"
-        or model_basename.startswith("ling-")
-        or "bailing" in model_basename
+        _model_basename == "ling"
+        or _model_basename.startswith("ling-")
+        or "bailing" in _model_basename
+        # Liquid AI LFM2 / LFM2.5: tool call native Pythoniche, convertite dal parser di llama.cpp
+        # (verificato sul binario b10549, 19 set 2026).
+        or _model_basename == "lfm"
+        or _model_basename.startswith(("lfm-", "lfm2"))
         or any(kw in model_lc for kw in (
         "gpt-4", "gpt-5", "gpt-o", "claude", "gemini", "gemma",
         "qwen3", "qwen2.5", "mixtral", "mistral", "llama-3.1", "llama-3.2",
@@ -5075,6 +5161,20 @@ async def stream_agent_loop(
     _NUDGE_FORCE_TOOL = _os.getenv("ODYSSEUS_INTENT_NUDGE_FORCE", "1") == "1"
     _NUDGE_FUTURO = _os.getenv("ODYSSEUS_INTENT_NUDGE_FUTURO", "1") == "1"
     _STATE_REMINDER = _os.getenv("ODYSSEUS_STATE_REMINDER", "1") == "1"
+    # Soglia di lunghezza del nudge: 400 = comportamento storico. Alzandola si
+    # prendono anche le risposte lunghe che finiscono con una promessa (LFM:
+    # 664 caratteri chiusi da "Chiamero' fin_mercati con il titolo Apple").
+    _NUDGE_MAX_CHARS = _nudge_max_chars()
+    # LFM2.5: coppia di marker tool_call vuota dopo molti giri. Un solo
+    # rilancio per turno, default OFF.
+    _EMPTY_TOOLCALL_RETRY = _os.getenv("ODYSSEUS_EMPTY_TOOLCALL_RETRY", "0") == "1"
+    _empty_toolcall_retries = 0
+    # Escalation browser automatica dopo 2 fallimenti consecutivi di un
+    # adattatore: una sola volta per turno, default OFF.
+    _BROWSER_AUTO_ESCALATION = _os.getenv("ODYSSEUS_BROWSER_AUTO_ESCALATION", "0") == "1"
+    _browser_fail_streak = 0
+    _browser_escalated = False
+    _browser_escalation_msg = None  # appeso DOPO i risultati tool del giro
 
     # "I said I would, then didn't" detector. The pattern that breaks debug
     # loops on weak models (deepseek-v4-flash mid-2026): the model writes
@@ -5989,7 +6089,9 @@ async def stream_agent_loop(
                 else (
                     set(_tool_names_sent) | set(disabled_tools or set())
                     if _is_api_model
-                    else set(_relevant_tools or TOOL_TAGS) | set(disabled_tools or set())
+                    else set(_relevant_tools or TOOL_TAGS)
+                    | {"ask_user", "update_plan"}
+                    | set(disabled_tools or set())
                 )
             ),
             reasoning_allowed_tool_names=(
@@ -5998,7 +6100,8 @@ async def stream_agent_loop(
                 else (
                     set(_tool_names_sent)
                     if _is_api_model
-                    else set(_relevant_tools or TOOL_TAGS) - set(disabled_tools or set())
+                    else (set(_relevant_tools or TOOL_TAGS) | {"ask_user", "update_plan"})
+                    - set(disabled_tools or set())
                 )
             ),
         )
@@ -6188,6 +6291,42 @@ async def stream_agent_loop(
             yield f'data: {json.dumps({"delta": cleaned_round})}\n\n'
 
         if not tool_blocks:
+            # ── Guardia tool call VUOTA (LFM2.5-2.6B) ─────────────────
+            # Il modello chiude il giro con `<|tool_call_start|>` +
+            # `<|tool_call_end|>` senza nome di funzione (o con una chiamata
+            # nativa dal nome vuoto). Senza questa guardia il turno finisce
+            # con testo vuoto o coi marker a schermo. Un solo rilancio per
+            # turno; mai in guide_only / force-answer (li' non ci sono tool).
+            if _EMPTY_TOOLCALL_RETRY and not guide_only and not _force_answer:
+                _tc_vuota, _tc_pulito = _toolcall_vuota(cleaned_round, native_tool_calls)
+                if _tc_vuota:
+                    # I marker non devono mai arrivare all'utente.
+                    if _tc_pulito != cleaned_round:
+                        cleaned_round = _tc_pulito.strip()
+                        if round_texts:
+                            round_texts[-1] = cleaned_round
+                        full_response = _TOOLCALL_VUOTA_RE.sub("", full_response)
+                    if not cleaned_round.strip() and _empty_toolcall_retries < 1:
+                        _empty_toolcall_retries += 1
+                        logger.info(
+                            "[agent] empty tool call on round %s: no name emitted, asking once for a complete call",
+                            round_num,
+                        )
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "[ERROR] Your tool call was empty. Emit the complete "
+                                "function call with its name and arguments, or write "
+                                "the final answer. (Automated message: do not respond "
+                                "conversationally.)"
+                            ),
+                        })
+                        yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                        continue
+                    logger.info(
+                        "[agent] empty tool call on round %s: markers stripped, delivering %s chars of text",
+                        round_num, len(cleaned_round.strip()),
+                    )
             # ── Completion verifier (mechanism 3a) ────────────────────
             # The model is finishing. If this was an effectful agentic turn,
             # have a fresh-context verifier independently check the work
@@ -6279,10 +6418,13 @@ async def stream_agent_loop(
             # promise: short response (<400 chars), no fenced code/answer,
             # and an action-intent phrase was matched. Long answers that
             # happen to contain "let me know" are not stalls.
+            # Soglia configurabile (ODYSSEUS_INTENT_NUDGE_MAX_CHARS, default
+            # 400 = identico a prima); oltre i 400 la promessa deve stare in
+            # coda, altrimenti una risposta finale lunga verrebbe nudgiata.
             _looks_like_promise = (
                 not guide_only
                 and _intent_match is not None
-                and len(_intent_text) < 400
+                and _promessa_in_coda(_intent_text, _intent_match, _NUDGE_MAX_CHARS)
                 and "```" not in _intent_text
             )
             if _looks_like_promise and _intent_nudge_count < _MAX_INTENT_NUDGES:
@@ -6720,6 +6862,69 @@ async def stream_agent_loop(
                         sorted(_new_browser_tools),
                     )
 
+            # ── Escalation browser automatica (ODYSSEUS_BROWSER_AUTO_ESCALATION) ──
+            # I modelli piccoli non pensano a chiamare browser_more: ripetono
+            # l'adattatore che fallisce o si arrendono. Due fallimenti
+            # CONSECUTIVI di un adattatore core => si sblocca da soli UNA
+            # categoria specialista, una sola volta per turno. Il calcolo della
+            # lista passa dallo stesso handler di browser_more (nessuna mappa
+            # duplicata, disabled_tools rispettati, "unsafe" irraggiungibile:
+            # non e' nella mappa e allow_browser_unsafe resta False).
+            if (
+                _BROWSER_AUTO_ESCALATION
+                and block.tool_type in BROWSER_CORE_TOOL_NAMES
+                and block.tool_type != "browser_more"
+            ):
+                if result.get("error") or result.get("exit_code"):
+                    _browser_fail_streak += 1
+                else:
+                    _browser_fail_streak = 0
+                _esc_categoria = _categoria_escalation(block.tool_type)
+                if (
+                    _browser_fail_streak >= 2
+                    and not _browser_escalated
+                    and _esc_categoria
+                    and _relevant_tools is not None
+                ):
+                    _browser_escalated = True
+                    try:
+                        from src.agent_tools.browser_tools import BROWSER_TOOL_HANDLERS as _BTH
+                        _esc_result = await _BTH["browser_more"](
+                            json.dumps({"category": _esc_categoria}),
+                            {
+                                "session_id": session_id,
+                                "owner": owner,
+                                "disabled_tools": set(disabled_tools or ()),
+                                "allow_browser_unsafe": False,
+                            },
+                        )
+                    except Exception as _esc_err:
+                        _esc_result = {"error": str(_esc_err), "exit_code": 1}
+                    _esc_tools = sorted({
+                        str(name) for name in (_esc_result.get("unlock_tools") or [])
+                        if isinstance(name, str)
+                        and name.startswith(_BROWSER_MCP_PREFIX)
+                        and name not in disabled_tools
+                    }) if not _esc_result.get("error") else []
+                    if _esc_tools:
+                        _relevant_tools.update(_esc_tools)
+                        _browser_escalation_msg = (
+                            "[state] The simple browser tools failed twice. Extra "
+                            f"tools for \"{_esc_categoria}\" are available this round: "
+                            + ", ".join(_esc_tools)
+                            + ". Use them, or say plainly what blocks you. (Automated.)"
+                        )
+                        logger.info(
+                            "[browser-escalation] %s failed twice -> category '%s' unlocked: %s",
+                            block.tool_type, _esc_categoria, _esc_tools,
+                        )
+                    else:
+                        logger.info(
+                            "[browser-escalation] %s failed twice but category '%s' unlocked nothing: %s",
+                            block.tool_type, _esc_categoria,
+                            str(_esc_result.get("error") or "no connected tools")[:200],
+                        )
+
             # Extract structured web sources from web_search tool output.
             # web_search returns {"output": ..., "exit_code": 0}; check "output"
             # first so the <!-- SOURCES:…--> marker is found and stripped even
@@ -7141,6 +7346,12 @@ async def stream_agent_loop(
                              round_reasoning=round_reasoning,
                              model_name=_round_actual_model or model or "",
                              tool_result_records=tool_result_records)
+
+        # Escalation browser: il messaggio va DOPO i risultati tool del giro,
+        # altrimenti si inserirebbe prima della coppia assistant/tool.
+        if _browser_escalation_msg:
+            messages.append({"role": "user", "content": _browser_escalation_msg})
+            _browser_escalation_msg = None
 
         # Vergilius, promemoria a giro N: dal terzo giro in poi il rischio
         # non e' piu' "troppo poco" ma "raccolta infinita". Un modello

@@ -84,7 +84,9 @@ def test_emits_intent_nudge_exhausted_when_cap_is_exhausted(monkeypatch):
     guard = next((e for e in events if e.get("type") == "intent_nudge_exhausted"), None)
     assert guard is not None, events
     assert guard["reason"] == "intent_without_action_nudge_cap"
-    assert guard["nudges"] == 2
+    # Fork raises the default intent-nudge cap to 3 (ODYSSEUS_INTENT_NUDGE_MAX,
+    # default 3) instead of upstream's 2.
+    assert guard["nudges"] == 3
 
 
 def test_emits_loop_breaker_triggered_when_loop_breaker_trips(monkeypatch):

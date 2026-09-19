@@ -195,7 +195,10 @@ def test_qwen_fallback_candidate_gets_capped_temperature(monkeypatch):
         fallbacks=[("https://qwen.example/v1", ODY_QWEN, {})],
     )
 
-    assert stream_calls[0]["temperature"] == 1.2
+    # Fork-only "Onda 4" policy: any round with tool schemas attached is a
+    # selection round and is capped to 0.25 regardless of provider, so the
+    # requested 1.2 does not survive on the primary candidate either.
+    assert stream_calls[0]["temperature"] == 0.25
     factory = stream_calls[0]["candidate_request_factory"]
     request = asyncio.run(factory(1, "https://qwen.example/v1", ODY_QWEN, {}))
     assert request["kwargs"]["temperature"] == 0.2

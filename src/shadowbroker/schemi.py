@@ -171,15 +171,21 @@ OSINT_TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "function": {
             "name": "osint_recon",
             "description": (
+                "External lookup, slower than platform tools. "
                 "Technical lookup on an IP address, domain, CVE or sanction. "
-                "Not about the map: digital-infrastructure investigation."
+                "Not about the map: digital-infrastructure investigation. "
+                "tipo='espandi' returns the relationship graph around an "
+                "entity (who owns it, what it is linked to)."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "tipo": {"type": "string",
-                             "enum": ["ip", "dns", "whois", "certs", "bgp", "sanctions", "cve", "mac", "github", "leaks", "threats"]},
+                             "enum": ["ip", "dns", "whois", "certs", "bgp", "sanctions", "cve", "mac", "github", "leaks", "threats", "espandi"]},
                     "valore": {"type": "string", "description": "The value to look up"},
+                    "entita": {"type": "string",
+                               "enum": ["aircraft", "vessel", "company", "person", "ip", "country"],
+                               "description": "For 'espandi': what the value is"},
                 },
                 "required": ["tipo", "valore"],
             },
@@ -200,6 +206,9 @@ OSINT_TOOL_SCHEMAS: List[Dict[str, Any]] = [
                 "azione='preset' turns on a curated set (financial, conflitto, "
                 "infrastruttura); azione='livelli' with accendi=[...] keeps ONLY "
                 "those on and switches off the rest; azione='ripristina' restores.\n"
+                "azione='nota' pins your written note on the map at a point "
+                "(testo, optional colore); azione='note' lists the notes; "
+                "azione='cancella_nota' removes one by id.\n"
                 "Layer names: military_flights, commercial_flights, private_jets, "
                 "ships, gdelt, news, telegram_osint, satellites, earthquakes, "
                 "firms_fires, weather_alerts, internet_outages, military_bases, "
@@ -208,7 +217,8 @@ OSINT_TOOL_SCHEMAS: List[Dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "azione": {"type": "string", "enum": ["centra", "livelli", "evidenzia", "preset", "ripristina"]},
+                    "azione": {"type": "string", "enum": ["centra", "livelli", "evidenzia", "preset",
+                                                          "ripristina", "nota", "note", "cancella_nota"]},
                     "preset": {"type": "string", "enum": ["financial", "conflitto", "infrastruttura"],
                                "description": "For 'preset': turns on a curated layer set"},
                     "luogo": {"type": "string", "description": "For 'centra': place name or identifier"},
@@ -219,6 +229,9 @@ OSINT_TOOL_SCHEMAS: List[Dict[str, Any]] = [
                                 "description": "For 'livelli': the only layers to keep on"},
                     "ids": {"type": "array", "items": {"type": "string"},
                             "description": "For 'evidenzia': identifiers taken from briefings"},
+                    "testo": {"type": "string", "description": "For 'nota': the note text left on the map"},
+                    "colore": {"type": "string", "description": "For 'nota': rosso, ambra, blu, viola, ciano (default)"},
+                    "id": {"type": "string", "description": "For 'cancella_nota': the note id from 'note'"},
                 },
                 "required": ["azione"],
             },
@@ -229,6 +242,7 @@ OSINT_TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "function": {
             "name": "osint_web",
             "description": (
+                "External lookup, slower than platform tools. "
                 "General web search, beyond the platform feeds. Use when "
                 "briefings cannot know the answer: background and biography "
                 "('chi e' il ministro della difesa di X'), context on "
@@ -412,6 +426,37 @@ OSINT_TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "lng": {"type": "number"},
                     "raggio_km": {"type": "number", "description": "For 'termico': radius (default 10, max 100)"},
                     "ore": {"type": "integer", "description": "For 'passaggi': hours ahead (default 24)"},
+                },
+                "required": ["azione"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "osint_sar",
+            "description": (
+                "RADAR satellite (SAR): what changed on the ground at night or "
+                "under clouds, where the optical satellite sees nothing. "
+                "azione='anomalie' lists radar detections (near a place if you "
+                "give one); 'aree' lists the watched areas (AOI) and 'scene' "
+                "their radar passes; 'copertura' says how well an area is "
+                "covered; 'aggiungi_area'/'rimuovi_area' manage them; "
+                "'sorveglia' alerts on new anomalies there; 'centra' moves the "
+                "map onto one. Use for 'cosa vede il radar', 'anomalie SAR'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "azione": {"type": "string",
+                               "enum": ["stato", "anomalie", "scene", "copertura", "aree",
+                                        "aggiungi_area", "rimuovi_area", "sorveglia", "centra"]},
+                    "area": {"type": "string", "description": "The AOI id from 'aree'"},
+                    "luogo": {"type": "string", "description": "Place name or 'lat,lng'"},
+                    "lat": {"type": "number"},
+                    "lng": {"type": "number"},
+                    "raggio_km": {"type": "number", "description": "Radius (default 50; for a new area 25)"},
+                    "quante": {"type": "integer", "description": "How many items (default 25)"},
                 },
                 "required": ["azione"],
             },
@@ -677,10 +722,13 @@ REGOLE_FINANCE_LIBERE = (
     "ranked by importance.\n"
     "- Prices, MSPR, contract amounts and news come from the tools; call the "
     "tool when the question needs them. Questions that need no data (a "
-    "definition, a greeting, small talk) can be answered directly.\n"
+    "definition, a greeting, small talk) can be answered directly. "
+    "Off-topic requests (weather, recipes, code, chit-chat) get a short "
+    "direct answer, no tool call.\n"
     "- Arithmetic is your job: totals, differences, percentages, currency "
-    "conversion with a rate the user gave. Use numbers from the tool result "
-    "or from the user's message and show the formula.\n"
+    "conversion with a rate the user gave. Take the numbers from the tool "
+    "result or from the user's message, compute them with `calcola` (all "
+    "expressions in one call) and show the formula.\n"
     "- News about a company or person: `osint_notizie` with soggetto='X'. "
     "`luogo` is for geographic places. Geopolitics behind a market move: "
     "`fin_mercati` first, then `osint_notizie` with English keywords.\n"
@@ -708,6 +756,10 @@ REGOLE_FINANCE_LIBERE = (
 
 REGOLE_OSINT_LIBERE = (
     "Answer in Italian (these notes are in English, replies are not).\n"
+    "- Default order: a briefing tool first; `osint_geocode` only when you "
+    "have a place name and need coordinates; `osint_web` only when the "
+    "briefing cannot know it. Off-topic requests (weather, recipes, code, "
+    "chit-chat) get a short direct answer, no tool call.\n"
     "- ShadowBroker. Briefings: `osint_situazione`, `osint_notizie`, "
     "`osint_militare`, `osint_allerte`, `osint_zona`; results arrive ranked. "
     "Markets and prices: `fin_mercati`.\n"
@@ -727,7 +779,12 @@ REGOLE_OSINT_LIBERE = (
     "`osint_storico`; financial history: `fin_archivio`.\n"
     "- Cyber (C2 IPs, CISA KEV, country risk): `osint_cyber`; single IP/CVE: "
     "`osint_recon`. Scanners, KiwiSDR, ACARS/HFDL: `osint_radio`. Fires or "
-    "satellite passes over a point: `osint_satellite`."
+    "satellite passes over a point: `osint_satellite`.\n"
+    "- Radar satellite (night, cloud cover), SAR anomalies and watched areas: "
+    "`osint_sar`. Who an entity is linked to: `osint_recon` with "
+    "tipo='espandi'.\n"
+    "- To leave a written note on the map at a point: `osint_mappa` with "
+    "azione='nota'; it needs full access in ShadowBroker."
 )
 
 import os as _os_regole

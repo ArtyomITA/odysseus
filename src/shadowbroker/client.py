@@ -66,12 +66,16 @@ class ShadowBrokerClient:
 
     # ── trasporto ────────────────────────────────────────────────────────
 
-    def _post(self, percorso: str, corpo: Dict[str, Any], timeout: float) -> Dict[str, Any]:
-        dati = json.dumps(corpo).encode("utf-8")
+    def _post(self, percorso: str, corpo: Optional[Dict[str, Any]], timeout: float,
+              metodo: str = "POST") -> Dict[str, Any]:
+        # `metodo` serve alle API REST che non sono POST (le override dei layer
+        # sono PUT/DELETE): stesso backoff, stesso rate limiting, un solo posto.
+        dati = json.dumps(corpo).encode("utf-8") if corpo is not None else None
         req = urllib.request.Request(
             f"{self.base}{percorso}",
             data=dati,
             headers={"Content-Type": "application/json"},
+            method=metodo,
         )
         ultimo: Optional[Exception] = None
         for tentativo in range(_TENTATIVI):
@@ -185,6 +189,99 @@ class ShadowBrokerClient:
                   timeout: float = _TIMEOUT_NORMALE) -> Any:
         """POST verso un endpoint HTTP diretto di ShadowBroker."""
         return self._post(percorso, corpo, timeout)
+
+    # ── override dei layer lato server ───────────────────────────────────
+    #
+    # `set_layers` (canale agente) muove l'INTERFACCIA: il cruscotto accende
+    # e spegne le sue caselle. `/api/ai/layer-overrides` invece accende la
+    # SORGENTE: `effective_layers()` unisce le override allo stato
+    # dell'operatore, e senza di loro un layer che lui tiene spento lato
+    # server si accende vuoto nel browser. Servono entrambe, non sono
+    # alternative. L'override scade da sola (TTL) e non tocca le preferenze
+    # dell'operatore: niente da ripristinare se la conversazione muore.
+
+    def accendi_livelli_server(self, livelli: Dict[str, bool],
+                               ttl_s: float = 300.0) -> Dict[str, Any]:
+        """Accende (o spegne) lato server dei layer per `ttl_s` secondi.
+
+        Le chiavi sono quelle dei fetcher (`military`, non `military_flights`):
+        quelle sconosciute tornano in `ignored`. Ogni PUT sostituisce la mappa
+        intera e fa ripartire il TTL.
+        """
+        return self._post(
+            "/api/ai/layer-overrides",
+            {"layers": {str(k): bool(v) for k, v in livelli.items()},
+             "ttl_seconds": float(ttl_s)},
+            _TIMEOUT_NORMALE, metodo="PUT")
+
+    def azzera_livelli_server(self) -> Dict[str, Any]:
+        """Toglie tutte le override: torna lo stato scelto dall'operatore."""
+        return self._post("/api/ai/layer-overrides", None,
+                          _TIMEOUT_NORMALE, metodo="DELETE")
+
+    # ── flusso eventi (SSE) ──────────────────────────────────────────────
+
+    def ascolta_eventi(self, callback, stop_event,
+                       timeout_lettura: float = 60.0) -> None:
+        """Ascolta `/api/ai/channel/sse` e chiama `callback(evento, dati)`.
+
+        BLOCCANTE e non collegata al ciclo dell'agente: qui c'e' solo il
+        motore. Un eventuale compito di sfondo la userebbe cosi'::
+
+            stop = threading.Event()
+            def su_evento(tipo, dati):
+                if tipo in ("alert", "task"):
+                    coda_avvisi.put(dati)      # poi li racconta osint_situazione
+            threading.Thread(target=client.ascolta_eventi,
+                             args=(su_evento, stop), daemon=True).start()
+
+        Attenzione a una cosa sola: il flusso SSE drena la STESSA coda di
+        `avvisi_watchdog()` (lettura distruttiva lato loro). O si ascolta, o
+        si interroga: usarli insieme significa perdere meta' degli avvisi.
+
+        Eventi che il backend spinge: `connected`, `layer_changed`, `task`,
+        `alert`, `heartbeat` (ogni 15 s, tiene viva la connessione). Alla
+        caduta si riconnette a scalare (1, 2, 4… fino a 30 s); `stop_event`
+        ferma sia l'attesa sia la lettura. Solo libreria standard.
+        """
+        attesa = 1.0
+        while not stop_event.is_set():
+            try:
+                req = urllib.request.Request(
+                    f"{self.base}/api/ai/channel/sse",
+                    headers={"Accept": "text/event-stream"},
+                )
+                with urllib.request.urlopen(req, timeout=timeout_lettura) as r:
+                    attesa = 1.0
+                    evento, righe = "message", []
+                    for grezza in r:
+                        if stop_event.is_set():
+                            return
+                        riga = grezza.decode("utf-8", "replace").rstrip("\r\n")
+                        if not riga:
+                            if righe:
+                                corpo: Any = "\n".join(righe)
+                                try:
+                                    corpo = json.loads(corpo)
+                                except (ValueError, TypeError):
+                                    pass
+                                try:
+                                    callback(evento, corpo)
+                                except Exception:
+                                    logger.exception("[shadowbroker] callback SSE fallita")
+                            evento, righe = "message", []
+                        elif riga.startswith(":"):
+                            continue          # commento di keep-alive
+                        elif riga.startswith("event:"):
+                            evento = riga[6:].strip() or "message"
+                        elif riga.startswith("data:"):
+                            righe.append(riga[5:].lstrip())
+            except Exception as e:
+                logger.info("[shadowbroker] SSE caduto (%s), riprovo fra %.0f s",
+                            type(e).__name__, attesa)
+            if stop_event.wait(attesa):
+                return
+            attesa = min(attesa * 2.0, 30.0)
 
     def batch(self, comandi: List[Dict[str, Any]],
               timeout: float = _TIMEOUT_LUNGO) -> List[Any]:

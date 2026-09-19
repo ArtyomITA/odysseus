@@ -101,6 +101,15 @@ except Exception as _e:  # pragma: no cover
     _logging.getLogger(__name__).warning("Strumenti vista non caricati: %s", _e)
     VISTA_TOOL_NAMES = frozenset()
 
+# Vergilius: calcolatrice generale, disponibile in ogni profilo.
+try:
+    from .calc_tools import CALC_TOOL_HANDLERS, CALC_TOOL_NAMES
+    TOOL_HANDLERS.update(CALC_TOOL_HANDLERS)
+except Exception as _e:  # pragma: no cover
+    import logging as _logging
+    _logging.getLogger(__name__).warning("Calcolatrice non caricata: %s", _e)
+    CALC_TOOL_NAMES = frozenset()
+
 # ---------------------------------------------------------------------------
 # Constants (re-exported for backward compatibility — single source of truth
 # is src.constants; always prefer importing from there for new code)
@@ -160,6 +169,7 @@ TOOL_TAGS = {"bash", "python", "web_search", "web_fetch", "read_file", "write_fi
 # automaticamente riconosciuto anche qui.
 TOOL_TAGS |= {n for n in TOOL_HANDLERS if n.startswith(("osint_", "fin_", "vista_"))}
 TOOL_TAGS |= set(BROWSER_TOOL_HANDLERS)
+TOOL_TAGS |= set(CALC_TOOL_NAMES)
 
 ToolBlock = namedtuple("ToolBlock", ["tool_type", "content"])
 

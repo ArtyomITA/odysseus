@@ -23,7 +23,7 @@
   }
   function attiva() {
     var m = modelloCorrente().split('/').pop();
-    return m.indexOf('ling') === 0 && /-vista$/.test(m);
+    return /^(ling|lfm)/.test(m) && /-vista$/.test(m);
   }
   function computer() { try { return attiva() && localStorage.getItem(PREF_PC) === '1'; } catch (_) { return false; } }
   function browser()  { try { return attiva() && localStorage.getItem(PREF_BR) === '1'; } catch (_) { return false; } }

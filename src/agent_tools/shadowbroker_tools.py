@@ -78,6 +78,23 @@ def _errore(messaggio: str) -> Dict[str, Any]:
     return {"error": messaggio, "exit_code": 1}
 
 
+def _errore_scrittura(etichetta: str, e: Exception) -> Dict[str, Any]:
+    """Errore di una SCRITTURA sul canale OpenClaw.
+
+    Il caso frequente e' il tier: il backend risponde 403 con
+    "command '…' requires full access tier". Non si ritenta — ritentare da
+    soli con lo stesso tier produce solo un secondo 403.
+    """
+    testo = str(e)
+    if "requires full" in testo or "HTTP 403" in testo:
+        return _errore(
+            f"{etichetta}: ShadowBroker non accetta le scritture con l'accesso attuale. "
+            f"Apri il pannello AI di ShadowBroker e porta l'accesso a 'full' "
+            f"(OPENCLAW_ACCESS_TIER=full), poi richiedimelo. Non riprovo da solo."
+        )
+    return _errore(f"{etichetta}: {testo[:180]}")
+
+
 def _non_raggiungibile(e: Exception) -> Dict[str, Any]:
     return _errore(
         f"ShadowBroker non risponde ({type(e).__name__}). "
@@ -264,9 +281,16 @@ class ReconTool(_Base):
     """
 
     _TIPI = {"ip", "dns", "whois", "certs", "bgp", "sanctions", "cve", "mac",
-             "github", "leaks", "threats"}
+             "github", "leaks", "threats", "espandi"}
     _ALIAS = {"sanzioni": "sanctions", "dominio": "dns", "certificati": "certs",
-              "minacce": "threats", "violazioni": "leaks"}
+              "minacce": "threats", "violazioni": "leaks",
+              "expand": "espandi", "entity_expand": "espandi", "grafo": "espandi"}
+    # `entity_expand` vuole sapere COSA e' il valore. Il modello lo dira' quasi
+    # mai, quindi si indovina: un IP si riconosce da solo, il resto e' un nome
+    # di azienda finche' non si dice il contrario.
+    _ENTITA = {"aircraft", "vessel", "company", "person", "ip", "country"}
+    _ENTITA_ALIAS = {"aereo": "aircraft", "nave": "vessel", "azienda": "company",
+                     "societa": "company", "persona": "person", "paese": "country"}
 
     def run(self, a, ctx):
         from src.shadowbroker.client import get_client
@@ -277,6 +301,8 @@ class ReconTool(_Base):
             return _errore("osint_recon: serve un valore (indirizzo IP, dominio, CVE…)")
         if tipo not in self._TIPI:
             return _errore(f"osint_recon: tipo '{tipo}' sconosciuto. Ammessi: {', '.join(sorted(self._TIPI))}")
+        if tipo == "espandi":
+            return self._espandi(get_client(), str(valore), a)
         try:
             r = get_client().comando(
                 "osint_lookup", {"tool": tipo, "query": valore, tipo: valore}, timeout=60)
@@ -284,8 +310,95 @@ class ReconTool(_Base):
             return _errore(f"osint_recon {tipo}: {str(e)[:200]}")
         return _consegna({"tipo": tipo, "valore": valore, "risultato": r})
 
+    def _espandi(self, client, valore: str, a: Dict[str, Any]) -> Dict[str, Any]:
+        """Grafo delle relazioni intorno a un'entita' (`entity_expand`)."""
+        ent = str(a.get("entita") or a.get("entity") or "").strip().lower()
+        ent = self._ENTITA_ALIAS.get(ent, ent)
+        if ent and ent not in self._ENTITA:
+            return _errore(f"osint_recon espandi: entita' '{ent}' sconosciuta. "
+                           f"Ammesse: {', '.join(sorted(self._ENTITA))}")
+        if not ent:
+            pezzi = valore.split(".")
+            if len(pezzi) == 4 and all(p.isdigit() for p in pezzi):
+                ent = "ip"
+            else:
+                ent = "company"
+        try:
+            r = client.comando("entity_expand", {"type": ent, "id": valore}, timeout=60)
+        except Exception as e:
+            return _errore(f"osint_recon espandi: {str(e)[:200]}")
+        return _consegna({"tipo": "espandi", "entita": ent, "valore": valore, "grafo": r})
+
 
 # ── mappa ────────────────────────────────────────────────────────────────
+
+# Nomi dei layer come li conosce il modello (e il cruscotto) tradotti nelle
+# chiavi dei fetcher, che sono un'altra cosa: `military`, non
+# `military_flights`. Servono alle override lato server
+# (`PUT /api/ai/layer-overrides`): `set_layers` accende la CASELLA nel
+# browser, l'override accende la SORGENTE. Senza la seconda, un layer che
+# l'operatore tiene spento lato server (firms, datacenters, power_plants,
+# cctv sono spenti di fabbrica) si accende vuoto. Le chiavi che non compaiono
+# qui non hanno un interruttore lato server: si saltano, il cruscotto basta.
+_LIVELLI_SERVER: Dict[str, list] = {
+    "gdelt": ["global_incidents"],
+    "news": ["global_incidents"],
+    "telegram_osint": ["telegram_osint"],
+    "military_flights": ["military"],
+    "tracked_flights": ["tracked"],
+    "commercial_flights": ["flights"],
+    "private_jets": ["jets", "private"],
+    "ships": ["ships_military", "ships_cargo", "ships_civilian", "ships_passenger"],
+    "satellites": ["satellites"],
+    "earthquakes": ["earthquakes"],
+    "firms_fires": ["firms"],
+    "weather_alerts": ["weather_alerts"],
+    "internet_outages": ["internet_outages"],
+    "military_bases": ["military_bases"],
+    "power_plants": ["power_plants"],
+    "datacenters": ["datacenters"],
+    "frontlines": ["ukraine_frontline"],
+    "correlations": ["correlations"],
+    "sigint": ["sigint_meshtastic", "sigint_aprs"],
+    "sar_anomalies": ["sar"],
+}
+
+# 5 minuti, rinfrescati a ogni chiamata: l'override e' pensata per essere
+# ri-messa dall'agente che tiene aperto un overlay, non per durare a lungo.
+_TTL_LIVELLI_S = 300.0
+
+# Le note sulla mappa non hanno un colore libero: il backend ha cinque
+# CATEGORIE e da quelle ricava il colore. Il modello pero' dira' "rosso", non
+# "warning", quindi si accettano entrambi.
+_CATEGORIA_NOTA: Dict[str, str] = {
+    "rosso": "warning", "red": "warning", "warning": "warning",
+    "ambra": "contradiction", "giallo": "contradiction", "amber": "contradiction",
+    "contradiction": "contradiction",
+    "blu": "observation", "blue": "observation", "observation": "observation",
+    "viola": "hypothesis", "purple": "hypothesis", "hypothesis": "hypothesis",
+    "ciano": "analysis", "cyan": "analysis", "analysis": "analysis",
+}
+
+
+def _accendi_sorgenti(client, accesi) -> Optional[Dict[str, Any]]:
+    """Accende lato server le sorgenti dei layer chiesti. Best-effort.
+
+    Non e' un fallback: viaggia INSIEME a `set_layers`. Se fallisce, il
+    cruscotto accende comunque le sue caselle, e questa resta una nota.
+    """
+    chiavi: Dict[str, bool] = {}
+    for nome in accesi or []:
+        for k in _LIVELLI_SERVER.get(str(nome).strip().lower(), []):
+            chiavi[k] = True
+    if not chiavi:
+        return None
+    try:
+        r = client.accendi_livelli_server(chiavi, ttl_s=_TTL_LIVELLI_S)
+    except Exception as e:
+        return {"applicate": False, "perche": str(e)[:120]}
+    return {"applicate": sorted((r or {}).get("overrides") or chiavi),
+            "scadenza_s": int(_TTL_LIVELLI_S)}
+
 
 class MappaTool(_Base):
     """Comanda la mappa che l'utente sta guardando.
@@ -340,7 +453,11 @@ class MappaTool(_Base):
                 }, timeout=15)
             except Exception as e:
                 return _errore(f"osint_mappa livelli: {str(e)[:180]}")
-            return _consegna({"azione": "livelli", "accesi": accesi, "spenti": spenti, "esito": r})
+            fuori = {"azione": "livelli", "accesi": accesi, "spenti": spenti, "esito": r}
+            sorgenti = _accendi_sorgenti(client, accesi)
+            if sorgenti:
+                fuori["sorgenti_server"] = sorgenti
+            return _consegna(fuori)
 
         if azione in ("preset", "profilo"):
             from src.shadowbroker.schemi import PRESET_MAPPA
@@ -354,7 +471,11 @@ class MappaTool(_Base):
                 r = client.comando("set_layers", {"on": livelli, "solo": True}, timeout=15)
             except Exception as e:
                 return _errore(f"osint_mappa preset: {str(e)[:180]}")
-            return _consegna({"azione": "preset", "nome": nome, "accesi": livelli, "esito": r})
+            fuori = {"azione": "preset", "nome": nome, "accesi": livelli, "esito": r}
+            sorgenti = _accendi_sorgenti(client, livelli)
+            if sorgenti:
+                fuori["sorgenti_server"] = sorgenti
+            return _consegna(fuori)
 
         if azione in ("evidenzia", "highlight"):
             ids = a.get("ids") or a.get("id") or a.get("_testo")
@@ -385,9 +506,61 @@ class MappaTool(_Base):
                 r = client.comando("set_layers", {"reset": True}, timeout=15)
             except Exception as e:
                 return _errore(f"osint_mappa ripristina: {str(e)[:180]}")
+            # Le caselle tornano come le aveva l'operatore; le override
+            # scadrebbero da sole, ma tenerle vive dopo un ripristino
+            # significherebbe continuare a far girare fetcher che lui aveva
+            # spento.
+            try:
+                client.azzera_livelli_server()
+            except Exception:
+                pass
             return _consegna({"azione": "ripristina", "esito": r})
 
-        return _errore("osint_mappa: azione ammessa fra centra, livelli, evidenzia, ripristina")
+        # ── note sulla mappa (zone di analisi) ───────────────────────────
+        # Quadrati tratteggiati sul layer correlations, con dentro il testo
+        # scritto da noi. Restano finche' qualcuno non li cancella: sono
+        # SCRITTURE, tier `full`.
+
+        if azione in ("nota", "note", "cancella_nota", "annota", "zone"):
+            if azione in ("note", "zone"):
+                try:
+                    r = client.comando("list_analysis_zones", {}, timeout=15)
+                except Exception as e:
+                    return _errore(f"osint_mappa note: {str(e)[:180]}")
+                return _consegna({"azione": "note", "note": r})
+
+            if azione == "cancella_nota":
+                zid = a.get("id") or a.get("_testo")
+                if not zid:
+                    return _errore("osint_mappa cancella_nota: serve l'id della nota (da azione='note')")
+                try:
+                    r = client.comando("delete_analysis_zone", {"zone_id": str(zid)}, timeout=15)
+                except Exception as e:
+                    return _errore_scrittura("osint_mappa cancella_nota", e)
+                return _consegna({"azione": "cancella_nota", "id": zid, "esito": r})
+
+            testo = a.get("testo") or a.get("_testo")
+            if not testo:
+                return _errore("osint_mappa nota: serve il testo della nota")
+            punto = _punto_da(a)
+            if not punto:
+                return _errore("osint_mappa nota: servono lat e lng (o un luogo noto)")
+            colore = str(a.get("colore") or a.get("categoria") or "analysis").strip().lower()
+            categoria = _CATEGORIA_NOTA.get(colore, "analysis")
+            try:
+                r = client.comando("place_analysis_zone", {
+                    "lat": punto[0], "lng": punto[1],
+                    "title": str(testo)[:80],
+                    "body": str(testo),
+                    "category": categoria,
+                }, timeout=20)
+            except Exception as e:
+                return _errore_scrittura("osint_mappa nota", e)
+            return _consegna({"azione": "nota", "lat": punto[0], "lng": punto[1],
+                              "categoria": categoria, "esito": r})
+
+        return _errore("osint_mappa: azione ammessa fra centra, livelli, evidenzia, "
+                       "preset, ripristina, nota, note, cancella_nota")
 
 
 # ── finanza ──────────────────────────────────────────────────────────────
@@ -764,6 +937,98 @@ class SatelliteTool(_Base):
             return _errore(f"osint_satellite {azione}: {str(e)[:180]}")
 
 
+class SarTool(_Base):
+    """Radar ad apertura sintetica: anomalie, scene, aree sorvegliate (AOI).
+
+    Facciata sui comandi sar_*. Il radar vede di notte e attraverso le nuvole:
+    e' l'unico layer che risponde quando il satellite ottico non puo'. Va
+    acceso lato ShadowBroker con MESH_SAR_OPENCLAW_ENABLED; se e' spento, il
+    backend lo dichiara e quel messaggio arriva all'utente tale e quale.
+
+    aggiungi_area / rimuovi_area / sorveglia / centra sono SCRITTURE: tier
+    `full`.
+    """
+
+    def run(self, a, ctx):
+        from src.shadowbroker.client import get_client
+        c = get_client()
+        azione = str(a.get("azione") or "stato").strip().lower()
+        area = str(a.get("area") or a.get("aoi") or a.get("id") or "").strip().lower()
+        quante = int(_numero(a.get("quante"), 25, 1, 100))
+
+        letture = {"stato", "anomalie", "scene", "copertura", "aree"}
+        scritture = {"aggiungi_area", "rimuovi_area", "sorveglia", "centra"}
+        if azione not in letture | scritture:
+            return _errore(f"osint_sar: azione '{azione}' sconosciuta. "
+                           f"Ammesse: {', '.join(sorted(letture | scritture))}")
+
+        try:
+            if azione == "stato":
+                return _consegna({"azione": "stato", "sar": c.comando("sar_status", {}, timeout=20)})
+
+            if azione == "anomalie":
+                punto = _punto_da(a)
+                if punto:
+                    r = c.comando("sar_anomalies_near", {
+                        "lat": punto[0], "lng": punto[1],
+                        "radius_km": _numero(a.get("raggio_km"), 50, 1, 2000),
+                        "limit": quante,
+                    }, timeout=30)
+                    return _consegna({"azione": "anomalie", "lat": punto[0], "lng": punto[1],
+                                      "anomalie": r})
+                r = c.comando("sar_anomalies_recent", {"limit": quante}, timeout=30)
+                return _consegna({"azione": "anomalie", "anomalie": r})
+
+            if azione == "scene":
+                r = c.comando("sar_scene_search",
+                              {"aoi_id": area, "limit": quante} if area else {"limit": quante},
+                              timeout=30)
+                return _consegna({"azione": "scene", "area": area or None, "scene": r})
+
+            if azione == "copertura":
+                r = c.comando("sar_coverage_for_aoi",
+                              {"aoi_id": area} if area else {}, timeout=30)
+                return _consegna({"azione": "copertura", "area": area or None, "copertura": r})
+
+            if azione == "aree":
+                return _consegna({"azione": "aree", "aree": c.comando("sar_aoi_list", {}, timeout=20)})
+        except Exception as e:
+            return _errore(f"osint_sar {azione}: {str(e)[:220]}")
+
+        # ── scritture ───────────────────────────────────────────────────
+        try:
+            if azione == "aggiungi_area":
+                punto = _punto_da(a)
+                if not punto:
+                    return _errore("osint_sar aggiungi_area: servono lat e lng (o un luogo noto)")
+                nome = str(a.get("nome") or a.get("luogo") or a.get("_testo") or area or "").strip()
+                ident = area or "".join(ch if ch.isalnum() else "_" for ch in nome.lower())[:32]
+                if not ident:
+                    return _errore("osint_sar aggiungi_area: serve un nome per l'area")
+                r = c.comando("sar_aoi_add", {
+                    "id": ident, "name": nome or ident,
+                    "center_lat": punto[0], "center_lon": punto[1],
+                    "radius_km": _numero(a.get("raggio_km"), 25, 1, 500),
+                }, timeout=30)
+                return _consegna({"azione": "aggiungi_area", "area": ident, "esito": r})
+
+            if not area:
+                return _errore(f"osint_sar {azione}: serve l'area (l'id da azione='aree')")
+
+            if azione == "rimuovi_area":
+                r = c.comando("sar_aoi_remove", {"id": area}, timeout=20)
+                return _consegna({"azione": "rimuovi_area", "area": area, "esito": r})
+            if azione == "sorveglia":
+                r = c.comando("sar_watch_anomaly", {"aoi_id": area}, timeout=20)
+                return _consegna({"azione": "sorveglia", "area": area, "esito": r})
+            # centra
+            r = c.comando("sar_focus_aoi", {"aoi_id": area,
+                                            "zoom": _numero(a.get("zoom"), 8, 1, 18)}, timeout=20)
+            return _consegna({"azione": "centra", "area": area, "esito": r})
+        except Exception as e:
+            return _errore_scrittura(f"osint_sar {azione}", e)
+
+
 SHADOWBROKER_TOOL_HANDLERS = {
     "osint_situazione": SituazioneTool().execute,
     "osint_notizie": NotizieTool().execute,
@@ -782,6 +1047,7 @@ SHADOWBROKER_TOOL_HANDLERS = {
     "osint_cyber": CyberTool().execute,
     "osint_radio": RadioTool().execute,
     "osint_satellite": SatelliteTool().execute,
+    "osint_sar": SarTool().execute,
     "fin_mercati": MercatiTool().execute,
     "fin_appalti": AppaltiTool().execute,
     "fin_insider": InsiderTool().execute,

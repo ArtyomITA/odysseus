@@ -8,7 +8,7 @@ from src.browser_tooling_constants import browser_adapters_disabled_by_raw
 from src.agent_tools import browser_tools as bt
 from src.agent_tools import ToolBlock
 from src.agent_loop import _select_browser_core_tools
-from src.tool_execution import execute_tool_block
+from src.tool_execution import NO_TOOL_SECURITY_CONTEXT, execute_tool_block
 from src.tool_security import email_tool_policy_names
 
 
@@ -352,6 +352,7 @@ def test_unsafe_gateway_and_runtime_require_explicit_user_intent(monkeypatch):
     _desc, denied_runtime = asyncio.run(execute_tool_block(
         ToolBlock("mcp__builtin_browser__browser_run_code_unsafe", "{}"),
         owner="admin",
+        security_context=NO_TOOL_SECURITY_CONTEXT,
     ))
     assert denied_runtime["exit_code"] == 1
     assert "explicit user request" in denied_runtime["error"]

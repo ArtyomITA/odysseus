@@ -18,7 +18,7 @@ _RECORD = {
 }
 
 
-def _replay_messages(round_response="", round_reasoning=""):
+def _replay_messages(round_response="", round_reasoning="", model_name=""):
     """Mirror the approved-action injection in stream_agent_loop."""
     messages = [
         {"role": "system", "content": "system preface"},
@@ -33,6 +33,7 @@ def _replay_messages(round_response="", round_reasoning=""):
         False,
         0,
         round_reasoning=round_reasoning,
+        model_name=model_name,
         tool_result_records=[_RECORD],
     )
     return messages
@@ -92,9 +93,20 @@ def test_reasoning_only_round_keeps_its_carrier_and_its_known_empty_content():
     request, and the approval replay never takes this path because it passes no
     reasoning. Left alone on purpose; this test makes the gap visible instead of
     silent, and should be updated by whoever closes it.
+
+    `_append_tool_results` now keeps `reasoning_content` in history only for
+    DeepSeek (every other model imitates the plan prose it echoes back
+    instead of emitting the next call), so this carrier only exists for a
+    DeepSeek model name; a non-DeepSeek model strips the reasoning and,
+    finding neither prose nor reasoning, appends no assistant turn at all.
     """
-    messages = _replay_messages(round_reasoning="thinking about it")
+    messages = _replay_messages(
+        round_reasoning="thinking about it", model_name="deepseek-v3.1"
+    )
     assistants = [m for m in messages if m.get("role") == "assistant"]
     assert len(assistants) == 1
     assert assistants[0].get("reasoning_content") == "thinking about it"
     assert assistants[0]["content"] == ""
+
+    non_deepseek_messages = _replay_messages(round_reasoning="thinking about it")
+    assert [m for m in non_deepseek_messages if m.get("role") == "assistant"] == []

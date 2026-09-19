@@ -57,4 +57,7 @@ def test_mcp_v2_snake_case_error_is_not_reported_as_success():
         "stdout": "",
         "stderr": "browser failed",
         "exit_code": 1,
+        # Fork-only: an MCP error body is attacker-influenced text, so it is
+        # tagged untrusted like every other external/error tool result.
+        "untrusted_content": True,
     }

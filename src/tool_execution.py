@@ -316,6 +316,15 @@ def _tool_path_roots() -> list[str]:
     # The rest of DATA_DIR is denied by _is_app_state_path.
     roots.extend(_agent_readable_data_subdirs())
 
+    # Vergilius: la VERA cartella temporanea del sistema. Su Windows "/tmp" si risolve in
+    # "<drive>:\tmp", che non esiste: senza questa riga ogni file sotto %TEMP% (upload,
+    # allegati, percorsi incollati dall'utente) veniva rifiutato dal confinamento.
+    try:
+        import tempfile as _tempfile
+        roots.append(_tempfile.gettempdir())
+    except Exception:
+        pass
+
     # /tmp (and its macOS realpath /private/tmp).
     roots.append("/tmp")
     try:

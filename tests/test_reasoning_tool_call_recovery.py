@@ -69,6 +69,14 @@ def test_recovered_call_threads_result_as_native_tool_observation():
         "role": "tool",
         "tool_call_id": converted[0]["id"],
         "content": "opened",
+        # browser_open results are brokered/external-untrusted, so
+        # _append_tool_results tags the tool-role message the same way a
+        # user-role untrusted-context message is tagged (fork security model).
+        "metadata": {
+            "trusted": False,
+            "source": "tool result: browser_open",
+            "tool_gate_untrusted": True,
+        },
     }
 
 
