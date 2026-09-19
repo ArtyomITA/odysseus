@@ -4597,6 +4597,13 @@ import { loadPanel } from './panels.js';
         }
       }
     } finally {
+      // L'avatar torna a riposo anche quando lo stream NON finisce con [DONE]:
+      // errore del fornitore, Stop premuto, connessione caduta. Senza questa
+      // riga restava a "pensa" per sempre, con la faccia bloccata.
+      // handleStreamEnd e' idempotente (setState scarta lo stato uguale).
+      if (_streamGenerations.get(streamSessionId) === streamGeneration) {
+        window.OdysseusAvatar?.handleStreamEnd();
+      }
       _cancelLiveThinkingWork();
       clearResponseTimeout();
       clearProcessingProbe();

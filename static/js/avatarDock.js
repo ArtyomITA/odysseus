@@ -59,7 +59,9 @@ async function mount() {
 
 function unmount() {
   if (dock) dock.hidden = true;
-  if (renderer?.app) renderer.app.destroy(false, { children: true });
+  // `destroy()` del renderer, non solo quello di PIXI: stacca anche
+  // l'ascoltatore di resize e libera la texture del modello.
+  renderer?.destroy();
   renderer = null;
 }
 

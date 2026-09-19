@@ -179,3 +179,8 @@ The project would not exist without them — credit where credit is due:
 - **Claude** (Anthropic)
 - **Codex** (OpenAI)
 - Friends, for helping me debug.
+
+## Vergilius fork: third-party artwork
+
+- **Live2D sample model "Niziiro Mao (PRO Version)"** in `static/live2d/mao_pro/`: illustration and modeling by Live2D Inc. It is NOT covered by this repository's AGPL-3.0 licence. Use requires accepting Live2D's "Free Material License Agreement" and "Terms of Use" (https://www.live2d.com/en/download/sample-data/): General Users and Small-Scale Enterprise Users may use it, including commercially; other parties only for internal or evaluation purposes. The original `ReadMe.txt` from Live2D is kept next to the model. To use a different character, replace the model folder: the avatar reads its parameters from `model3.json`.
+- **Live2D Cubism Core / runtime** in `static/lib/`: own licences (Live2D Proprietary Software License for Cubism Core).

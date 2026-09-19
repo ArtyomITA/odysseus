@@ -59,7 +59,11 @@ export class AvatarRenderer {
 
     this.app.stage.addChild(this.model);
     this._layout();
-    window.addEventListener('resize', () => this._layout());
+    // Riferimento tenuto da parte: senza, ogni accensione dell'avatar lascia un
+    // ascoltatore attaccato a un modello distrutto, e al primo ridimensionamento
+    // della finestra la console si riempie di errori.
+    this._suRidimensiona = () => this._layout();
+    window.addEventListener('resize', this._suRidimensiona);
 
     // beforeModelUpdate is the only hook that survives: parameters written on a
     // plain ticker get overwritten by the model's own update pass.
@@ -81,7 +85,7 @@ export class AvatarRenderer {
   // Frame the upper body: these models are full-height (mao_pro is 5800x8400),
   // so fitting the whole figure into a small dock leaves a face a few pixels tall.
   _layout() {
-    if (!this.model || !this.app) return;
+    if (!this.model || !this.app?.screen) return;
     const { width, height } = this.app.screen;
     const im = this.model.internalModel;
     this.model.anchor.set(0.5, 0.0);
@@ -119,12 +123,29 @@ export class AvatarRenderer {
 
   /** Follow a core instance (in-page) or the BroadcastChannel (widget). */
   bind(core) {
+    this._applica = (e) => this.apply(e.detail);
     if (core) {
-      core.addEventListener('command', (e) => this.apply(e.detail));
+      this._core = core;
+      core.addEventListener('command', this._applica);
       return this;
     }
-    const channel = new BroadcastChannel('odysseus-avatar');
-    channel.onmessage = (e) => this.apply(e.data);
+    this._canale = new BroadcastChannel('odysseus-avatar');
+    this._canale.onmessage = (e) => this.apply(e.data);
     return this;
+  }
+
+  /**
+   * Smonta tutto. La texture di mao_pro e' 4096x4096: lasciarla in giro a ogni
+   * accensione/spegnimento dell'avatar vuol dire ~67 MB di memoria video per
+   * giro, e il contesto WebGL che prima o poi si perde.
+   */
+  destroy() {
+    if (this._suRidimensiona) window.removeEventListener('resize', this._suRidimensiona);
+    if (this._core && this._applica) this._core.removeEventListener('command', this._applica);
+    try { this._canale?.close(); } catch { /* gia' chiuso */ }
+    try { this.model?.destroy({ children: true, texture: true, baseTexture: true }); } catch { /* gia' distrutto */ }
+    try { this.app?.destroy(false, { children: true, texture: true, baseTexture: true }); } catch { /* gia' distrutto */ }
+    this.model = null;
+    this.app = null;
   }
 }

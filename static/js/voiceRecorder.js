@@ -41,6 +41,10 @@ async function refreshSttProvider() {
     if (res.ok) {
       const stats = await res.json();
       _sttProvider = stats.provider || 'disabled';
+      // La lingua scelta nelle impostazioni va passata al riconoscitore in
+      // diretta: nessuno la pubblicava, e il microfono partiva sempre in
+      // italiano qualunque cosa ci fosse scritto in `stt_language`.
+      if (stats.language) window.OdysseusSttLanguage = stats.language;
       // Notify the send button to update its icon
       if (window._updateSendBtnIcon) window._updateSendBtnIcon();
     }
@@ -160,6 +164,26 @@ let _live = null;
 let _liveBase = '';          // what was already in the box when the mic opened
 let _liveParziale = '';      // the not-yet-final text currently shown
 
+// Invio automatico a fine turno. Il ponte decide da solo quando hai finito di
+// parlare (`fine_turno`): era esattamente per questo, ma il testo restava nella
+// casella in attesa di un click. Quel click e' il pezzo piu' lento di tutto il
+// giro della voce — leggere, spostare il mouse, premere — e vanifica i 900 ms
+// che il riconoscitore si e' sudato. Si spegne con
+// `localStorage['odysseus.stt.autoinvio'] = '0'`.
+const PREF_AUTOINVIO = 'odysseus.stt.autoinvio';
+
+function _autoinvioAcceso() {
+  return localStorage.getItem(PREF_AUTOINVIO) !== '0';
+}
+
+/** Manda quello che c'e' nella casella, come farebbe il pulsante. */
+function _inviaOra() {
+  const form = document.getElementById('chat-form');
+  if (!form) return;
+  if (form.requestSubmit) form.requestSubmit();
+  else form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+}
+
 /**
  * Paints the box as base + confirmed turns + current partial.
  *
@@ -193,6 +217,13 @@ function startLiveTranscription(showToast, showError) {
       _liveParziale = '';
       _dipingi(input);
       input.focus();
+      if (_autoinvioAcceso()) {
+        const daMandare = _liveBase;
+        // La casella riparte vuota: il turno successivo non deve rimandare la
+        // frase appena spedita.
+        _liveBase = '';
+        if (daMandare.trim()) _inviaOra();
+      }
     },
     onErrore: (msg) => {
       if (showError) showError('Trascrizione: ' + msg);
@@ -378,5 +409,11 @@ const voiceRecorderModule = {
   get _sttProvider() { return _sttProvider; },
   set _sttProvider(v) { _sttProvider = v; },
 };
+
+// settings.js e' un modulo a parte e cercava `window.voiceRecorderModule` per
+// aggiornare il fornitore appena lo cambi. Nessuno lo pubblicava: cambiare
+// fornitore nelle impostazioni non aveva effetto fino al ricaricamento della
+// pagina (sceglievi "in diretta" e il microfono continuava a registrare un file).
+window.voiceRecorderModule = voiceRecorderModule;
 
 export default voiceRecorderModule;

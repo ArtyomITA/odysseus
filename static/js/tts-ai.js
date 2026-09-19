@@ -15,6 +15,13 @@ class AITTSManager {
     // PocketTTS skips words past ~50 tokens per chunk; ~180 characters of
     // Italian sits comfortably under that.
     static MAX_SPEAK_CHARS = 180;
+    // Il PRIMO pezzo di un turno ha regole piu' larghe: e' l'unico la cui
+    // attesa l'utente sente come "silenzio dopo la risposta". Misurato: la
+    // prima virgola utile arriva ~0,3 s prima della prima frase intera, e la
+    // sintesi tiene (fattore tempo reale 0,56), quindi anticipare non crea
+    // buchi piu' avanti. Dal secondo pezzo si torna alle soglie normali,
+    // altrimenti la voce suona spezzettata per tutta la risposta.
+    static MIN_FIRST_SPEAK_CHARS = 6;
 
     constructor() {
         this.currentAudio = null;
@@ -275,7 +282,10 @@ class AITTSManager {
 
             this.currentAudio = new Audio(audioUrl);
             window.OdysseusAudioDevices?.applyOutputDevice(this.currentAudio);
-            window.OdysseusAvatar?.attachAudio(this.currentAudio);
+            // L'avatar e' un di piu': se inciampa non deve portarsi dietro la
+            // voce. Un errore qui dentro faceva fallire tutta la riproduzione.
+            try { window.OdysseusAvatar?.attachAudio(this.currentAudio); }
+            catch (e) { console.warn('avatar: aggancio fallito', e); }
             await this.currentAudio.play();
             this.isPlaying = true;
             // Note: onended should be set by the caller (addAITTSButton)
@@ -484,7 +494,11 @@ class AITTSManager {
                     // Queued playback is the path the read-aloud button and
                     // auto-speak use, so the avatar has to be tapped here too.
                     window.OdysseusAudioDevices?.applyOutputDevice(audio);
-                    window.OdysseusAvatar?.attachAudio(audio);
+                    // Dentro la Promise: un'eccezione dell'avatar qui faceva
+                    // saltare la riproduzione insieme alla bocca. L'avatar e'
+                    // accessorio, la voce no.
+                    try { window.OdysseusAvatar?.attachAudio(audio); }
+                    catch (e) { console.warn('avatar: aggancio fallito', e); }
                     audio.onended = () => {
                         this.isPlaying = false;
                         if (this.currentAudio === audio) this.currentAudio = null;
@@ -552,10 +566,13 @@ class AITTSManager {
      * The count of characters consumed is what the caller adds to its offset, so
      * every branch must push the text it consumed, whitespace included.
      */
-    _spezza(regione) {
+    _spezza(regione, primo) {
         var pezzi = [];
         var corrente = '';
-        var LOOK = AITTSManager.SUBSENTENCE_LOOKAHEAD;
+        // Sul primo pezzo del turno si taglia alla prima virgola utile senza
+        // pretendere che la frase continui: l'attesa qui e' quella che si sente.
+        var LOOK = primo ? 0 : AITTSManager.SUBSENTENCE_LOOKAHEAD;
+        var MINIMO = primo ? AITTSManager.MIN_FIRST_SPEAK_CHARS : AITTSManager.MIN_SPEAK_CHARS;
         var MAX = AITTSManager.MAX_SPEAK_CHARS;
 
         for (var i = 0; i < regione.length; i++) {
@@ -575,7 +592,7 @@ class AITTSManager {
             }
 
             if ((ch === ',' || ch === ';' || ch === ':') &&
-                corrente.trim().length >= AITTSManager.MIN_SPEAK_CHARS &&
+                corrente.trim().length >= MINIMO &&
                 resto >= LOOK) {
                 pezzi.push(corrente);
                 corrente = '';
@@ -607,7 +624,8 @@ class AITTSManager {
         // old code advanced by `trimmed.length + 1`, which assumes exactly one
         // separator character — a paragraph break ("\n\n") made it drift and
         // re-read a character every time.
-        var chunks = this._spezza(newRegion);
+        var primo = this._streamSentencesSent === 0;
+        var chunks = this._spezza(newRegion, primo);
 
         if (chunks.length === 0) return;
 
@@ -621,7 +639,9 @@ class AITTSManager {
         for (var j = 0; j < chunks.length; j++) {
             pending += chunks[j];
             pendingRaw += chunks[j].length;
-            if (pending.trim().length < AITTSManager.MIN_SPEAK_CHARS) continue;
+            var soglia = (primo && advancedChars === 0)
+                ? AITTSManager.MIN_FIRST_SPEAK_CHARS : AITTSManager.MIN_SPEAK_CHARS;
+            if (pending.trim().length < soglia) continue;
             var btn = this._streamButton || this._createPlaceholderButton();
             var resetFn = this._streamResetFn || function() {};
             this.enqueue(pending.trim(), btn, resetFn);
