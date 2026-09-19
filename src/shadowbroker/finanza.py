@@ -140,15 +140,95 @@ def _variazione(v: Dict[str, Any]) -> float:
         return 0.0
 
 
-def quotazione_titolo(titolo: str) -> Dict[str, Any]:
-    """Quotazione ESPLICITA di un titolo chiesto per nome o ticker (27 ago 2026).
+# Albero dei titoli noti: mercato -> comparto -> nome -> simbolo. Serve dove la ricerca Finnhub
+# "trova" ma sbaglia societa' (Leonardo -> Leonardo DRS, USA) o non trova nulla. Nomi in minuscolo.
+ALBERO_TITOLI: Dict[str, Dict[str, Dict[str, str]]] = {
+    "italia": {
+        "difesa_industria": {"leonardo": "LDO.MI", "fincantieri": "FCT.MI", "prysmian": "PRY.MI",
+                             "iveco": "IVG.MI", "stellantis": "STLAM.MI", "ferrari": "RACE.MI",
+                             "pirelli": "PIRC.MI", "stmicroelectronics": "STMMI.MI"},
+        "banche_assicurazioni": {"unicredit": "UCG.MI", "intesa sanpaolo": "ISP.MI", "intesa": "ISP.MI",
+                                 "generali": "G.MI", "mediobanca": "MB.MI", "banco bpm": "BAMI.MI",
+                                 "bper": "BPE.MI", "mps": "BMPS.MI", "monte dei paschi": "BMPS.MI",
+                                 "poste italiane": "PST.MI", "unipol": "UNI.MI"},
+        "energia_reti": {"eni": "ENI.MI", "enel": "ENEL.MI", "snam": "SRG.MI", "terna": "TRN.MI",
+                         "saipem": "SPM.MI", "tenaris": "TEN.MI", "a2a": "A2A.MI", "italgas": "IG.MI"},
+        "altro": {"telecom italia": "TIT.MI", "tim": "TIT.MI", "moncler": "MONC.MI", "campari": "CPR.MI",
+                  "amplifon": "AMP.MI", "recordati": "REC.MI", "nexi": "NEXI.MI"},
+        "indici": {"ftse mib": "FTSEMIB.MI"},
+    },
+    "europa": {
+        "difesa": {"rheinmetall": "RHM.DE", "bae systems": "BA.L", "thales": "HO.PA", "airbus": "AIR.PA",
+                   "saab": "SAAB-B.ST", "dassault aviation": "AM.PA", "safran": "SAF.PA"},
+        "altro": {"asml": "ASML.AS", "sap": "SAP.DE", "siemens": "SIE.DE", "lvmh": "MC.PA",
+                  "totalenergies": "TTE.PA", "shell": "SHEL.L", "volkswagen": "VOW3.DE", "nestle": "NESN.SW"},
+    },
+    "usa": {
+        "tecnologia": {"apple": "AAPL", "microsoft": "MSFT", "nvidia": "NVDA", "alphabet": "GOOGL",
+                       "google": "GOOGL", "amazon": "AMZN", "meta": "META", "tesla": "TSLA",
+                       "netflix": "NFLX", "amd": "AMD", "intel": "INTC", "palantir": "PLTR"},
+        "difesa": {"lockheed martin": "LMT", "lockheed": "LMT", "rtx": "RTX", "raytheon": "RTX",
+                   "northrop grumman": "NOC", "northrop": "NOC", "general dynamics": "GD",
+                   "boeing": "BA", "l3harris": "LHX", "leonardo drs": "DRS"},
+    },
+    "cripto": {
+        "principali": {"bitcoin": "BINANCE:BTCUSDT", "btc": "BINANCE:BTCUSDT", "ethereum": "BINANCE:ETHUSDT",
+                       "eth": "BINANCE:ETHUSDT", "solana": "BINANCE:SOLUSDT", "xrp": "BINANCE:XRPUSDT",
+                       "cardano": "BINANCE:ADAUSDT"},
+    },
+}
 
-    Nato dal caso «come e' andata Leonardo in borsa»: il paniere fisso non aveva
-    LDO e il modello inventava i prezzi o parlava di Palantir al suo posto. Qui
-    la risposta e' sempre esplicita: o i numeri Finnhub, o `disponibile: False`
-    con il motivo, cosi' il modello ha un fatto da riportare invece di un vuoto.
-    Nome -> simbolo via /search; preferiti i simboli senza suffisso di borsa
-    (quotati USA, dove la chiave gratuita risponde), poi gli altri.
+
+def _cerca_albero(nome: str) -> Optional[Tuple[str, str, str]]:
+    """(simbolo, mercato, comparto) per nome esatto, poi per nome contenuto. None se assente."""
+    n = " ".join(str(nome or "").lower().replace("s.p.a.", " ").replace(" spa", " ").split())
+    if not n:
+        return None
+    parziale = None
+    for mercato, comparti in ALBERO_TITOLI.items():
+        for comparto, nomi in comparti.items():
+            for k, sym in nomi.items():
+                if k == n:
+                    return sym, mercato, comparto
+                if parziale is None and len(n) >= 4 and (k.startswith(n) or n.startswith(k + " ")):
+                    parziale = (sym, mercato, comparto)
+    return parziale
+
+
+def _quota_yahoo(sym: str) -> Optional[Dict[str, Any]]:
+    """Ripiego senza chiave per i mercati che la chiave Finnhub gratuita non copre (Milano, Xetra,
+    Parigi, Londra). Prezzo e chiusura precedente dalle candele giornaliere."""
+    import json as _json
+    import urllib.parse
+    import urllib.request
+    url = ("https://query1.finance.yahoo.com/v8/finance/chart/"
+           + urllib.parse.quote(sym) + "?range=5d&interval=1d")
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=12) as r:
+        d = _json.loads(r.read().decode("utf-8", "replace"))
+    ris = ((d.get("chart") or {}).get("result") or [None])[0]
+    if not ris:
+        return None
+    meta = ris.get("meta") or {}
+    prezzo = meta.get("regularMarketPrice")
+    chiusure = [c for c in (((ris.get("indicators") or {}).get("quote") or [{}])[0].get("close") or []) if c]
+    prec = chiusure[-2] if len(chiusure) >= 2 else meta.get("chartPreviousClose")
+    if not prezzo or not prec:
+        return None
+    return {"prezzo": round(float(prezzo), 4), "chiusura_precedente": round(float(prec), 4),
+            "valuta": meta.get("currency") or "?", "borsa": meta.get("exchangeName"),
+            "descrizione": meta.get("longName") or meta.get("shortName"),
+            "massimo": meta.get("regularMarketDayHigh"), "minimo": meta.get("regularMarketDayLow")}
+
+
+def quotazione_titolo(titolo: str) -> Dict[str, Any]:
+    """Quotazione ESPLICITA di un titolo chiesto per nome o ticker.
+
+    Ordine (19 set 2026): 1) ticker scritto come tale; 2) ricerca Finnhub per nome; 3) albero dei
+    titoli noti, che VINCE sulla ricerca quando conosce il nome (la ricerca «trova» Leonardo DRS
+    per «Leonardo», Maui Land per «Apple») e la sostituisce quando la ricerca e' vuota.
+    Quotazione: Finnhub; se non copre il mercato, ripiego Yahoo. Ogni numero porta la sua unita':
+    il modello confondeva variazione assoluta e percentuale.
     """
     q = str(titolo or "").strip()
     fuori: Dict[str, Any] = {"titolo_richiesto": q}
@@ -157,25 +237,14 @@ def quotazione_titolo(titolo: str) -> Dict[str, Any]:
         return fuori
     try:
         sym = q.upper()
-        # 1. watchlist nota: "Apple" -> AAPL, "Nvidia" -> NVDA, "Bitcoin" -> BTC. Nessuna ricerca,
-        #    nessun equivoco (misurato: la ricerca dava Apple -> MLP, Bitcoin -> GBTC).
-        _noti = {v.lower(): k for k, v in NOMI.items()}
-        _noti.update({"raytheon": "RTX", "bitcoin": "BINANCE:BTCUSDT", "btc": "BINANCE:BTCUSDT",
-                      "ethereum": "BINANCE:ETHUSDT", "eth": "BINANCE:ETHUSDT", "alphabet": "GOOGL"})
-        _noto = _noti.get(q.lower())
-        if _noto:
-            sym = _noto
-            fuori["descrizione"] = q
-        # e' un ticker solo se l'utente lo ha scritto come tale (maiuscolo, corto, senza spazi):
-        # "Leonardo" e' un NOME e va cercato, "LDO.MI" o "AAPL" no.
-        if not _noto and (" " in q or not q.isupper() or not re.fullmatch(r"[A-Z0-9.\-]{1,8}", sym)):
-            r = _chiama("/search", {"q": q})
-            cands = [c for c in (r.get("result") or []) if isinstance(c, dict) and c.get("symbol")]
-            if not cands:
-                fuori.update(disponibile=False, motivo="nessun simbolo trovato per questo nome")
-                return fuori
-            # NON il ticker piu' corto (Apple -> MLP, Leonardo -> DRS): prima chi ha il nome che
-            # COMINCIA con la richiesta, poi titolo ordinario, poi senza suffisso di borsa.
+        e_ticker = (" " not in q and q.isupper() and bool(re.fullmatch(r"[A-Z0-9.:\-]{1,16}", sym)))
+        if not e_ticker:
+            cands: List[Dict[str, Any]] = []
+            try:
+                r = _chiama("/search", {"q": q})
+                cands = [c for c in (r.get("result") or []) if isinstance(c, dict) and c.get("symbol")]
+            except Exception:  # noqa: BLE001  la ricerca e' un aiuto, non un requisito
+                cands = []
             _ql = q.lower()
 
             def _voto(c):
@@ -184,30 +253,57 @@ def quotazione_titolo(titolo: str) -> Dict[str, Any]:
                         0 if str(c.get("type") or "").lower().startswith("common") else 1,
                         1 if "." in c["symbol"] else 0, len(d))
             cands.sort(key=_voto)
-            sym = cands[0]["symbol"]
-            fuori["descrizione"] = cands[0].get("description")
-            fuori["alternative"] = [f"{c['symbol']} = {c.get('description') or '?'}" for c in cands[1:5]]
-            if len(cands) > 1:
-                # "Leonardo" trova Leonardo DRS (USA) prima di LDO.MI (Milano): societa'
-                # DIVERSE. Il modello deve dire QUALE ha quotato, non spacciarla per l'altra.
-                fuori["avviso"] = (
-                    f"piu' titoli corrispondono a '{q}': quotato {sym} = "
-                    f"{cands[0].get('description') or '?'}. Di' esplicitamente quale titolo hai "
-                    f"quotato; se l'utente intendeva un altro, chiedi o usa il simbolo esatto."
-                )
-        v = _chiama("/quote", {"symbol": sym})
-        c = v.get("c") if isinstance(v, dict) else None
+            noto = _cerca_albero(q)
+            if noto:
+                sym = noto[0]
+                fuori["mercato"], fuori["comparto"] = noto[1], noto[2]
+                altri = [c for c in cands if c["symbol"] != sym][:4]
+            elif cands:
+                sym = cands[0]["symbol"]
+                fuori["descrizione"] = cands[0].get("description")
+                altri = cands[1:5]
+            else:
+                fuori.update(disponibile=False,
+                             motivo="nessun simbolo trovato per questo nome, ne' nella ricerca ne' tra i titoli noti; "
+                                    "chiedi all'utente il ticker esatto")
+                return fuori
+            if altri:
+                fuori["altri_titoli_con_nome_simile"] = [f"{c['symbol']} = {c.get('description') or '?'}" for c in altri]
+                fuori["avviso"] = f"quotato {sym}. Esistono altri titoli con nome simile: di' quale hai quotato."
         fuori["simbolo"] = sym
-        if not c:
+        prezzo = prec = None
+        if "." not in sym or ":" in sym:
+            try:
+                v = _chiama("/quote", {"symbol": sym}) or {}
+            except Exception:  # noqa: BLE001
+                v = {}
+            if isinstance(v, dict) and v.get("c"):
+                prezzo, prec = v.get("c"), v.get("pc")
+                fuori.update(fonte="Finnhub", valuta="USD", apertura=v.get("o"), massimo=v.get("h"), minimo=v.get("l"))
+        if not prezzo and ":" not in sym:
+            y = _quota_yahoo(sym)
+            if y:
+                prezzo, prec = y["prezzo"], y["chiusura_precedente"]
+                fuori.update(fonte="Yahoo Finance", valuta=y["valuta"], borsa=y.get("borsa"),
+                             massimo=y.get("massimo"), minimo=y.get("minimo"))
+                if y.get("descrizione"):
+                    fuori["descrizione"] = y["descrizione"]
+        if not prezzo:
             fuori.update(disponibile=False,
-                         motivo="quotazione non disponibile per questo simbolo (copertura della chiave: mercati USA); "
+                         motivo="quotazione non disponibile per questo simbolo da nessuna delle due fonti; "
                                 "dillo all'utente, non stimare il prezzo")
             return fuori
-        fuori.update(disponibile=True, prezzo=c, variazione_pct=v.get("dp"), variazione=v.get("d"),
-                     apertura=v.get("o"), massimo=v.get("h"), minimo=v.get("l"),
-                     chiusura_precedente=v.get("pc"), valuta="USD se simbolo senza suffisso")
+        val = fuori.get("valuta") or "?"
+        fuori.update(disponibile=True, prezzo=prezzo, chiusura_precedente=prec)
+        if prec:
+            d_ass = round(float(prezzo) - float(prec), 4)
+            d_pct = round(d_ass / float(prec) * 100, 2)
+            fuori["variazione_percento"] = d_pct
+            fuori["variazione_in_valuta"] = d_ass
+            fuori["leggi_cosi"] = (f"{fuori.get('descrizione') or q} ({sym}): {prezzo} {val}, oggi {d_pct:+.2f}% "
+                                   f"rispetto alla chiusura precedente, cioe' {d_ass:+.2f} {val} per azione")
     except Exception as e:  # noqa: BLE001
-        fuori.update(disponibile=False, motivo=f"errore Finnhub: {type(e).__name__}")
+        fuori.update(disponibile=False, motivo=f"errore della fonte dati: {type(e).__name__}")
     return fuori
 
 
@@ -317,7 +413,22 @@ def mercati(quante_notizie: int = 8, titolo: Optional[str] = None) -> Dict[str, 
         # IN TESTA, non in coda: l'harness taglia gli output lunghi e la risposta
         # alla domanda specifica dev'essere la prima cosa che il modello legge
         # (H3: tagliata a 3000 caratteri, il modello ha inventato il prezzo).
-        fuori = {"titolo_richiesto": quotazione_titolo(str(titolo)), **fuori}
+        quota = quotazione_titolo(str(titolo))
+        # Notizie DEL titolo, separate da quelle generali (19 set: il modello attribuiva a Meta una
+        # notizia su Netflix perche' l'elenco generale arrivava sotto la quotazione chiesta).
+        _sym = str(quota.get("simbolo") or "").split(".")[0].split(":")[-1].replace("USDT", "")
+        _parole = str(quota.get("descrizione") or titolo or "").lower().split()
+        _nome = _parole[0] if _parole else ""
+        sue = [n for n in notizie
+               if (n.get("ticker") or "") == _sym
+               or (len(_nome) >= 4 and _nome in str(n.get("title") or "").lower())]
+        quota["notizie_di_questo_titolo"] = (
+            [{"titolo": n.get("title"), "fonte": n.get("source"), "quando": n.get("published"), "url": n.get("url")}
+             for n in sue[:5]]
+            or "nessuna notizia collegata a questo titolo nel feed: dillo; per cercarne usa osint_notizie con soggetto")
+        generali = fuori.pop("notizie", [])
+        fuori["notizie_generali_di_mercato_NON_sul_titolo_richiesto"] = generali[:4]
+        fuori = {"titolo_richiesto": quota, **fuori}
     # Archivio storico: i picchi di oggi diventano eventi consultabili domani.
     # Lavora in un thread, un errore li' non tocca questa risposta.
     from src.shadowbroker import archivio
