@@ -24,7 +24,7 @@ def test_ask_user_close_button_uses_one_css_glyph():
     styles = (root / "static/style.css").read_text(encoding="utf-8")
 
     assert "closeBtn.className = 'modal-close ask-user-close';" in renderer
-    assert "closeBtn.setAttribute('aria-label', 'Dismiss question');" in renderer
+    assert "closeBtn.setAttribute('aria-label', 'Chiudi la domanda');" in renderer  # Vergilius fork: Italian label
     assert "closeBtn.textContent = '×';" not in renderer
     assert ".modal-close::before" in styles
 
@@ -88,16 +88,21 @@ def test_every_changed_approval_module_is_cache_busted_together():
     """
 
     root = Path(__file__).resolve().parents[1]
-    version = "20260819approvalcontrol1"
     index = (root / "static/index.html").read_text(encoding="utf-8")
     app = (root / "static/app.js").read_text(encoding="utf-8")
     chat = (root / "static/js/chat.js").read_text(encoding="utf-8")
     compare_index = (root / "static/js/compare/index.js").read_text(encoding="utf-8")
     compare_stream = (root / "static/js/compare/stream.js").read_text(encoding="utf-8")
 
-    assert f"chatStream.js?v={version}" in index
-    assert f"chatStream.js?v={version}" in chat
-    assert f"compare/index.js?v={version}" in app
-    assert f"stream.js?v={version}" in compare_index
+    # Vergilius fork: module specifiers carry no ?v= (one URL per module; static is served no-cache + etag).
+    assert "/static/js/chatStream.js" in index
+    assert "import chatStream from './chatStream.js';" in chat
+    assert "import compareModule from './js/compare/index.js';" in app
+    assert "from './stream.js';" in compare_index
     # One chatRenderer instance, so the ask_user keydown listener binds once.
-    assert f"chatRenderer.js?v={version}" in compare_stream
+    assert "from '../chatRenderer.js';" in compare_stream
+    assert "chatStream.js?v=" not in index
+    assert "chatStream.js?v=" not in chat
+    assert "compare/index.js?v=" not in app
+    assert "stream.js?v=" not in compare_index
+    assert "chatRenderer.js?v=" not in compare_stream

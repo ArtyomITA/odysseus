@@ -18,18 +18,20 @@ _SESSIONS = _REPO / "static" / "js" / "sessions.js"
 _SHELL_URL = (_REPO / "static" / "js" / "startupShell.js").as_uri()
 _HAS_NODE = shutil.which("node") is not None
 
+# Vergilius fork: module specifiers carry no ?v= (one URL per module; static is served no-cache + etag).
+# These keys must match today's real import lines in static/js/sessions.js exactly.
 _IMPORT_REWRITES = {
     "import Storage from './storage.js';": "import Storage from './storage.mjs';",
     "import uiModule, { autoResize, styledPrompt } from './ui.js';": (
         "import uiModule, { autoResize, styledPrompt } from './ui.mjs';"
     ),
-    "import chatRenderer from './chatRenderer.js?v=20260815toolapproval4';": (
+    "import chatRenderer from './chatRenderer.js';": (
         "import chatRenderer from './chatRenderer.mjs';"
     ),
     "import { providerLogo } from './providers.js';": (
         "import { providerLogo } from './providers.mjs';"
     ),
-    "import { initModelPicker, updateModelPicker } from './modelPicker.js?v=20260722ctxheader1';": (
+    "import { initModelPicker, updateModelPicker } from './modelPicker.js';": (
         "import { initModelPicker, updateModelPicker } from './modelPicker.mjs';"
     ),
     "import themeModule from './theme.js';": "import themeModule from './theme.mjs';",

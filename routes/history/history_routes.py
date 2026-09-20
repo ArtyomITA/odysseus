@@ -137,6 +137,12 @@ def setup_history_routes(session_manager, upload_handler=None) -> APIRouter:
                 meta = {}
         if m.timestamp and "timestamp" not in meta:
             meta["timestamp"] = m.timestamp.isoformat() + "Z"
+        # Id della riga, sempre. E' la chiave con cui l'interfaccia modifica,
+        # cancella e tronca: senza, restava solo la posizione della bolla, che
+        # non corrisponde a quella della riga salvata (un turno agente rende
+        # piu' bolle, e la storia arriva paginata). Questa e' la via da cui
+        # passa davvero il browser (chiede sempre con `limit`).
+        meta["_db_id"] = m.id
         if meta:
             entry["metadata"] = meta
         return entry
@@ -254,10 +260,34 @@ def setup_history_routes(session_manager, upload_handler=None) -> APIRouter:
         try:
             body = await request.json()
             keep_count = body.get("keep_count", 0)
+            # Troncamento a partire da un messaggio preciso, indicato dal suo id
+            # di riga. L'indice contato sulle bolle a schermo NON coincide con
+            # quello delle righe salvate: un turno agente puo' rendere piu'
+            # bolle, e la storia arriva paginata. Usando l'id il punto di taglio
+            # e' lo stesso per l'interfaccia e per il server.
+            from_msg_id = body.get("from_msg_id")
+            if from_msg_id:
+                db = SessionLocal()
+                try:
+                    righe = db.query(DbChatMessage).filter(
+                        DbChatMessage.session_id == session_id
+                    ).order_by(DbChatMessage.timestamp).all()
+                    posizione = next(
+                        (i for i, r in enumerate(righe) if str(r.id) == str(from_msg_id)),
+                        None,
+                    )
+                finally:
+                    db.close()
+                if posizione is None:
+                    raise HTTPException(404, "Message not found")
+                keep_count = posizione
             result = session_manager.truncate_messages(session_id, keep_count)
             return {"status": "ok", "kept": keep_count, "truncated": result}
         except KeyError:
             raise HTTPException(404, "Session not found")
+        except HTTPException:
+            # Gia' una risposta d'errore precisa: non va trasformata in 500.
+            raise
         except Exception as e:
             logger.error(f"Truncate error {session_id}: {e}")
             raise HTTPException(500, str(e))

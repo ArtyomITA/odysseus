@@ -347,12 +347,14 @@ def test_route_context_agent_frontend_and_cache_bust_wire_the_contract():
     assert "CHAT_SESSION_APPROVAL_CONTEXT_MARKER" in capabilities
     assert "CHAT_SESSION_APPROVAL_CONTEXT_MARKER" in models
 
-    version = "20260819approvalcontrol1"
-    # chatRenderer.js carries its own, later cache-bust tag (fork-only avatar
-    # emotion-name feature bumped it independently of chat.js's version).
-    renderer_version = "20260826emotionname1"
-    assert f"chat.js?v={version}" in app
-    assert f"chat.js?v={version}" in index
-    assert f"chatRenderer.js?v={renderer_version}" in frontend
-    assert f"chatRenderer.js?v={renderer_version}" in app
-    assert f"chatRenderer.js?v={renderer_version}" in index
+    # Vergilius fork: module specifiers carry no ?v= (one URL per module; static is served no-cache + etag).
+    assert "import chatModule from './js/chat.js';" in app
+    assert "/static/js/chat.js" in index
+    assert "import chatRenderer from './chatRenderer.js';" in frontend
+    assert "import chatRenderer from './js/chatRenderer.js';" in app
+    assert "/static/js/chatRenderer.js" in index
+    assert "chat.js?v=" not in app
+    assert "chat.js?v=" not in index
+    assert "chatRenderer.js?v=" not in frontend
+    assert "chatRenderer.js?v=" not in app
+    assert "chatRenderer.js?v=" not in index
