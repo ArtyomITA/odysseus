@@ -1104,10 +1104,10 @@ Use this instead of `bash`, `curl`, `python`, `requests`, or scraping code for w
 ```web_fetch
 <url or domain>
 ```
-Fetch and read the text content of a SPECIFIC URL the user names (e.g. "check example.com", "what does this page say <url>"). A bare domain like `example.com` works (defaults to https). Use this when you already have a concrete URL. For open-ended lookups use `web_search`, and for "research X" jobs use `trigger_research`.""",
+Download ONE specific URL as plain text, without a browser: fast, but many sites (Wikipedia, news, pages needing JS or cookies) refuse it or return nothing. A bare domain like `example.com` works (defaults to https). If the user asked to "apri"/"use the browser", or if this tool fails or comes back empty, call `browser_open` on the same URL instead of retrying. For open-ended lookups use `web_search`, and for "research X" jobs use `trigger_research`.""",
 
-    "browser_open": "- ```browser_open``` — Open an absolute http/https URL. Args: {\"url\":\"https://...\"}. Returns an accessibility tree with refs.",
-    "browser_read": "- ```browser_read``` — Read the current browser page. Args: {}. Prefer browser_find for a specific item.",
+    "browser_open": "- ```browser_open``` — Open an absolute http/https URL in a real browser. Args: {\"url\":\"https://...\"}. Slower than web_fetch but it gets through where web_fetch is refused; this is the tool for \"apri <url>\" and for any page web_fetch could not read. Returns the page tree with refs.",
+    "browser_read": "- ```browser_read``` — Read the readable TEXT of the open page (title + main article, no menus). Args: {} for the text, {\"refs\":true} for the element tree when you must click or type. Answer only from the text it returns.",
     "browser_find": "- ```browser_find``` — Find text in the current page tree. Args: {\"text\":\"...\"}. Returns exact refs.",
     "browser_click": "- ```browser_click``` — Click only an exact current ref. Args: {\"ref\":\"e12\"}. Never invent selectors or prose targets.",
     "browser_type": "- ```browser_type``` — Type at an exact current ref. Args: {\"ref\":\"e12\",\"text\":\"...\",\"submit\":false}.",

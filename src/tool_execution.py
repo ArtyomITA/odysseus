@@ -598,6 +598,220 @@ def _parse_qualified_mcp_args(tool: str, content: str) -> tuple[Dict, Optional[s
     return parsed, None
 
 
+# Vergilius: argomenti "punto dello schermo" dei tool Windows-MCP. Il modello
+# vede nello stesso paniere `browser_type(ref='e4')` e copia quella forma qui:
+# lato Windows-MCP `json.loads("e4")` sollevava un errore di sintassi JSON
+# illeggibile e il modello riprovava all'infinito (QA 20 set, turni PC-2b/PC-4).
+_WINDOWS_MCP_POINT_ARGS = ("loc", "from_loc", "to_loc")
+_WINDOWS_MCP_POINT_TOOLS = ("Click", "Type", "Scroll", "Move", "Drag")
+
+
+def _coerce_point(value: Any) -> Optional[list]:
+    """Accetta [x,y], (x,y), 'x,y', '[x, y]', {'x':..,'y':..}; altrimenti None."""
+    if isinstance(value, str):
+        testo = value.strip()
+        if not testo:
+            return None
+        if testo.startswith(("[", "(", "{")):
+            try:
+                value = json.loads(testo.replace("(", "[").replace(")", "]"))
+            except (json.JSONDecodeError, TypeError):
+                return None
+        else:
+            pezzi = [p for p in re.split(r"[,;x\s]+", testo) if p]
+            value = pezzi
+    if isinstance(value, dict):
+        if "x" not in value or "y" not in value:
+            return None
+        value = [value.get("x"), value.get("y")]
+    if isinstance(value, tuple):
+        value = list(value)
+    if not isinstance(value, list) or len(value) != 2:
+        return None
+    punto = []
+    for item in value:
+        if isinstance(item, bool):
+            return None
+        if isinstance(item, (int, float)):
+            punto.append(int(item))
+            continue
+        if isinstance(item, str) and item.strip().lstrip("+-").isdigit():
+            punto.append(int(item.strip()))
+            continue
+        return None
+    return punto
+
+
+def _normalize_windows_point_args(tool: str, args: Dict) -> tuple[Dict, Optional[str]]:
+    """Normalizza `loc` per i tool Windows-MCP, o spiega in inglese che cosa serve."""
+    bare = tool.rsplit("__", 1)[-1]
+    if bare not in _WINDOWS_MCP_POINT_TOOLS or not isinstance(args, dict):
+        return args, None
+    fixed = dict(args)
+    for key in _WINDOWS_MCP_POINT_ARGS:
+        if key not in fixed or fixed[key] is None:
+            continue
+        punto = _coerce_point(fixed[key])
+        if punto is None:
+            mostrato = str(fixed[key])[:60]
+            return args, (
+                f"{bare}: `{key}` must be a pair of SCREEN PIXELS, like "
+                f'"{key}": [742, 318]. Got {mostrato!r}, which is not a coordinate '
+                "pair: a browser ref (e4, ref_3), an element name or a window title "
+                "cannot be used on a desktop tool. Get the numbers first: call "
+                "`vista_schermo` and copy the (x, y) shown at the start of the "
+                "`albero_ui` line for that element, or `vista_trova` for an icon "
+                "the tree does not list. Browser refs belong to `browser_click`/"
+                "`browser_type`, never here."
+            )
+        fixed[key] = punto
+    return fixed, None
+
+
+# ---------------------------------------------------------------------------
+# Vergilius: guardia sulla finestra in primo piano (20 set 2026)
+# ---------------------------------------------------------------------------
+# Windows-MCP scrive dove c'e' il fuoco, non dove crede il modello. Durante il
+# giro 2 di QA un `Type` con il testo "12*12" e' finito nel terminale del
+# proprietario ed e' stato pure inviato con Invio. Un modello locale che
+# digita testo arbitrario in un terminale con permessi non e' un difetto
+# estetico: qui il lato Odysseus controlla il bersaglio PRIMA di ogni azione
+# di input, e rifiuta con un errore che dice come rimediare.
+
+# Processi che non devono MAI ricevere input sintetico: terminali, editor di
+# codice, l'agente stesso, i browser. Nome dell'immagine senza estensione.
+_FINESTRE_VIETATE = frozenset({
+    "windowsterminal", "openconsole", "conhost", "cmd", "powershell", "pwsh",
+    "code", "code - insiders", "codium", "devenv", "idea64", "pycharm64",
+    "claude", "node", "windowsterminalshellext", "wt",
+    "chrome", "msedge", "firefox", "brave", "opera",
+})
+
+# Nomi italiani del menu Start -> pezzo di nome del processo o del titolo.
+_ALIAS_FINESTRE = {
+    "blocco note": ("notepad",),
+    "calcolatrice": ("calculator", "calcolatrice"),
+    "esplora file": ("explorer",),
+    "paint": ("mspaint", "paint"),
+    "impostazioni": ("systemsettings", "impostazioni"),
+    "wordpad": ("wordpad",),
+}
+
+_WINDOWS_MCP_INPUT_TOOLS = ("Click", "Type", "Scroll", "Shortcut", "Drag", "Move")
+
+# Ultimo bersaglio dichiarato dal modello, per sessione: lo scrive un `App`
+# riuscito. Senza un bersaglio dichiarato non si scrive da nessuna parte.
+_BERSAGLIO_PC: Dict[str, str] = {}
+
+
+def _finestra_in_primo_piano() -> tuple[str, str]:
+    """(nome processo senza estensione, titolo) della finestra col fuoco."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return ("", "")
+    try:
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return ("", "")
+        lunghezza = user32.GetWindowTextLengthW(hwnd)
+        buffer = ctypes.create_unicode_buffer(lunghezza + 1)
+        user32.GetWindowTextW(hwnd, buffer, lunghezza + 1)
+        titolo = buffer.value or ""
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        processo = ""
+        if pid.value:
+            # PROCESS_QUERY_LIMITED_INFORMATION: basta per il nome immagine.
+            handle = kernel32.OpenProcess(0x1000, False, pid.value)
+            if handle:
+                try:
+                    dimensione = wintypes.DWORD(32768)
+                    percorso = ctypes.create_unicode_buffer(dimensione.value)
+                    if kernel32.QueryFullProcessImageNameW(
+                        handle, 0, percorso, ctypes.byref(dimensione)
+                    ):
+                        processo = os.path.basename(percorso.value)
+                finally:
+                    kernel32.CloseHandle(handle)
+        if processo.lower().endswith(".exe"):
+            processo = processo[:-4]
+        return (processo.lower(), titolo)
+    except Exception:
+        return ("", "")
+
+
+def _bersaglio_corrisponde(bersaglio: str, processo: str, titolo: str) -> bool:
+    atteso = str(bersaglio or "").strip().lower()
+    if not atteso:
+        return False
+    candidati = {atteso}
+    candidati.update(_ALIAS_FINESTRE.get(atteso, ()))
+    # Anche il nome senza estensione, per chi passa gia' "notepad.exe".
+    if atteso.endswith(".exe"):
+        candidati.add(atteso[:-4])
+    titolo_l = (titolo or "").lower()
+    for nome in candidati:
+        if not nome:
+            continue
+        if processo and (nome in processo or processo in nome):
+            return True
+        if nome in titolo_l:
+            return True
+    return False
+
+
+def _guardia_finestra_pc(tool: str, session_id: Optional[str]) -> Optional[str]:
+    """None se l'azione puo' partire, altrimenti l'errore da restituire."""
+    bare = tool.rsplit("__", 1)[-1]
+    if bare not in _WINDOWS_MCP_INPUT_TOOLS:
+        return None
+    processo, titolo = _finestra_in_primo_piano()
+    if not processo and not titolo:
+        return (
+            f"{bare}: the foreground window could not be read, so typing or "
+            "clicking is refused. Bring the target window to front with "
+            "App(mode='switch', name='<app>') and try again."
+        )
+    if processo in _FINESTRE_VIETATE:
+        return (
+            f"{bare}: refused. The foreground window belongs to '{processo}' "
+            f"(\"{titolo[:80]}\"), a terminal, editor or browser of the user. "
+            "Synthetic keystrokes and clicks are never sent there. Bring the "
+            "target application to front with App(mode='switch', name='<app>') "
+            "first, then look with vista_schermo and retry."
+        )
+    bersaglio = _BERSAGLIO_PC.get(str(session_id or ""), "")
+    if not bersaglio:
+        return (
+            f"{bare}: no target application has been declared in this chat yet, "
+            "so it is not safe to type or click: the keystrokes would go to "
+            "whatever window happens to have focus. Call "
+            "App(mode='launch'|'switch', name='<app>') first, then retry."
+        )
+    if not _bersaglio_corrisponde(bersaglio, processo, titolo):
+        return (
+            f"{bare}: refused. Foreground window is '{processo}' "
+            f"(\"{titolo[:80]}\"), not the target '{bersaglio}'. Bring the "
+            f"target to front with App(mode='switch', name='{bersaglio}') "
+            "first, check with vista_schermo, then retry."
+        )
+    return None
+
+
+def _ricorda_bersaglio_pc(tool: str, args: Dict, session_id: Optional[str], result: Dict) -> None:
+    """Un `App` riuscito dichiara il bersaglio delle azioni successive."""
+    if tool.rsplit("__", 1)[-1] != "App" or result.get("exit_code"):
+        return
+    nome = str((args or {}).get("name") or "").strip()
+    modo = str((args or {}).get("mode") or "").strip().lower()
+    if nome and modo in {"launch", "switch"}:
+        _BERSAGLIO_PC[str(session_id or "")] = nome
+
+
 def _parse_generate_image(content: str) -> Dict:
     lines = content.strip().split("\n")
     args = {"prompt": lines[0].strip() if lines else ""}
@@ -1360,7 +1574,24 @@ async def _execute_tool_block_impl(
                         },
                     )
                 else:
-                    result = await mcp.call_tool(tool, args)
+                    args, _loc_error = _normalize_windows_point_args(tool, args)
+                    _guardia = None if _loc_error else _guardia_finestra_pc(tool, session_id)
+                    if _loc_error or _guardia:
+                        _motivo = _loc_error or _guardia
+                        logger.warning("MCP %s rifiutato: %s", tool, _motivo)
+                        result = {"error": _motivo, "exit_code": 1}
+                    else:
+                        result = await mcp.call_tool(tool, args)
+                        _ricorda_bersaglio_pc(tool, args, session_id, result)
+                        # A7: l'errore di un tool MCP finiva solo come
+                        # exit_code=1, senza argomenti ne' messaggio.
+                        if result.get("exit_code"):
+                            logger.warning(
+                                "MCP %s fallito: args=%s esito=%s",
+                                tool,
+                                json.dumps(args, default=str)[:300],
+                                str(result.get("error") or result.get("stderr") or "")[:300],
+                            )
         else:
             desc = f"mcp: {tool}"
             result = {"error": "MCP manager not available", "exit_code": 1}
@@ -1415,7 +1646,7 @@ def format_tool_result(description: str, result: Dict) -> str:
     if "stdout" in result:
         if result["stdout"]:
             parts.append(f"**stdout:**\n```\n{result['stdout']}\n```")
-        if result["stderr"]:
+        if result.get("stderr"):
             parts.append(f"**stderr:**\n```\n{result['stderr']}\n```")
         parts.append(f"**exit_code:** {result.get('exit_code', 'unknown')}")
     elif "output" in result:

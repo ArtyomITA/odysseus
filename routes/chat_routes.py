@@ -174,9 +174,42 @@ def _mark_tool_approval_resolved(sess, approval_id: Any, decision: Any) -> bool:
         db.close()
 
 
-async def _tool_approval_resolution_stream(decision: str) -> AsyncGenerator[str, None]:
-    yield f"data: {json.dumps({'type': 'tool_approval_resolved', 'decision': decision})}\n\n"
+async def _tool_approval_resolution_stream(
+    decision: str,
+    nota: Optional[str] = None,
+) -> AsyncGenerator[str, None]:
+    # Vergilius: dopo un diniego il turno si chiudeva in silenzio e l'utente
+    # restava con un ragionamento a meta'. La riga viaggia con l'evento, cosi'
+    # la chat la mostra senza un altro giro di modello.
+    payload = {"type": "tool_approval_resolved", "decision": decision}
+    if nota:
+        payload["nota"] = nota
+    yield f"data: {json.dumps(payload)}\n\n"
     yield "data: [DONE]\n\n"
+
+
+# Nomi leggibili degli strumenti piu' visti nelle schede di approvazione.
+# Quelli che mancano si mostrano com'e' scritto il tool: meglio esatto che
+# inventato.
+_AZIONI_LEGGIBILI = {
+    "bash": "il comando di sistema",
+    "python": "il codice Python",
+    "web_fetch": "la lettura della pagina",
+    "web_search": "la ricerca sul web",
+    "browser_open": "l'apertura della pagina nel browser",
+    "write_file": "la scrittura del file",
+    "edit_file": "la modifica del file",
+    "create_document": "la creazione del documento",
+}
+
+
+def _frase_diniego(tool_name: Any) -> str:
+    nome = str(tool_name or "").strip()
+    if nome.startswith("mcp__windows__"):
+        etichetta = f"l'azione sul PC ({nome.rsplit('__', 1)[-1]})"
+    else:
+        etichetta = _AZIONI_LEGGIBILI.get(nome) or (f"`{nome}`" if nome else "l'azione richiesta")
+    return f"Non ho eseguito {etichetta}: richiesta negata."
 
 
 def _chat_candidate_request_factory(
@@ -1308,7 +1341,12 @@ def setup_chat_routes(
                     )
                 if decision == "deny":
                     return StreamingResponse(
-                        _tool_approval_resolution_stream(decision),
+                        _tool_approval_resolution_stream(
+                            decision,
+                            _frase_diniego(
+                                getattr(pending_tool_approval, "tool_name", "")
+                            ),
+                        ),
                         media_type="text/event-stream",
                     )
                 # Approval is a control-plane continuation, not a new user turn.
@@ -2573,6 +2611,7 @@ def setup_chat_routes(
                             from src.tool_index import ALWAYS_AVAILABLE
                             _vista = set(VISTA_TOOL_NAMES)
                             _pc = set()
+                            _windows_tutti = set()
                             try:
                                 from src.tool_utils import get_mcp_manager as _gmm
                                 _mm = _gmm()
@@ -2581,6 +2620,8 @@ def setup_chat_routes(
                                 for _t in (_mm.get_all_tools() if _mm else []):
                                     _qn = _t.get("qualified_name") or ""
                                     _nudo = _t.get("name") or _qn.rsplit("__", 1)[-1]
+                                    if _t.get("server_id") == "windows" or _qn.startswith("mcp__windows__"):
+                                        _windows_tutti.add(_qn)
                                     if computer_mode and _nudo in (
                                         "Snapshot", "Screenshot", "Click", "Type", "Scroll",
                                         "Shortcut", "Wait", "WaitFor", "App", "Scrape", "Clipboard",
@@ -2592,6 +2633,37 @@ def setup_chat_routes(
                             _forced_tools = set(_forced_tools or ()) | _forzati
                             if _disabled_finale:
                                 _disabled_finale = set(_disabled_finale) - _forzati
+                            # Vergilius: due mondi, mai nello stesso paniere.
+                            # Con Computer acceso il modello vedeva anche
+                            # `browser_type(ref='e4')` e copiava quella forma su
+                            # `mcp__windows__Type`, che vuole pixel: erano i
+                            # fallimenti di Click/Type del 20 set. Il paniere
+                            # dell'altro mondo si toglie, salvo quando la
+                            # richiesta parla esplicitamente di web o desktop.
+                            _testo_turno = str(message or "")
+                            _chiede_web = bool(re.search(
+                                r"https?://|\bbrowser\b|\bsit[oi]\b|\bpagin[ae]\b|"
+                                r"\bweb\b|\bonline\b|\binternet\b|\bwikipedia\b|"
+                                r"\.(?:it|com|org|net|eu)\b",
+                                _testo_turno, re.IGNORECASE,
+                            ))
+                            _chiede_desktop = bool(re.search(
+                                r"\bdesktop\b|\bfinestr[ae]\b|\bschermo\b|\bapp\b|"
+                                r"\bprogramm[ai]\b|\bblocco note\b|\bcalcolatrice\b",
+                                _testo_turno, re.IGNORECASE,
+                            ))
+                            _esclusi = set()
+                            if computer_mode and not browser_mode and not _chiede_web:
+                                _esclusi |= set(BROWSER_CORE_TOOL_NAMES)
+                            elif browser_mode and not computer_mode and not _chiede_desktop:
+                                _esclusi |= _windows_tutti
+                            _esclusi -= _forzati
+                            if _esclusi:
+                                _disabled_finale = set(_disabled_finale or ()) | _esclusi
+                                logger.info(
+                                    "[vista-mode] %d strumenti dell'altro mondo esclusi dal paniere",
+                                    len(_esclusi),
+                                )
                             logger.info("[vista-mode] %d occhi + %d tool PC/browser forzati", len(_vista), len(_pc))
                             # Computer/Browser accesi ma zero strumenti forzati
                             # = il server MCP non e' collegato. Prima passava

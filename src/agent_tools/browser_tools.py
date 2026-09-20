@@ -75,6 +75,54 @@ _REF_VALUE_RE = re.compile(r"^[A-Za-z]\d+(?:[A-Za-z]\d+)*$")
 _MAX_RESULT_CHARS = 24_000
 _MAX_TEXT_CHARS = 20_000
 
+# Vergilius: quanto testo leggibile si mostra di una pagina. Il taglio e'
+# sempre dalla TESTA (inizio dell'articolo), mai dalla coda: un articolo
+# comincia dove comincia, e la coda e' quasi sempre note e collegamenti.
+_MAX_PAGE_TEXT_CHARS = 9_000
+_MAX_PAGE_TEXT_IN_TREE = 4_000
+
+# Riga in inglese che accompagna ogni lettura: il modello deve rispondere SOLO
+# da questo testo. Senza, con l'albero di accessibilita' troncato, il 2,6B
+# riempiva i vuoti inventando (luogo di nascita di Virgilio, QA 20 set).
+LEGGI_COSI = (
+    "leggi_cosi: answer ONLY from the page text below. "
+    "If the answer is not in it, say you did not find it on the page and, "
+    "if useful, ask for another page. Never complete it from memory."
+)
+
+# Estrattore del contenuto principale. Gira nella pagina aperta ed e' una
+# COSTANTE nostra: il modello non puo' influenzarla in nessun punto, quindi
+# non apre la strada a Playwright arbitrario. Prende il primo contenitore
+# plausibile; se non c'e', sceglie per densita' di testo contro collegamenti
+# (i menu hanno tanti link e poco testo).
+_PAGE_TEXT_JS = (
+    "() => {\n"
+    "  const t = (document.title || '').trim();\n"
+    "  const sels = ['#mw-content-text', 'main', 'article', '[role=\"main\"]',"
+    " '#content', '#main-content', '#main'];\n"
+    "  let el = null;\n"
+    "  for (const s of sels) {\n"
+    "    const c = document.querySelector(s);\n"
+    "    if (c && (c.innerText || '').trim().length > 200) { el = c; break; }\n"
+    "  }\n"
+    "  if (!el) {\n"
+    "    let best = null, bs = 0;\n"
+    "    document.querySelectorAll('div,section').forEach(d => {\n"
+    "      const x = (d.innerText || '').trim();\n"
+    "      if (x.length < 200) return;\n"
+    "      const l = d.querySelectorAll('a').length;\n"
+    "      const s = x.length / (1 + l * 40);\n"
+    "      if (s > bs) { bs = s; best = d; }\n"
+    "    });\n"
+    "    el = best || document.body;\n"
+    "  }\n"
+    "  if (!el) return t;\n"
+    "  const x = (el.innerText || '').replace(/[ \\t]+\\n/g, '\\n')"
+    ".replace(/\\n{3,}/g, '\\n\\n').trim();\n"
+    "  return (t ? t + '\\n\\n' : '') + x;\n"
+    "}"
+)
+
 _state_lock = threading.Lock()
 _refs_by_session: Dict[str, frozenset[str]] = {}
 _active_session_key: Optional[str] = None
@@ -117,8 +165,13 @@ BROWSER_TOOL_SCHEMAS = [
     ),
     _schema(
         "browser_read",
-        "Read the whole current page as an accessibility tree with refs. For one specific word, link or field prefer browser_find (smaller, faster).",
-        {},
+        "Read the open page as readable text: title plus the main article, without menus or navigation. This is how you ANSWER a question about a page. Pass refs=true only when you must click or type and need the element ids.",
+        {
+            "refs": {
+                "type": "boolean",
+                "description": "false (default) = readable text of the page. true = accessibility tree with element refs, for acting.",
+            }
+        },
     ),
     _schema(
         "browser_find",
@@ -282,7 +335,13 @@ def _compact_result(
     return out
 
 
-async def _call_raw(raw_name: str, args: dict, ctx: Optional[dict]) -> dict:
+async def _call_raw(
+    raw_name: str,
+    args: dict,
+    ctx: Optional[dict],
+    *,
+    record_refs: bool = True,
+) -> dict:
     mgr = get_mcp_manager()
     available = _browser_raw_tools(ctx)
     qualified = available.get(raw_name)
@@ -292,7 +351,7 @@ async def _call_raw(raw_name: str, args: dict, ctx: Optional[dict]) -> dict:
             "exit_code": 1,
         }
     result = await mgr.call_tool(qualified, args)
-    return _compact_result(result, _session_key(ctx))
+    return _compact_result(result, _session_key(ctx), record_refs=record_refs)
 
 
 async def _reset_context_for_session_switch_unlocked(
@@ -499,18 +558,98 @@ async def _open(content: str, ctx: Optional[dict]) -> dict:
     # between the destructive reset and this assignment.
     with _state_lock:
         _active_session_key = session_key
-    if result.get("exit_code") or result.get("browser_ref_count"):
+    if not result.get("exit_code") and not result.get("browser_ref_count"):
+        result = await _call_raw("browser_snapshot", {}, ctx)
+    if result.get("exit_code"):
         return result
-    return await _call_raw("browser_snapshot", {}, ctx)
+    # Vergilius: l'albero da solo comincia con banner e menu, e il troncamento
+    # mangiava proprio l'articolo: chi apriva Wikipedia non leggeva una riga di
+    # testo e inventava la risposta. Il testo leggibile va in TESTA, i ref
+    # restano sotto per chi deve agire.
+    testo = await _page_text(ctx, _MAX_PAGE_TEXT_IN_TREE)
+    if testo:
+        result = dict(result)
+        result["stdout"] = (
+            LEGGI_COSI
+            + "\n\n--- page text ---\n"
+            + testo
+            + "\n\n--- elements (only for clicking or typing) ---\n"
+            + str(result.get("stdout") or "")
+        )
+    return result
+
+
+async def _page_text(ctx: Optional[dict], limit: int) -> Optional[str]:
+    """Testo leggibile del contenuto principale, o None se non ottenibile.
+
+    Usa `browser_evaluate` del server Playwright con una funzione COSTANTE
+    (vedi `_PAGE_TEXT_JS`): nessun pezzo arriva dal modello, quindi non e' una
+    scorciatoia verso la categoria `developer`. Se lo strumento non e'
+    collegato o e' disattivato dal proprietario, si ripiega sull'albero.
+    """
+    if "browser_evaluate" not in _browser_raw_tools(ctx):
+        return None
+    try:
+        # record_refs=False: la lettura del testo non e' uno snapshot e non
+        # deve cancellare i ref appena raccolti dall'albero.
+        result = await _call_raw(
+            "browser_evaluate", {"function": _PAGE_TEXT_JS}, ctx, record_refs=False
+        )
+    except Exception:
+        return None
+    if result.get("exit_code"):
+        return None
+    raw = str(result.get("stdout") or "").strip()
+    if not raw:
+        return None
+    # Playwright incornicia il valore restituito; si tiene solo la parte utile.
+    if "### Result" in raw:
+        raw = raw.split("### Result", 1)[1]
+    raw = raw.strip().strip("`").strip()
+    if raw.startswith('"') and raw.endswith('"') and len(raw) > 1:
+        try:
+            raw = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    raw = str(raw).strip()
+    if len(raw) < 80:
+        return None
+    if len(raw) > limit:
+        raw = raw[:limit].rstrip() + (
+            f"\n\n[Page text cut after {limit} characters, from the beginning. "
+            "Use browser_find for something further down.]"
+        )
+    return raw
 
 
 async def _read(content: str, ctx: Optional[dict]) -> dict:
-    _args, error = _decode_args(content, set())
+    args, error = _decode_args(content, {"refs"})
     if error:
         return {"error": error, "exit_code": 1}
     if access_error := _page_access_error(ctx):
         return {"error": access_error, "exit_code": 1}
-    return await _call_raw("browser_snapshot", {}, ctx)
+    refs = args.get("refs", False)
+    if isinstance(refs, str):
+        refs = refs.strip().lower() in {"1", "true", "yes", "on"}
+    if refs:
+        return await _call_raw("browser_snapshot", {}, ctx)
+    testo = await _page_text(ctx, _MAX_PAGE_TEXT_CHARS)
+    if testo is None:
+        # Ripiego onesto: l'albero, ma detto chiaramente che non e' prosa.
+        result = await _call_raw("browser_snapshot", {}, ctx)
+        if not result.get("exit_code"):
+            result["stdout"] = (
+                "[Readable page text is not available here; this is the element "
+                "tree, menus included.]\n\n" + str(result.get("stdout") or "")
+            )
+        return result
+    # Solo le chiavi che il formattatore dei risultati conosce: una chiave in
+    # piu' finirebbe in coda come JSON grezzo sotto gli occhi del modello.
+    return {
+        "stdout": LEGGI_COSI + "\n\n" + testo,
+        "stderr": "",
+        "exit_code": 0,
+    }
 
 
 async def _find(content: str, ctx: Optional[dict]) -> dict:

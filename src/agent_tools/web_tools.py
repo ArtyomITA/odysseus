@@ -136,13 +136,37 @@ class WebFetchTool:
         title = result.get("title") or ""
 
         if not text:
+            # Vergilius: un 403/429 o una pagina vuota non sono la fine della
+            # strada: il browser vero apre quasi sempre la stessa pagina. Il
+            # messaggio lo dice al modello in modo eseguibile, altrimenti
+            # insiste su web_fetch o inventa il contenuto.
+            err_txt = str(err or "")
+            retry_hint = (
+                f' Retry the same page with browser_open {{"url": "{url}"}}: '
+                "it uses a real browser and usually gets through. "
+                "Do not answer from memory."
+            )
             if err:
+                blocked = ("403" in err_txt) or ("429" in err_txt) or ("Rate limit" in err_txt)
                 return {
-                    "error": f"web_fetch: {url}: {err}",
+                    "error": (
+                        f"web_fetch: {url}: {err}"
+                        + (
+                            " The site refused this non-browser request." + retry_hint
+                            if blocked
+                            else retry_hint
+                        )
+                    ),
                     "exit_code": 1,
                     "untrusted_content": True,
                 }
-            return {"error": f"web_fetch: {url}: no readable text content (not HTML, or the page needs JS/login)", "exit_code": 1}
+            return {
+                "error": (
+                    f"web_fetch: {url}: no readable text content "
+                    "(not HTML, or the page needs JS/login)." + retry_hint
+                ),
+                "exit_code": 1,
+            }
 
         # Tell the model when the download budget cut the body short and how
         # to get the rest, instead of silently presenting a partial page as

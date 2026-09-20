@@ -94,6 +94,14 @@ WEB_FETCH_USER_AGENT = os.environ.get(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
 )
+# Vergilius: alcuni siti (Wikimedia in testa) rispondono 403 a uno User-Agent
+# che IMITA un browser senza esserlo, e accettano invece un UA descrittivo con
+# un contatto, come chiede la loro robot policy. Usato solo come secondo
+# tentativo dopo un 403/429, mai come UA principale.
+WEB_FETCH_FALLBACK_USER_AGENT = os.environ.get(
+    "WEB_FETCH_FALLBACK_USER_AGENT",
+    "VergiliusAssistant/1.0 (local personal assistant; +https://github.com/vergilius)",
+)
 
 # Environment variables with defaults
 DEFAULT_HOST = os.getenv("LLM_HOST", "localhost")

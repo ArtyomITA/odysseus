@@ -3008,6 +3008,12 @@ import { loadPanel } from './panels.js';
                 if (spinner && spinner.element) spinner.destroy();
                 if (!_isBg && roundHolder && roundHolder !== holder) roundHolder.remove();
                 if (!_isBg && holder) holder.remove();
+                // Vergilius: dopo un diniego il turno finiva in silenzio e
+                // l'ultima cosa a schermo era un pensiero a meta'. La riga
+                // arriva gia' pronta dal server: nessun altro giro di modello.
+                if (!_isBg && json.decision === 'deny' && json.nota) {
+                  try { addMessage('assistant', String(json.nota)); } catch (_) { /* renderer non pronto */ }
+                }
                 continue;
               }
               if (json.delta) {

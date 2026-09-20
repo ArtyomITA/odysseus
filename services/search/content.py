@@ -12,7 +12,12 @@ from typing import List
 import httpx
 from bs4 import BeautifulSoup
 
-from src.constants import WEB_FETCH_SOFT_MAX_BYTES, WEB_FETCH_HARD_MAX_BYTES, WEB_FETCH_USER_AGENT
+from src.constants import (
+    WEB_FETCH_SOFT_MAX_BYTES,
+    WEB_FETCH_HARD_MAX_BYTES,
+    WEB_FETCH_USER_AGENT,
+    WEB_FETCH_FALLBACK_USER_AGENT,
+)
 from src import outbound_fetch as _outbound_fetch
 
 from .analytics import RateLimitError, error_logger
@@ -223,6 +228,27 @@ def fetch_webpage_content(url: str, timeout: int = 5, retry_attempt: int = 0,
         }
         response = _get_public_url(url, headers=headers, timeout=timeout,
                                    max_bytes=effective_cap)
+
+        # Vergilius: 403/429 con lo UA da browser = il sito riconosce un client
+        # che finge. Un solo secondo tentativo con uno UA descrittivo e un
+        # contatto (quello che le robot policy chiedono davvero) recupera i
+        # casi come Wikipedia, che altrimenti rispondeva sempre 403.
+        if (
+            response.status_code in (403, 429)
+            and WEB_FETCH_FALLBACK_USER_AGENT
+            and headers.get("User-Agent") != WEB_FETCH_FALLBACK_USER_AGENT
+        ):
+            _retry_headers = dict(headers)
+            _retry_headers["User-Agent"] = WEB_FETCH_FALLBACK_USER_AGENT
+            try:
+                _retry = _get_public_url(url, headers=_retry_headers,
+                                         timeout=timeout, max_bytes=effective_cap)
+            except Exception as _retry_err:  # rete/limiti: tiene la prima risposta
+                logger.debug(f"Fallback UA retry failed for {url}: {_retry_err}")
+            else:
+                if _retry.status_code < 400:
+                    logger.info(f"Fallback UA recovered {url} (was HTTP {response.status_code})")
+                    response = _retry
 
         if response.status_code == 429:
             raise RateLimitError(f"Rate limit hit for {url} (attempt {retry_attempt})")
