@@ -336,6 +336,40 @@ import { loadPanel } from './panels.js';
     } catch (_) {}
   }
   let _pendingContinue = null; // Stores the stopped AI element to merge with new response
+  // Bolla utente del turno in corso, in attesa del suo id di riga.
+  let _pendingUserBubble = null;
+
+  /** Collega alla bolla utente del turno il suo id di riga nel database.
+   *  Il flusso annuncia solo l'id del messaggio dell'assistente; la riga
+   *  dell'utente e' quella salvata subito prima, e la si prende dalla storia
+   *  (una richiesta piccola, solo quando serve davvero). */
+  async function _attachUserMessageDbId(assistantDbId) {
+    const pend = _pendingUserBubble;
+    _pendingUserBubble = null;
+    if (!pend || !pend.el || !pend.el.isConnected) return;
+    if (pend.el.dataset.dbId) return;
+    const sid = pend.sessionId;
+    if (!sid) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/history/${encodeURIComponent(sid)}?limit=6`, { credentials: 'same-origin' });
+      if (!res.ok) return;
+      const data = await res.json();
+      const rows = Array.isArray(data.history) ? data.history : [];
+      let cut = rows.length;
+      if (assistantDbId != null) {
+        const at = rows.findIndex(r => String((r.metadata || {})._db_id) === String(assistantDbId));
+        if (at >= 0) cut = at;
+      }
+      for (let i = cut - 1; i >= 0; i -= 1) {
+        if (rows[i].role !== 'user') continue;
+        const rid = (rows[i].metadata || {})._db_id;
+        if (rid != null && pend.el.isConnected && !pend.el.dataset.dbId) {
+          pend.el.dataset.dbId = String(rid);
+        }
+        return;
+      }
+    } catch (_) { /* senza id si ricade sull'indice di bolla, come prima */ }
+  }
   function _createChatSendPerf() {
     const started = (performance && performance.now) ? performance.now() : Date.now();
     let last = started;
@@ -1616,6 +1650,11 @@ import { loadPanel } from './panels.js';
       let _userMsgEl = null;
       if (!skipBubble) {
         _userMsgEl = addMessage('user', userDisplay, null, _pendingAttachInfo ? { attachments: _pendingAttachInfo } : null);
+        // La bolla dell'utente appena inviata non riceveva nessun id di riga
+        // (solo quella dell'assistente, via `message_saved`), quindi modifica e
+        // cancella ricadevano sull'indice di bolla finche' non si ricaricava.
+        // La teniamo da parte: al `message_saved` le colleghiamo il suo id.
+        try { _pendingUserBubble = { el: _userMsgEl, sessionId: sessionModule.getCurrentSessionId() }; } catch (_) {}
       }
       _sendPerf.mark('user_bubble_visible');
       messageInput.value = approvalForSend ? (approvalForSend.draft || '') : '';
@@ -3594,6 +3633,7 @@ import { loadPanel } from './panels.js';
                 // can be edited/deleted immediately, without reloading the chat.
                 if (_isBg) continue;
                 if (holder && json.id) holder.dataset.dbId = json.id;
+                _attachUserMessageDbId(json.id);
 
               } else if (json.type === 'tool_start') {
                 _closeOpenThinkingMarkup(_isBg);
@@ -3736,6 +3776,20 @@ import { loadPanel } from './panels.js';
 
               } else if (json.type === 'tool_output') {
                 if (_isBg) continue;
+                // Vergilius: l'esito di uno strumento viene annunciato al resto
+                // della pagina. Nessuna logica qui: se ne serve una (per ora:
+                // aprire da sola la mappa quando il modello l'ha appena mossa)
+                // sta in chi ascolta, non in chat.js.
+                try {
+                  window.dispatchEvent(new CustomEvent('vergilius:strumento-esito', {
+                    detail: {
+                      tool: json.tool || '',
+                      argomenti: json.command || '',
+                      esito: json.output || '',
+                      codice: json.exit_code,
+                    },
+                  }));
+                } catch (_) {}
                 // --- Update the current thread node ---
                 if (currentToolBubble) {
                   // Stop wave animation + the per-second cooking ticker

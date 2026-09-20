@@ -552,6 +552,147 @@ export async function mostraConfigFinancial() {
   });
 }
 
+// ── la mappa che si apre da sola ─────────────────────────────────────────
+// Il segnale NON e' il testo dell'utente: "passo da Odessa in aereo" non e'
+// una richiesta di mappa, e un riconoscitore di frasi geografiche sbaglia in
+// entrambi i versi. Il segnale e' il fatto compiuto: il modello ha appena
+// mosso o segnato la vista con `osint_mappa`. Allora il pannello si apre una
+// volta sola nel turno, cosi' l'utente VEDE cio' che e' appena successo.
+//
+// Solo eventi vivi del turno (`vergilius:strumento-esito`, emesso da
+// chat.js): rileggendo una conversazione vecchia non si apre niente.
+
+const PREF_AUTO = 'odysseus.osint.automappa';
+
+// Azioni che muovono o segnano la vista. Fuori restano `note` (che elenca e
+// basta), `ripristina` e `cancella_nota`: non c'e' niente di nuovo da vedere.
+const _AZIONI_VISTA = new Set([
+  'centra', 'focus', 'vola', 'evidenzia', 'highlight',
+  'livelli', 'layers', 'mostra_solo', 'preset', 'profilo', 'nota', 'annota',
+]);
+
+let _apertaInQuestoTurno = false;
+
+export function automappaAttiva() {
+  // Predefinita ACCESA: vale finche' non la si spegne esplicitamente.
+  return localStorage.getItem(PREF_AUTO) !== '0';
+}
+
+function _aggiornaPulsanteAuto() {
+  const b = document.getElementById('overflow-automappa-btn');
+  if (!b) return;
+  const on = automappaAttiva();
+  b.classList.toggle('active', on);
+  b.title = on
+    ? 'La mappa si apre da sola quando il modello la usa davvero'
+    : 'La mappa non si apre da sola: la apri tu dalla barra';
+}
+
+export function impostaAutomappa(on) {
+  try { localStorage.setItem(PREF_AUTO, on ? '1' : '0'); } catch (_) {}
+  _aggiornaPulsanteAuto();
+  try {
+    window.uiModule?.showToast?.(on
+      ? 'La mappa si aprirà da sola quando il modello la usa'
+      : 'La mappa non si aprirà più da sola');
+  } catch (_) {}
+}
+
+function _profiloSenzaShadowBroker() {
+  // profilo.js marca cosi' i comandi che il profilo di avvio non prevede.
+  const b = document.getElementById('rail-shadowbroker');
+  return !b || !!b.getAttribute('data-profilo-nascosto');
+}
+
+function _luogoDa(dati, argomenti) {
+  const v = dati && dati.luogo_verificato;
+  if (typeof v === 'string' && v.trim()) return v.split(',')[0].trim();
+  for (const k of ['luogo', 'nome', 'preset', 'testo']) {
+    const x = argomenti && argomenti[k];
+    if (typeof x === 'string' && x.trim()) return x.trim();
+  }
+  if (dati && dati.azione === 'evidenzia') return `${dati.quanti || 0} punti`;
+  if (dati && dati.azione) return String(dati.azione);
+  return 'vista aggiornata';
+}
+
+/**
+ * Ripete UNA volta il centramento, quando l'iframe e' appena nato.
+ *
+ * Le azioni dell'agente vivono in un anello con un cursore per ogni vista
+ * (shadowbroker/backend/routers/ai_intel.py, `wait_agent_actions`): una vista
+ * nuova chiede `after=-1` e riceve **solo** il cursore corrente, quindi tutto
+ * cio' che e' passato prima che nascesse e' perso. Il `map_focus` parte dal
+ * server mentre l'iframe non esiste ancora: senza questa ripetizione la mappa
+ * si aprirebbe dove stava prima.
+ *
+ * L'attesa e' lunga di proposito, e misurata. Non basta che il polling sia
+ * acceso (`secondaryBootReady`, fino a 6,4 s dopo il montaggio, page.tsx riga
+ * 320): il centramento viene buttato via anche dopo, perche' MaplibreViewer
+ * esce subito se la mappa non c'e' ancora (`if (!flyToLocation ||
+ * !mapRef.current) return`, MaplibreViewer.tsx riga 763) e quell'effetto non
+ * riparte da solo. Provato dal vivo: a 8 s dal caricamento il comando si
+ * perde, a 24 s arriva. Si sta larghi. Non e' un ritardo percepito: la mappa
+ * impiega comunque una ventina di secondi a disegnarsi.
+ */
+function _ripetiFocus(frame, lat, lng, zoom) {
+  if (!frame) return;
+  frame.addEventListener('load', () => {
+    setTimeout(() => {
+      fetch('/api/shadowbroker/focus', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ lat, lng, zoom: zoom || 6 }),
+      }).catch(() => { /* mappa spenta: si tace */ });
+    }, 25000);
+  }, { once: true });
+}
+
+async function _daStrumento(ev) {
+  const d = (ev && ev.detail) || {};
+  if (String(d.tool || '') !== 'osint_mappa') return;
+  // Solo le chiamate RIUSCITE: un errore non ha mosso niente da mostrare.
+  if (d.codice != null && d.codice !== 0) return;
+  let dati = null;
+  try { dati = JSON.parse(String(d.esito || '')); } catch (_) { return; }
+  if (!dati || typeof dati !== 'object') return;
+  if (!_AZIONI_VISTA.has(String(dati.azione || '').toLowerCase())) return;
+  if (!automappaAttiva()) return;
+  if (_apertaInQuestoTurno) return;
+  if (_open) {
+    // Gia' aperto: la vista si sposta da sola, non si riapre niente. Il
+    // permesso del turno si consuma lo stesso, cosi' chiudendolo a mano a
+    // meta' turno non riparte da capo alla chiamata successiva.
+    _apertaInQuestoTurno = true;
+    return;
+  }
+  if (_profiloSenzaShadowBroker()) return;
+  // Cruscotto spento: non si apre niente e non si fa rumore.
+  const salute = await _probe();
+  if (!salute || !salute.frontend) return;
+  // Il pannello copre l'area della chat, barra di composizione compresa: se
+  // l'utente sta scrivendo gli si toglierebbe il testo da sotto le dita.
+  const att = document.activeElement;
+  if (att && att.id === 'message' && String(att.value || '').trim()) return;
+
+  _apertaInQuestoTurno = true;
+  const nuovo = !(_frame && _frame.isConnected);
+  await open();
+
+  let argomenti = null;
+  try { argomenti = JSON.parse(String(d.argomenti || '')); } catch (_) {}
+  const lat = Number(dati.lat), lng = Number(dati.lng);
+  if (nuovo && Number.isFinite(lat) && Number.isFinite(lng)) {
+    _ripetiFocus(_frame, lat, lng, Number(argomenti && argomenti.zoom) || 6);
+  }
+  try {
+    window.uiModule?.showToast?.(`Mappa aperta: ${_luogoDa(dati, argomenti)}`, {
+      duration: 7000, action: 'Chiudi', onAction: () => close(),
+    });
+  } catch (_) {}
+}
+
 export function init() {
   const { railBtn, toolBtn, closeBtn, externalBtn } = _els();
   const modoBtn = document.getElementById('overflow-osint-btn');
@@ -576,6 +717,21 @@ export function init() {
     });
     _aggiornaPulsanteFin();
   }
+  // Interruttore "Apri la mappa da sola": vive accanto a Intelligence e
+  // Financial nel menu "+", perché è della stessa famiglia.
+  const autoBtn = document.getElementById('overflow-automappa-btn');
+  if (autoBtn) {
+    autoBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      impostaAutomappa(!automappaAttiva());
+    });
+  }
+  _aggiornaPulsanteAuto();
+  window.addEventListener('vergilius:strumento-esito', _daStrumento);
+  // Inizio di un turno nuovo: torna buono il permesso di aprirsi una volta.
+  window.addEventListener('odysseus:chat-busy-change', (e) => {
+    if (e && e.detail && e.detail.active) _apertaInQuestoTurno = false;
+  });
   // Nessun popup all'avvio: compariva da solo anche sopra una risposta in
   // corso e, essendo un velo a tutto schermo, si prendeva il primo clic
   // destinato ad altro (il pannello ShadowBroker ci finiva sotto).
@@ -649,6 +805,7 @@ const shadowbrokerModule = {
   init, open, close, toggle, isOpen,
   modoAttivo, impostaModo,
   financialAttivo, impostaFinancial, mostraConfigFinancial,
+  automappaAttiva, impostaAutomappa,
 };
 try { window.OdysseusShadowBroker = shadowbrokerModule; } catch (_) {}
 export default shadowbrokerModule;

@@ -122,6 +122,49 @@ def _register(router: APIRouter) -> None:
             return {"ok": False, "detail": f"{type(exc).__name__}"}
         return {"ok": True, "preset": nome, "livelli": livelli, "esito": esito}
 
+    @router.post("/shadowbroker/focus")
+    async def shadowbroker_focus(request: Request) -> Dict[str, Any]:
+        """Ripete un `map_focus` che il cruscotto non poteva ancora ricevere.
+
+        Le azioni dell'agente vivono in un anello con un cursore per ogni
+        vista (shadowbroker/backend/routers/ai_intel.py, `wait_agent_actions`):
+        una vista appena nata chiede `after=-1` e riceve **solo** il cursore
+        corrente, quindi tutto cio' che e' passato prima di lei e' perso. Il
+        comando parte dal server mentre l'iframe non esiste ancora: senza una
+        ripetizione la mappa si aprirebbe dove stava prima.
+
+        Il browser conosce lat/lng/zoom dall'esito dello strumento e li
+        rimanda qui una volta sola, a caricamento finito. Fallisce in
+        silenzio: se la mappa non c'e', il turno resta valido lo stesso.
+        """
+        _require_user(request)
+        try:
+            corpo = await request.json()
+        except Exception:
+            corpo = {}
+        try:
+            lat = float((corpo or {}).get("lat"))
+            lng = float((corpo or {}).get("lng"))
+        except (TypeError, ValueError):
+            return {"ok": False, "detail": "servono lat e lng numerici"}
+        try:
+            zoom = float((corpo or {}).get("zoom") or 6.0)
+        except (TypeError, ValueError):
+            zoom = 6.0
+        try:
+            from src.shadowbroker.client import get_client
+        except Exception as exc:
+            return {"ok": False, "detail": f"ponte non disponibile: {type(exc).__name__}"}
+        try:
+            import asyncio
+            esito = await asyncio.to_thread(
+                get_client().comando, "map_focus",
+                {"lat": lat, "lng": lng, "zoom": zoom}, 15)
+        except Exception as exc:
+            logger.info("[shadowbroker] focus ripetuto non applicato: %s", exc)
+            return {"ok": False, "detail": f"{type(exc).__name__}"}
+        return {"ok": True, "lat": lat, "lng": lng, "zoom": zoom, "esito": esito}
+
     @router.post("/shadowbroker/start")
     async def shadowbroker_start(request: Request) -> Dict[str, Any]:
         """Avvia backend e cruscotto ShadowBroker se sono spenti.
