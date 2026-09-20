@@ -148,7 +148,10 @@ def setup_history_routes(session_manager, upload_handler=None) -> APIRouter:
         return entry
 
     @router.get("/api/history/{session_id}")
-    async def get_session_history(
+    # Sincrona per lo stesso motivo del contesto qui sotto: usa SQLAlchemy
+    # bloccante e non ha alcun `await`. Nel pool di thread non ferma il ciclo
+    # di eventi e non resta in coda dietro a un'altra rotta lenta.
+    def get_session_history(
         request: Request,
         session_id: str,
         limit: Optional[int] = None,
@@ -692,7 +695,12 @@ def setup_history_routes(session_manager, upload_handler=None) -> APIRouter:
             raise HTTPException(500, f"Topic analysis failed: {e}")
 
     @router.get("/api/session/{session_id}/context")
-    async def get_session_context_usage(request: Request, session_id: str) -> Dict[str, Any]:
+    # Volutamente sincrona: dentro ci sono letture di DB e una chiamata HTTP a
+    # llama-swap (/props) che bloccano. Da `async def` restavano sul ciclo di
+    # eventi e fermavano TUTTO il server per ~1,6 s all'avvio, ritardando la
+    # storia della chat che parte nello stesso istante. Cosi' finisce nel pool
+    # di thread e le altre richieste passano.
+    def get_session_context_usage(request: Request, session_id: str) -> Dict[str, Any]:
         """Return an estimated whole-chat context usage for the session's model.
 
         Streaming footers report the prompt size for the last request. This

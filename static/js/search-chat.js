@@ -65,7 +65,16 @@ var escapeHtml = uiModule.esc;
 function highlightMatch(text, query) {
   if (!query) return escapeHtml(text);
   const escaped = escapeHtml(text);
-  const regex = new RegExp('(' + query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'gi');
+  // La ricerca a indice fa AND sulle singole parole: la frase intera spesso non
+  // c'e'. Evidenziando solo la query completa non si marcava mai niente e il
+  // risultato sembrava non contenere la parola cercata. Evidenziamo anche i
+  // singoli termini, i piu' lunghi per primi.
+  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const terms = [query]
+    .concat(String(query).split(/\s+/).filter(t => t.length > 1))
+    .filter((t, i, a) => t && a.indexOf(t) === i)
+    .sort((a, b) => b.length - a.length);
+  const regex = new RegExp('(' + terms.map(esc).join('|') + ')', 'gi');
   return escaped.replace(regex, '<mark class="search-highlight">$1</mark>');
 }
 

@@ -39,12 +39,14 @@ import './js/modalManager.js';
 // Desktop window tiling — drag a modal near an edge/corner to snap.
 import './js/tileManager.js';
 import themeModule from './js/theme.js';
-// IMPORTANT: import cookbook.js with NO ?v= query — the same plain specifier
-// every other importer (cookbook-hwfit.js / cookbook-diagnosis.js) uses. A query
-// mismatch makes the browser load cookbook.js twice as separate modules (two
-// _envState objects), which broke server selection. Keep all cookbook imports
-// unversioned so this can't recur.
-import cookbookModule from './js/cookbook.js';
+// IMPORTANT: la catena cookbook.js si carica PIGRA, al primo clic. Sono sei
+// file per ~900 KB che il browser scaricava e analizzava all'avvio anche senza
+// mai aprire la finestra, e siccome stavano nel grafo di import statico di
+// app.js bloccavano l'esecuzione dell'intera applicazione (misurato: catena da
+// 42 ms a 890 ms, con la storia della chat chiesta solo dopo).
+// Sempre con specificatore semplice, MAI con ?v=: un import diverso caricherebbe
+// cookbook.js due volte come moduli separati (due _envState) e la scelta del
+// server tornerebbe a rompersi.
 import groupModule from './js/group.js';
 import * as researchPanelModule from './js/research/panel.js';
 import ttsModule from './js/tts-ai.js';
@@ -59,7 +61,27 @@ window.themeModule = themeModule;
 window.sessionModule = sessionModule;
 window.uiModule = uiModule;
 window.adminModule = adminModule;
-window.cookbookModule = cookbookModule;
+// Caricatore pigro condiviso: chi apre il Cookbook (questo file,
+// slashCommands.js, modelPicker.js, galleryEditor.js) passa di qui. Una sola
+// importazione, memorizzata, e window.cookbookModule resta il punto d'accesso
+// di sempre una volta caricato.
+let _cookbookPromise = null;
+function loadCookbookModule() {
+  if (window.cookbookModule) return Promise.resolve(window.cookbookModule);
+  if (!_cookbookPromise) {
+    _cookbookPromise = import('./js/cookbook.js').then((mod) => {
+      const m = mod.default || mod;
+      window.cookbookModule = m;
+      return m;
+    }).catch((e) => {
+      _cookbookPromise = null;
+      console.warn('[cookbook] caricamento fallito', e);
+      return null;
+    });
+  }
+  return _cookbookPromise;
+}
+window.loadCookbookModule = loadCookbookModule;
 
 function _isMobileChatInput() {
   return window.innerWidth <= 768;
@@ -1016,6 +1038,7 @@ function initializeEventListeners() {
   const toolCookbookBtn = el('tool-cookbook-btn');
   if (toolCookbookBtn) {
     toolCookbookBtn.addEventListener('click', async () => {
+      const cookbookModule = await loadCookbookModule();
       if (!cookbookModule) return;
       // Try minimized→restore or open→minimize via the manager first
       const Modals = await import('./js/modalManager.js');

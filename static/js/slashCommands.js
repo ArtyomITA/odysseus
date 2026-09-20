@@ -19,7 +19,19 @@ import themeModule from './theme.js';
 import documentModule from './document.js';
 import workspaceModule from './workspace.js';
 import settingsModule from './settings.js';
-import cookbookModule from './cookbook.js';
+// cookbook.js arriva pigro: e' una catena da ~900 KB che non deve pesare
+// sull'avvio. `_cookbook()` la carica al primo uso (caricatore condiviso in
+// app.js), con lo stesso specificatore semplice degli altri importatori.
+async function _cookbook() {
+  try {
+    if (window.loadCookbookModule) return await window.loadCookbookModule();
+    const mod = await import('./cookbook.js');
+    return mod.default || mod;
+  } catch (e) {
+    console.warn('[cookbook] caricamento fallito', e);
+    return null;
+  }
+}
 import { EVAL_PROMPTS } from './compare/index.js';
 import { PROVIDER_DEVICE_FLOWS, formatDeviceFlowError, runProviderDeviceFlow } from './providerDeviceFlow.js';
 import { getSettings } from './appConfig.js';
@@ -1358,6 +1370,7 @@ async function _cmdOpen(args, ctx) {
   };
   try {
     if (target === 'cookbook' || target === 'cook') {
+      const cookbookModule = await _cookbook();
       if (cookbookModule && typeof cookbookModule.open === 'function') await cookbookModule.open({ tab: 'Download' });
       else clickFirst('tool-cookbook-btn', 'rail-cookbook');
       return true;
@@ -1399,6 +1412,7 @@ async function _cmdToolPanel(tool, args, ctx) {
     if (sub === 'serve') {
       const query = args.slice(1).join(' ').trim();
       try {
+        const cookbookModule = await _cookbook();
         if (cookbookModule && typeof cookbookModule.open === 'function') {
           await cookbookModule.open({ tab: 'Serve', serveSearch: query });
           if (query) {
@@ -1418,10 +1432,10 @@ async function _cmdToolPanel(tool, args, ctx) {
       return true;
     }
     if (sub === 'download' || sub === 'scan') {
-      await cookbookModule?.open?.({ tab: 'Download', usecase: args.slice(1).join(' ').trim() || undefined });
+      await (await _cookbook())?.open?.({ tab: 'Download', usecase: args.slice(1).join(' ').trim() || undefined });
       return true;
     }
-    await cookbookModule?.open?.({ tab: 'Download', usecase: rest || undefined });
+    await (await _cookbook())?.open?.({ tab: 'Download', usecase: rest || undefined });
     return true;
   }
   if (target === 'email') {

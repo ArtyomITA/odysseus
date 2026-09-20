@@ -87,7 +87,24 @@ function _updateSessionLoading(chatHistory, label) {
 }
 
 function _nextPaint() {
-  return new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  // Attesa di un fotogramma, ma MAI all'infinito: in una scheda nascosta o
+  // sotto altre finestre Chrome non chiama piu' requestAnimationFrame, e il
+  // trascritto restava bloccato sugli scheletri grigi per decine di secondi
+  // (misurato: scheletro a 1,9 s, messaggi ancora assenti a 57 s).
+  // A scheda nascosta non c'e' nessun fotogramma da aspettare (e i timer sono
+  // strozzati a uno al secondo): si prosegue subito.
+  if (typeof document !== 'undefined' && document.hidden) return Promise.resolve();
+  return new Promise(resolve => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(finish, 120);
+    requestAnimationFrame(() => requestAnimationFrame(finish));
+  });
 }
 
 function _displayHistoryContent(content) {
@@ -1963,8 +1980,19 @@ export async function selectSession(id, { keepSidebar = false, showLoading = tru
           loadingPaintReady = _nextPaint();
         }, loadingDelayMs);
       }
-      const res = await fetch(_historyUrl(id, { limit: _historyPageLimit() }));
-      const data = await res.json();
+      // Se index.html ha gia' chiesto questa storia all'inizio del caricamento,
+      // si riusa quella risposta invece di rifare il giro. Si consuma una volta
+      // sola: i cambi sessione successivi tornano alla fetch normale.
+      const pre = window.__odysseusHistoryPrefetch;
+      let data = null;
+      if (pre && pre.id === id && pre.limit === _historyPageLimit()) {
+        window.__odysseusHistoryPrefetch = null;
+        data = await pre.promise;
+      }
+      if (!data) {
+        const res = await fetch(_historyUrl(id, { limit: _historyPageLimit() }));
+        data = await res.json();
+      }
       if (loadingTimer) {
         clearTimeout(loadingTimer);
         loadingTimer = null;
@@ -2022,7 +2050,10 @@ export async function selectSession(id, { keepSidebar = false, showLoading = tru
     if (chatHistory && !paintedLoading) {
       chatHistory.style.transition = 'opacity 0.12s ease-out';
       chatHistory.style.opacity = '0';
-      await new Promise(r => setTimeout(r, 120));
+      // La dissolvenza si aspetta solo se la scheda e' visibile: nascosta, il
+      // timer viene strozzato a un secondo e quell'attesa diventava il pezzo
+      // piu' grosso del cambio sessione, senza che nessuno vedesse nulla.
+      if (!document.hidden) await new Promise(r => setTimeout(r, 120));
       if (navToken !== _sessionNavToken || currentSessionId !== id) return;
       chatHistory.innerHTML = '';
     }
@@ -2277,7 +2308,21 @@ export async function materializePendingSession() {
     const incognitoChk = document.getElementById('incognito-toggle');
     const isIncognito = incognitoChk && incognitoChk.checked;
     const base = (pending.modelId || 'model').split('/').pop();
-    const name = isIncognito ? 'Nobody' : `${base} ${new Date().toLocaleTimeString()}`;
+    // Titolo provvisorio = le prime parole del messaggio, non il nome del
+    // modello con l'ora ("lfm 06:09:25"): quello non dice niente all'utente.
+    // Il testo e' ancora nella casella (viene svuotata piu' tardi nell'invio).
+    // Se non c'e' testo si ricade sulla vecchia forma, che l'auto-titolazione
+    // lato server riconosce e riscrive a fine turno.
+    let name;
+    if (isIncognito) {
+      name = 'Nobody';
+    } else {
+      const typed = (document.getElementById('message')?.value || '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      const words = typed ? typed.split(' ').slice(0, 8).join(' ').slice(0, 72).trim() : '';
+      name = words || `${base} ${new Date().toLocaleTimeString()}`;
+    }
 
     const fd = new FormData();
     fd.append('name', name);

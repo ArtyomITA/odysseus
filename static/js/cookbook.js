@@ -3588,18 +3588,30 @@ setInterval(() => {
 }, 5000);
 
 // Close button
-document.addEventListener('DOMContentLoaded', () => {
+// Il modulo ora arriva pigro, al primo clic: DOMContentLoaded e' gia' scattato
+// da un pezzo e l'ascoltatore non verrebbe mai eseguito. Quindi: se il
+// documento e' pronto si lega subito, altrimenti si aspetta l'evento.
+function _bindCookbookCloseHandlers() {
   const closeBtn = document.getElementById('close-cookbook-modal');
-  if (closeBtn) closeBtn.addEventListener('click', close);
+  if (closeBtn && !closeBtn._cookbookCloseBound) {
+    closeBtn._cookbookCloseBound = true;
+    closeBtn.addEventListener('click', close);
+  }
 
   const modal = document.getElementById('cookbook-modal');
-  if (modal) {
+  if (modal && !modal._cookbookBackdropBound) {
+    modal._cookbookBackdropBound = true;
     modal.addEventListener('click', (e) => {
       if (uiModule.isTouchInsideModal()) return;
       if (e.target === modal) close();
     });
   }
-});
+}
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', _bindCookbookCloseHandlers);
+} else {
+  _bindCookbookCloseHandlers();
+}
 
 // ── Initialize sub-modules ──
 

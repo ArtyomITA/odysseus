@@ -16,6 +16,28 @@
   <link rel="apple-touch-icon" href="/static/icons/icon-192.png">
   <script nonce="{{CSP_NONCE}}">
   window._odysseusLoadTime = Date.now();
+  // Anticipo della storia della chat. L'id della sessione e' gia' qui,
+  // nell'ancora dell'indirizzo (o in lastSessionId): chiederla adesso, prima
+  // dei 2,6 MB di moduli, toglie piu' di un secondo al primo trascritto,
+  // perche' prima la richiesta partiva solo dopo il caricamento di tutta
+  // l'applicazione e dopo /api/sessions. sessions.js la riusa se combacia.
+  (function(){
+    try {
+      var id = String(window.location.hash || '').replace(/^#/, '').trim();
+      if (!id || /^(document|note|image|email|event|task|skill|research)-/.test(id) || id.indexOf('open=') === 0) {
+        id = String(localStorage.getItem('lastSessionId') || '').replace(/^"|"$/g, '').trim();
+      }
+      if (!/^[0-9a-fA-F-]{16,}$/.test(id)) return;
+      var limit = (window.innerWidth <= 768) ? 8 : 24;
+      window.__odysseusHistoryPrefetch = {
+        id: id,
+        limit: limit,
+        promise: fetch('/api/history/' + encodeURIComponent(id) + '?limit=' + limit, { credentials: 'same-origin' })
+          .then(function (r) { return r.ok ? r.json() : null; })
+          .catch(function () { return null; }),
+      };
+    } catch (_) {}
+  })();
   (function(){
     try {
       var t = JSON.parse(localStorage.getItem('odysseus-theme'));
@@ -1176,6 +1198,14 @@
               <button type="button" class="overflow-menu-item" id="overflow-financial-btn">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v16a2 2 0 0 0 2 2h16"/><path d="m19 9-5 5-4-4-3 3"/></svg>
                 <span>Financial</span>
+                <span class="overflow-active-dot"></span>
+              </button>
+              <!-- Vergilius: la mappa si apre da sola quando il modello l'ha
+                   davvero mossa (non quando la frase "sembra" geografica).
+                   Predefinita accesa; si spegne da qui. -->
+              <button type="button" class="overflow-menu-item" id="overflow-automappa-btn">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"/><line x1="8" y1="2" x2="8" y2="18"/><line x1="16" y1="6" x2="16" y2="22"/></svg>
+                <span>Apri la mappa da sola</span>
                 <span class="overflow-active-dot"></span>
               </button>
               <!-- Vergilius: con un modello "-vista" (ling-vista = Ling + occhi
@@ -2720,7 +2750,8 @@
 <script type="module" src="/static/js/codeRunner.js"></script>
 <script type="module" src="/static/js/chatStream.js"></script>
   <script type="module" src="/static/js/chat.js"></script>
-<script type="module" src="/static/js/cookbook.js"></script>
+<!-- cookbook.js NON si carica qui: la catena (~900 KB, sei file) arriva pigra
+     al primo clic sul Cookbook, tramite window.loadCookbookModule() in app.js. -->
 <script src="/static/js/cookbookSchedule.js"></script>
 <script type="module" src="/static/js/search-chat.js"></script>
 <script type="module" src="/static/js/theme.js"></script>

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from sqlalchemy import text
@@ -45,7 +45,14 @@ class SessionSearchResult:
 
 
 def _iso(value: datetime | None) -> str | None:
-    return value.isoformat() if value else None
+    # I timestamp in tabella sono UTC ma senza fuso (datetime.utcnow()): senza
+    # marcatore il browser leggeva "2026-09-20T12:34:56" come ora LOCALE e la
+    # ricerca mostrava orari sfasati di 2 ore. Lo mettiamo qui, unica sorgente.
+    if not value:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc).isoformat()
+    return value.isoformat()
 
 
 def _message_to_context(msg: DBChatMessage) -> dict[str, Any]:
@@ -67,12 +74,29 @@ def _snippet(content: str, query: str, radius: int = 60) -> str:
     if not query:
         return content[: radius * 2]
 
-    idx = content.lower().find(query.lower())
+    low = content.lower()
+    idx = low.find(query.lower())
+    hit_len = len(query)
+    if idx == -1:
+        # La ricerca a indice (FTS5) fa AND sulle singole parole: la frase
+        # intera puo' non esserci. Prima si restituiva l'INIZIO del messaggio,
+        # e il risultato sembrava non contenere nulla di quel che si cercava.
+        # Ora si centra la finestra sulla prima parola che c'e' davvero.
+        for token in sorted(
+            {t for t in re.findall(r"[\w][\w._-]*", query, flags=re.UNICODE) if len(t) > 1},
+            key=len,
+            reverse=True,
+        ):
+            pos = low.find(token.lower())
+            if pos != -1:
+                idx = pos
+                hit_len = len(token)
+                break
     if idx == -1:
         return content[: radius * 2]
 
     start = max(0, idx - radius)
-    end = min(len(content), idx + len(query) + radius)
+    end = min(len(content), idx + hit_len + radius)
     return ("..." if start > 0 else "") + content[start:end] + ("..." if end < len(content) else "")
 
 
@@ -170,6 +194,15 @@ def _rows_to_results(db, rows: Iterable[tuple[DBChatMessage, str, str]], query: 
     for msg, session_name, snippet in rows:
         before, after = _context_for_message(db, msg, context_messages)
         content = msg.content or ""
+        # Lo snippet di FTS5 e' ritagliato sull'INDICE, non sul messaggio: per i
+        # messaggi con media inline l'indice contiene un segnaposto, e usciva
+        # uno snippet che nel testo vero non esiste. Se nemmeno il pezzo piu'
+        # lungo si ritrova nel contenuto, lo si ricalcola sul contenuto reale.
+        if snippet:
+            pieces = [p.strip() for p in str(snippet).split("...") if p.strip()]
+            longest = max(pieces, key=len) if pieces else ""
+            if longest and longest not in content:
+                snippet = ""
         results.append(
             SessionSearchResult(
                 message_id=msg.id,

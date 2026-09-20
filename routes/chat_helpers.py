@@ -248,6 +248,11 @@ def needs_auto_name(name: str) -> bool:
     # Default frontend name: "modelname HH:MM:SS AM/PM"
     if re.match(r"^.+ \d{1,2}:\d{2}:\d{2}(\s*(AM|PM))?$", name, re.IGNORECASE):
         return True
+    # Forma vecchia rimasta in molte righe: "testo del messaggio · lfm".
+    # Il nome del modello non deve stare nel titolo visibile, e finora nessuno
+    # riconosceva questa forma, quindi restava li' per sempre.
+    if re.search(r"\s·\s[\w.\-]+$", name):
+        return True
     return False
 
 
