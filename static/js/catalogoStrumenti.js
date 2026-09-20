@@ -22,7 +22,9 @@
     box-shadow:0 4px 14px rgba(0,0,0,.35);transition:border-color .15s,box-shadow .15s}
   #cat-launch:hover{border-color:var(--brand-color,var(--red,#c678dd));
     box-shadow:0 0 18px color-mix(in srgb,var(--brand-color,var(--red,#c678dd)) 30%,transparent)}
-  #cat-launch .ico{font-size:14px;line-height:1}
+  #cat-launch .ico{display:inline-flex;line-height:1;color:var(--brand-color,var(--red,#c678dd))}
+  #cat-launch .ico svg{width:14px;height:14px}
+  #cat-launch:focus-visible{outline:2px solid var(--brand-color,var(--red,#c678dd));outline-offset:2px}
 
   #cat-panel{position:fixed;right:20px;top:106px;z-index:9001;
     width:400px;max-width:calc(100vw - 40px);max-height:calc(100vh - 130px);
@@ -215,8 +217,13 @@
     if (document.getElementById("cat-launch")) return;
     document.head.appendChild(el("style", { html: CSS }));
 
+    // Icona in linea, non un'emoji: stesso tratto delle altre icone dell'app.
+    var ICO = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" ' +
+      'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+      '<rect x="3" y="8" width="18" height="12" rx="1.5"/><path d="M3 13h18"/>' +
+      '<path d="M9 8V6a1.5 1.5 0 0 1 1.5-1.5h3A1.5 1.5 0 0 1 15 6v2"/></svg>';
     var launch = el("div", { id: "cat-launch", title: "Gli strumenti dell'assistente" }, [
-      el("span", { class: "ico", text: "🧰" }),
+      el("span", { class: "ico", html: ICO }),
       el("span", { text: "Strumenti" })
     ]);
     launch.addEventListener("click", function () {

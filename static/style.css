@@ -41664,3 +41664,240 @@ body.settings-sidebar-resize-active {
   color: var(--red, #d2544f);
   background: color-mix(in srgb, var(--red, #d2544f) 14%, transparent);
 }
+
+/* ===========================================================================
+   identita Vergilius  —  colori delle modalita', segni di famiglia, tessere
+   del benvenuto, marchio.  Piano: D:\vergilius-lab\design\01-identita-vergilius.md
+
+   Sta in coda di proposito: e' un blocco chiuso, non duplica regole di sopra e
+   si toglie tutto insieme. Prestazioni: nessun backdrop-filter, nessuna
+   animazione infinita, solo transizioni di colore/opacita'/transform <= 150 ms.
+   =========================================================================== */
+
+/* -- 1. Colori semantici delle modalita' ---------------------------------
+   Valgono in TUTTI i temi: dicono "in che stanza sei", non "che skin hai".
+   data-luminosita lo mette theme.js (e lo script in testa a index.html)
+   guardando la chiarezza del fondo: i toni chiari hanno bisogno di colori
+   piu' cupi per restare leggibili (AA). */
+:root {
+  --vg-intelligence: #4FA3B8;   /* Radar     */
+  --vg-financial:    #6FA96F;   /* Quadrante */
+  --vg-vista:        #8090D8;   /* Vetro     */
+  --vg-voce:         #B77BAE;   /* Voce      */
+  --vg-controllo:    #C96F53;   /* Leva      */
+  --vg-neutro:       color-mix(in srgb, var(--fg) 55%, transparent);
+  /* scala dei raggi, dichiarata: fili, controlli, tessere */
+  --vg-r1: 2px;
+  --vg-r2: 6px;
+  --vg-r3: 10px;
+}
+:root[data-luminosita="chiaro"] {
+  --vg-intelligence: #1F6F82;
+  --vg-financial:    #356F3F;
+  --vg-vista:        #4A59A8;
+  --vg-voce:         #8C4C86;
+  --vg-controllo:    #A34A2E;
+}
+
+/* famiglia -> colore, in un posto solo */
+[data-fam="intelligence"] { --vg-fam: var(--vg-intelligence); }
+[data-fam="financial"]    { --vg-fam: var(--vg-financial); }
+[data-fam="vista"]        { --vg-fam: var(--vg-vista); }
+[data-fam="voce"]         { --vg-fam: var(--vg-voce); }
+[data-fam="browser"],
+[data-fam="pc"]           { --vg-fam: var(--vg-controllo); }
+[data-fam="neutro"]       { --vg-fam: var(--vg-neutro); }
+
+/* -- 2. Il marchio -------------------------------------------------------
+   Tre segmenti: l'orizzonte e la V che lo rompe. Stesso segno nella barra
+   laterale, nel benvenuto e nella favicon. */
+.segno-vergilius { fill: none; stroke: currentColor; stroke-linecap: square; }
+.sidebar-brand .segno-barra {
+  width: 17px; height: 17px;
+  margin-right: 8px;
+  vertical-align: -0.16em;
+  color: var(--brand-color, var(--red));
+  flex: 0 0 auto;
+}
+
+/* -- 3. I chip delle modalita' prendono il colore della loro modalita' ----
+   Le regole di profilo.js sono iniettate a runtime (quindi DOPO questo file):
+   qui si vince con la specificita', non con l'ordine. */
+#modo-bar .mchip[data-modo="intelligence"] { --vg-fam: var(--vg-intelligence); }
+#modo-bar .mchip[data-modo="financial"]    { --vg-fam: var(--vg-financial); }
+#modo-bar .mchip[data-modo="computer"],
+#modo-bar .mchip[data-modo="browser"]      { --vg-fam: var(--vg-controllo); }
+#modo-bar .mchip[data-modo][aria-pressed] {
+  border-radius: var(--vg-r2);
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  font-size: 10.5px;
+}
+#modo-bar .mchip[data-modo][aria-pressed="false"] {
+  border-color: color-mix(in srgb, var(--vg-fam) 35%, transparent);
+}
+#modo-bar .mchip[data-modo][aria-pressed="false"]:hover {
+  border-color: var(--vg-fam);
+  color: var(--vg-fam);
+}
+#modo-bar .mchip[data-modo][aria-pressed="true"] {
+  color: var(--vg-fam);
+  border-color: var(--vg-fam);
+  background: color-mix(in srgb, var(--vg-fam) 14%, transparent);
+  box-shadow: none;
+}
+#modo-bar .mchip[data-modo][aria-pressed="true"]:hover { color: var(--vg-fam); }
+#modo-bar .mchip[data-modo][aria-pressed="true"] .dot { box-shadow: none; }
+#modo-bar .mchip[data-modo]:focus-visible {
+  outline: 2px solid var(--vg-fam);
+  outline-offset: 2px;
+}
+
+/* -- 4. Il filo: un capello in testa alla chat, del colore della modalita' -
+   .chat-top-bar::after esisteva con content:none, era li' apposta. */
+.chat-top-bar::after {
+  content: "";
+  position: absolute;
+  bottom: 0;
+  /* largo quanto la colonna della conversazione, non quanto lo schermo:
+     un filo, non una fascia. */
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(800px, calc(100% - 32px));
+  height: 2px;
+  border-radius: var(--vg-r1);
+  background: color-mix(in srgb, var(--border) 70%, transparent);
+  transition: background 0.15s ease;
+  pointer-events: none;
+}
+:root[data-modo-attivo="intelligence"] .chat-top-bar::after { background: var(--vg-intelligence); }
+:root[data-modo-attivo="financial"]    .chat-top-bar::after { background: var(--vg-financial); }
+:root[data-modo-attivo="controllo"]    .chat-top-bar::after { background: var(--vg-controllo); }
+:root[data-modo-attivo="vista"]        .chat-top-bar::after { background: var(--vg-vista); }
+
+/* Il campo di scrittura segue il filo, ma appena: un bordo tinto, non acceso. */
+:root[data-modo-attivo="intelligence"] .chat-input-bar { border-color: color-mix(in srgb, var(--vg-intelligence) 60%, var(--input-border, var(--border))); }
+:root[data-modo-attivo="financial"]    .chat-input-bar { border-color: color-mix(in srgb, var(--vg-financial) 60%, var(--input-border, var(--border))); }
+:root[data-modo-attivo="controllo"]    .chat-input-bar { border-color: color-mix(in srgb, var(--vg-controllo) 60%, var(--input-border, var(--border))); }
+:root[data-modo-attivo="vista"]        .chat-input-bar { border-color: color-mix(in srgb, var(--vg-vista) 60%, var(--input-border, var(--border))); }
+
+/* -- 5. Le schede degli strumenti portano il segno della famiglia ---------
+   data-fam lo mette identitaVergilius.js leggendo il nome dello strumento. */
+.agent-thread-node[data-fam] {
+  border-left: 2px solid color-mix(in srgb, var(--vg-fam) 55%, transparent);
+  border-radius: var(--vg-r1);
+  padding-left: 8px;
+}
+.agent-thread-node[data-fam="neutro"] { border-left-color: color-mix(in srgb, var(--fg) 18%, transparent); }
+.agent-thread-node[data-fam] .agent-thread-tool {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--vg-fam);
+}
+.agent-thread-node[data-fam="neutro"] .agent-thread-tool { color: color-mix(in srgb, var(--fg) 70%, transparent); }
+.segno-fam { width: 13px; height: 13px; flex: 0 0 auto; }
+
+/* -- 6. Benvenuto: le tessere delle capacita' ----------------------------
+   Il blocco resta centrato, il CONTENUTO e' allineato a sinistra su griglia.
+   Con le tessere il benvenuto non e' piu' centrato in verticale (non ci
+   starebbe): si appoggia in alto e l'entrata animata si spegne. */
+#welcome-screen:has(#ver-skill) {
+  top: 7%;
+  transform: translate(-50%, 0);
+  animation: none;
+  width: min(900px, calc(100% - 48px));
+}
+/* Il suggerimento a caso non serve piu': gli esempi delle tessere fanno lo
+   stesso lavoro, e meglio. Resta nel DOM (lo legge chi cerca l'elemento). */
+#welcome-screen:has(#ver-skill) .welcome-tip { display: none; }
+#ver-skill {
+  pointer-events: auto;
+  /* Il benvenuto e' una colonna flex: senza questo la griglia veniva
+     schiacciata (righe da 32px) e le tessere uscivano tagliate. */
+  flex: 0 0 auto;
+  width: 100%;
+  margin-top: 22px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 10px;
+  text-align: left;
+}
+.ver-tess {
+  /* la tessera e' un <button>: c'e' un `button{height:32px}` globale che la
+     schiacciava e faceva uscire il testo dal bordo. */
+  height: auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 11px 12px 10px;
+  /* mai lo stesso colore della superficie sotto: sui temi chiari la tessera
+     spariva nel fondo della chat. */
+  background: color-mix(in srgb, var(--fg) 5%, var(--panel));
+  border: 1px solid var(--border);
+  border-top: 2px solid color-mix(in srgb, var(--vg-fam) 70%, transparent);
+  border-radius: var(--vg-r3);
+  color: var(--fg);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.12s ease, transform 0.12s ease;
+}
+.ver-tess:hover { border-color: color-mix(in srgb, var(--vg-fam) 60%, var(--border)); transform: translateY(-1px); }
+.ver-tess:focus-visible { outline: 2px solid var(--vg-fam); outline-offset: 2px; }
+.ver-tess .vt-top { display: flex; align-items: center; gap: 7px; color: var(--vg-fam); }
+.ver-tess .vt-top .segno-fam { width: 15px; height: 15px; }
+.ver-tess .vt-ttl {
+  font-weight: 600;
+  font-size: 10.5px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+.ver-tess .vt-riga {
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: color-mix(in srgb, var(--fg) 72%, transparent);
+}
+.ver-tess .vt-es {
+  font-size: 11px;
+  line-height: 1.4;
+  color: color-mix(in srgb, var(--fg) 50%, transparent);
+  border-top: 1px dashed color-mix(in srgb, var(--border) 80%, transparent);
+  padding-top: 6px;
+  margin-top: 1px;
+}
+.ver-tess:hover .vt-es { color: color-mix(in srgb, var(--fg) 78%, transparent); }
+/* Capacita' che il profilo di avvio non offre: spenta, e dice perche'. */
+.ver-tess.spenta {
+  cursor: default;
+  opacity: .55;
+  border-top-style: dashed;
+  border-top-color: color-mix(in srgb, var(--fg) 25%, transparent);
+}
+.ver-tess.spenta .vt-top { color: color-mix(in srgb, var(--fg) 45%, transparent); }
+.ver-tess.spenta:hover { transform: none; border-color: var(--border); }
+.ver-tess.spenta .vt-es { font-style: italic; }
+
+/* Finestre basse o strette: si tolgono le righe, non le tessere. */
+@media (max-height: 780px), (max-width: 1040px) {
+  #ver-skill { grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 8px; margin-top: 16px; }
+  .ver-tess .vt-riga { display: none; }
+}
+/* Sotto i 560px di altezza utile restano solo titolo e colore: a 800x700
+   gli esempi ci stanno ancora, ed e' la misura che va difesa. */
+@media (max-height: 560px) {
+  #welcome-screen:has(#ver-skill) { top: 4%; }
+  .ver-tess .vt-es { display: none; }
+  .ver-tess { padding: 8px 10px; }
+}
+/* Sul telefono il benvenuto resta quello di prima: le tessere non ci stanno. */
+@media (max-width: 768px) {
+  #ver-skill { display: none; }
+  #welcome-screen:has(#ver-skill) { top: 42%; transform: translate(-50%, -50%); width: auto; }
+}
+/* "Meno animazioni" di sistema: restano i colori, sparisce il movimento. */
+@media (prefers-reduced-motion: reduce) {
+  .ver-tess, .chat-top-bar::after, #modo-bar .mchip[data-modo][aria-pressed] { transition: none; }
+  .ver-tess:hover { transform: none; }
+}

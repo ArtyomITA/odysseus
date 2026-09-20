@@ -22,7 +22,7 @@
   var API = (window.API_BASE || '');
 
   var NASCONDI = {
-    'vergilius-chat': ['overflow-osint-btn', 'overflow-financial-btn', 'rail-shadowbroker', 'tool-shadowbroker-btn', 'overflow-tts-btn'],
+    'vergilius-chat': ['overflow-osint-btn', 'overflow-financial-btn', 'overflow-automappa-btn', 'rail-shadowbroker', 'tool-shadowbroker-btn', 'overflow-tts-btn'],
     'vergilius-lite': ['overflow-tts-btn'],
     'full': [],
     'shadowbroker': [],
@@ -71,9 +71,16 @@
     return !el || el.getAttribute('data-profilo-nascosto');
   }
 
+  // Modalita' "in primo piano": la piu' specifica fra quelle accese. Serve al
+  // filo colorato in testa alla chat e al bordo del composer (blocco
+  // "identita Vergilius" in coda a style.css): un colore solo, mai cinque.
+  var ORDINE_MODO = { intelligence: 'intelligence', financial: 'financial',
+                      computer: 'controllo', browser: 'controllo' };
+
   function aggiornaBarra() {
     var bar = document.getElementById('modo-bar'); if (!bar) return;
     var vista = !!(window.OdysseusVista && window.OdysseusVista.attiva());
+    var inPrimoPiano = '';
     CHIP.forEach(function (c) {
       var el = bar.querySelector('[data-modo="' + c.id + '"]'); if (!el) return;
       var nascosto = _nascosto(c.needs) || (c.vista && !vista);
@@ -85,7 +92,16 @@
       // con la tastiera o con uno screen reader.
       el.setAttribute('aria-pressed', acceso ? 'true' : 'false');
       el.title = (acceso ? 'Acceso' : 'Spento') + ' — ' + c.label + ': clic per cambiare';
+      if (acceso && !inPrimoPiano) inPrimoPiano = ORDINE_MODO[c.id] || '';
     });
+    // Vista non ha un chip suo (e' un interruttore del modello): se nessuna
+    // modalita' e' accesa ma gli occhi ci sono, il filo lo dice lo stesso.
+    if (!inPrimoPiano && vista) inPrimoPiano = 'vista';
+    try {
+      var de = document.documentElement;
+      if (inPrimoPiano) de.setAttribute('data-modo-attivo', inPrimoPiano);
+      else de.removeAttribute('data-modo-attivo');
+    } catch (_) {}
     var mod = bar.querySelector('.mmod');
     if (mod) {
       var l = document.getElementById('model-picker-label');

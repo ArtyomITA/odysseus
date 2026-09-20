@@ -9,6 +9,23 @@ import { makeWindowDraggable } from './windowDrag.js';
 import { snapModalToZone } from './tileManager.js';
 
 export const THEMES = {
+  // Tema proprio di Vergilius: neutri freddi (Inchiostro/Ardesia/Grafite/Calce)
+  // con un solo accento di marca, Ottone. Vedi D:\vergilius-lab\design\
+  // 01-identita-vergilius.md. Predefinito per le installazioni nuove; i temi
+  // gia' scelti dall'utente non vengono toccati.
+  vergilius:  { bg:'#0F1216', fg:'#D7DCE2', panel:'#161A20', border:'#2A313A', red:'#C9A063',
+                advanced: { brandColor: '#C9A063', brandMixTo: '#9E7938',
+                            userBubbleBg: '#12161B', aiBubbleBg: '#161A20',
+                            inputBg: '#12161B', inputBorder: '#2A313A',
+                            sendBtnBg: '#C9A063', sendBtnHover: '#9E7938',
+                            toggleActive: '#C9A063' } },
+  'vergilius-chiaro':
+              { bg:'#EDEEF0', fg:'#20262D', panel:'#F7F8F9', border:'#C9CDD3', red:'#8A6415',
+                advanced: { brandColor: '#8A6415', brandMixTo: '#6B4C0F',
+                            userBubbleBg: '#E4E6E9', aiBubbleBg: '#F7F8F9',
+                            inputBg: '#F7F8F9', inputBorder: '#C9CDD3',
+                            sendBtnBg: '#8A6415', sendBtnHover: '#6B4C0F',
+                            toggleActive: '#8A6415' } },
   dark:       { bg:'#282c34', fg:'#9cdef2', panel:'#111111', border:'#355a66', red:'#e06c75' },
   light:      { bg:'#f0ebe3', fg:'#5a5248', panel:'#faf6f0', border:'#d4cdc2', red:'#c47d5a' },
   midnight:   { bg:'#0d1117', fg:'#c9d1d9', panel:'#161b22', border:'#30363d', red:'#f85149' },
@@ -31,7 +48,9 @@ export const THEMES = {
   cute:       { bg:'#fff0f5', fg:'#d4608a', panel:'#fff8fa', border:'#f0c0d0', red:'#ff6b9d' },
 };
 
-const DEFAULT_THEME = 'dark';
+// Predefinito per chi non ha ancora scelto nulla (installazione nuova).
+// Chi ha gia' un tema salvato in localStorage resta dov'e'.
+const DEFAULT_THEME = 'vergilius';
 const LS_KEY = 'odysseus-theme';
 const CUSTOM_THEMES_KEY = 'odysseus-custom-themes';
 
@@ -47,6 +66,9 @@ const MAX_CUSTOM_THEMES = 8;
 
 // Default background patterns for built-in themes
 const THEME_DEFAULT_PATTERN = {
+  // Vergilius: nessuno sfondo animato, per scelta (niente canvas a riposo).
+  vergilius:  'none',
+  'vergilius-chiaro': 'none',
   dark:       'none',
   light:      'dots',
   midnight:   'rain',
@@ -287,6 +309,14 @@ export function applyColors(colors) {
     s.setProperty(css, adv[key] || defaults[key]);
   }
 
+  // Fondo chiaro o scuro? Lo leggono i colori semantici delle modalita'
+  // (blocco "identita Vergilius" in coda a style.css): sui temi chiari
+  // servono toni piu' cupi per restare leggibili.
+  try {
+    const _bgL = hexToHSL(colors.bg)[2];
+    document.documentElement.setAttribute('data-luminosita', _bgL < 50 ? 'scuro' : 'chiaro');
+  } catch (e) { /* colore non valido: si resta sui toni scuri */ }
+
   // Update favicon to match theme accent color
   _updateFavicon(colors.red || '#e06c75');
 }
@@ -336,7 +366,8 @@ function _updateFavicon(fg) {
   if (routeShape) {
     svg = `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'>${routeShape.split('__C__').join(fg)}</svg>`;
   } else {
-    svg = `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><path d='M16 4L16 22L6 22Z' fill='${fg}'/><path d='M16 8L16 22L24 22Z' fill='${fg}' opacity='0.6'/><path d='M4 24Q10 20 16 24Q22 28 28 24' stroke='${fg}' stroke-width='2.5' fill='none' stroke-linecap='round'/></svg>`;
+    // Segno di Vergilius: l'orizzonte e la V che lo rompe (tre segmenti).
+    svg = `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><path d='M4 8h24' stroke='${fg}' stroke-width='2' opacity='0.45'/><path d='M8 8l8 18' stroke='${fg}' stroke-width='3'/><path d='M24 8l-8 18' stroke='${fg}' stroke-width='3' opacity='0.55'/></svg>`;
   }
   const href = 'data:image/svg+xml,' + encodeURIComponent(svg);
   let link = document.querySelector("link[rel='icon']");
@@ -649,7 +680,7 @@ export function initThemeUI() {
         <span style="background:${c.fg}"></span>
         <span style="background:${c.red}"></span>
       </div>
-      ${name === 'dark' ? 'original' : (name === 'gpt' ? 'GPT' : name)}
+      ${name === 'dark' ? 'original' : (name === 'gpt' ? 'GPT' : (name === 'vergilius' ? 'Vergilius' : (name === 'vergilius-chiaro' ? 'Vergilius chiaro' : name)))}
     </div>
   `).join('');
 
