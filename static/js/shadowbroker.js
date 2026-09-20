@@ -616,38 +616,27 @@ function _luogoDa(dati, argomenti) {
   return 'vista aggiornata';
 }
 
-/**
- * Ripete UNA volta il centramento, quando l'iframe e' appena nato.
- *
- * Le azioni dell'agente vivono in un anello con un cursore per ogni vista
- * (shadowbroker/backend/routers/ai_intel.py, `wait_agent_actions`): una vista
- * nuova chiede `after=-1` e riceve **solo** il cursore corrente, quindi tutto
- * cio' che e' passato prima che nascesse e' perso. Il `map_focus` parte dal
- * server mentre l'iframe non esiste ancora: senza questa ripetizione la mappa
- * si aprirebbe dove stava prima.
- *
- * L'attesa e' lunga di proposito, e misurata. Non basta che il polling sia
- * acceso (`secondaryBootReady`, fino a 6,4 s dopo il montaggio, page.tsx riga
- * 320): il centramento viene buttato via anche dopo, perche' MaplibreViewer
- * esce subito se la mappa non c'e' ancora (`if (!flyToLocation ||
- * !mapRef.current) return`, MaplibreViewer.tsx riga 763) e quell'effetto non
- * riparte da solo. Provato dal vivo: a 8 s dal caricamento il comando si
- * perde, a 24 s arriva. Si sta larghi. Non e' un ritardo percepito: la mappa
- * impiega comunque una ventina di secondi a disegnarsi.
- */
-function _ripetiFocus(frame, lat, lng, zoom) {
-  if (!frame) return;
-  frame.addEventListener('load', () => {
-    setTimeout(() => {
-      fetch('/api/shadowbroker/focus', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'same-origin',
-        body: JSON.stringify({ lat, lng, zoom: zoom || 6 }),
-      }).catch(() => { /* mappa spenta: si tace */ });
-    }, 25000);
-  }, { once: true });
-}
+// La ripetizione alla cieca del centramento non vive piu' qui.
+//
+// C'era: l'iframe appena nato chiedeva le azioni con `after=-1` e riceveva
+// **solo** il cursore corrente, quindi il `map_focus` partito mentre l'iframe
+// non esisteva era perso; si rimandava lo stesso comando 25 s dopo il `load`
+// sperando che intanto la mappa fosse pronta. Erano 25 s di attesa per una
+// cosa che l'utente vedeva comunque, e valeva solo per `centra`.
+//
+// Ora il recupero lo fa la vista stessa, dove il problema e' nato:
+//  - `shadowbroker/backend/routers/ai_intel.py`, `wait_agent_actions`:
+//    con `replay_recent=<secondi>` una vista appena nata riceve i comandi di
+//    vista recenti (l'ultimo per tipo: `fly_to`, `set_layers`, `highlight`);
+//  - `shadowbroker/frontend/src/hooks/useAgentActions.ts`: la prima chiamata
+//    chiede quei 90 s;
+//  - `shadowbroker/frontend/src/components/MaplibreViewer.tsx`: l'effetto del
+//    volo dipende anche da `mapReady`, quindi un comando arrivato prima che
+//    la mappa esistesse viene eseguito appena esiste.
+//
+// Vale quindi per TUTTI i comandi di vista, non solo per `centra`.
+// `POST /api/shadowbroker/focus` resta come comando manuale di riparazione,
+// ma nessuno lo chiama piu' da solo.
 
 async function _daStrumento(ev) {
   const d = (ev && ev.detail) || {};
@@ -677,15 +666,10 @@ async function _daStrumento(ev) {
   if (att && att.id === 'message' && String(att.value || '').trim()) return;
 
   _apertaInQuestoTurno = true;
-  const nuovo = !(_frame && _frame.isConnected);
   await open();
 
   let argomenti = null;
   try { argomenti = JSON.parse(String(d.argomenti || '')); } catch (_) {}
-  const lat = Number(dati.lat), lng = Number(dati.lng);
-  if (nuovo && Number.isFinite(lat) && Number.isFinite(lng)) {
-    _ripetiFocus(_frame, lat, lng, Number(argomenti && argomenti.zoom) || 6);
-  }
   try {
     window.uiModule?.showToast?.(`Mappa aperta: ${_luogoDa(dati, argomenti)}`, {
       duration: 7000, action: 'Chiudi', onAction: () => close(),
