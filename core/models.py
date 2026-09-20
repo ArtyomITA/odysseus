@@ -273,6 +273,22 @@ class Session:
                             args = json.dumps(args or {}, ensure_ascii=False)
                         except Exception:
                             args = "{}"
+                    else:
+                        # `command` e' la riga che l'interfaccia MOSTRA, non sempre
+                        # il JSON degli argomenti: per i tool documento e' la prima
+                        # riga del contenuto (agent_loop `cmd_display`), e i rami di
+                        # approvazione la tagliano a 240 caratteri. Rispedirla tale e
+                        # quale come `arguments` fa fallire il parser di llama.cpp
+                        # ("Failed to parse tool call arguments as JSON", HTTP 500) a
+                        # OGNI turno successivo: la chat resta rotta per sempre.
+                        # Qui si accetta solo un oggetto JSON valido; il resto viene
+                        # impacchettato, cosi' il testo non si perde e il messaggio
+                        # resta conforme alla specifica.
+                        try:
+                            if not isinstance(json.loads(args), dict):
+                                raise ValueError("non e' un oggetto")
+                        except Exception:
+                            args = json.dumps({"input": args}, ensure_ascii=False)
                     call_id = f"call_{i}_{j}"
                     out.append({
                         "role": "assistant",

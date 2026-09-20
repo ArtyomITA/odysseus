@@ -466,6 +466,18 @@ class McpManager:
         args = json.loads(srv.args) if srv.args else []
         env = json.loads(srv.env) if srv.env else {}
 
+        # Un server stdio che passa da uv o npx al primo avvio, su una macchina
+        # lenta e affollata dall'avvio degli altri servizi, supera facilmente i
+        # 20 secondi: Windows-MCP (`uv run windows-mcp serve`) e' arrivato a
+        # scadere a ogni riavvio. La connessione gira in secondo piano, quando
+        # il web server accetta gia' traffico, quindi aspettare di piu' non
+        # ritarda l'interfaccia; arrendersi presto invece lascia la modalita'
+        # Computer senza NESSUNO strumento, e senza un errore visibile.
+        try:
+            _timeout = float(os.getenv("ODYSSEUS_MCP_CONNECT_TIMEOUT", "90"))
+        except (TypeError, ValueError):
+            _timeout = 90.0
+
         try:
             await asyncio.wait_for(
                 self.connect_server(
@@ -477,13 +489,15 @@ class McpManager:
                     env=env,
                     url=srv.url,
                 ),
-                timeout=20,
+                timeout=_timeout,
             )
         except asyncio.TimeoutError:
-            logger.warning("Timed out connecting to %s", srv.name)
+            logger.warning(
+                "Timed out connecting to %s after %.0f seconds", srv.name, _timeout
+            )
             self._connections[srv.id] = {
                 "status": "timeout",
-                "error": f"Timed out after 20 seconds",
+                "error": f"Timed out after {_timeout:.0f} seconds",
                 "name": srv.name,
             }
 

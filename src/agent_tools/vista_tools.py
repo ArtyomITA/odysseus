@@ -77,7 +77,19 @@ async def _snapshot_mcp() -> Dict[str, Any]:
             return {"errore": "Windows-MCP non collegato"}
         nome = next((t["qualified_name"] for t in mm.get_all_tools() if t.get("name") == "Snapshot"), None)
         if not nome:
-            return {"errore": "tool Snapshot non disponibile"}
+            # Testo in inglese: lo legge il modello. Senza albero non puo'
+            # cliccare nulla, e deve dirlo invece di indovinare dalle sole
+            # parole degli occhi (che non fanno OCR).
+            logger.warning(
+                "[vista] Snapshot non disponibile: Windows-MCP non collegato "
+                "(controlla Impostazioni > MCP, lo stato del server 'windows')"
+            )
+            return {"errore": (
+                "The Windows-MCP server is not connected, so there is no "
+                "clickable UI tree and no window list. Do not guess window "
+                "names from the screen description: say the PC control server "
+                "is offline and that it must be reconnected in Settings > MCP."
+            )}
         r = await mm.call_tool(nome, {})
         if r.get("error"):
             return {"errore": str(r["error"])[:200]}

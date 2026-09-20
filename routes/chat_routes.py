@@ -2593,6 +2593,16 @@ def setup_chat_routes(
                             if _disabled_finale:
                                 _disabled_finale = set(_disabled_finale) - _forzati
                             logger.info("[vista-mode] %d occhi + %d tool PC/browser forzati", len(_vista), len(_pc))
+                            # Computer/Browser accesi ma zero strumenti forzati
+                            # = il server MCP non e' collegato. Prima passava
+                            # in sordina e il turno sembrava solo "il modello
+                            # non sa usare il PC".
+                            if (computer_mode or browser_mode) and not _pc:
+                                logger.warning(
+                                    "[vista-mode] Computer/Browser richiesti ma NESSUN tool "
+                                    "di azione disponibile: server MCP non collegato "
+                                    "(Impostazioni > MCP)"
+                                )
                         except Exception as _e:
                             logger.warning("[vista-mode] non applicabile: %s", _e)
 

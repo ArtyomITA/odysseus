@@ -112,6 +112,15 @@ def is_llamaswap(endpoint_url: str) -> bool:
     return verdict
 
 
+# llama-swap usa due vocabolari per lo stesso stato: `/running` dice
+# "ready"/"starting", `/v1/models` dice "loaded"/"loading". Qui dentro ne
+# esiste UNO solo (quello di `/running`), altrimenti un profilo ALIAS
+# (`lfm-vista` e' un alias di `lfm`) resta per sempre "loaded": `/running`
+# elenca solo il nome reale del gruppo, quindi non lo corregge mai e chi
+# confronta con "ready" (props, warmup degli occhi) non parte piu'.
+_STATI_V1_MODELS = {"loaded": "ready", "loading": "starting"}
+
+
 def _states(base: str) -> Dict[str, str]:
     """{model_id: state} for every profile llama-swap knows about.
 
@@ -129,7 +138,8 @@ def _states(base: str) -> Dict[str, str]:
             for item in r.json().get("data") or []:
                 mid = str(item.get("id") or "")
                 if mid:
-                    states[mid] = str((item.get("status") or {}).get("value") or "unloaded")
+                    _raw = str((item.get("status") or {}).get("value") or "unloaded")
+                    states[mid] = _STATI_V1_MODELS.get(_raw, _raw)
     except Exception:
         pass
     try:
