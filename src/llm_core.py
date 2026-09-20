@@ -10,6 +10,7 @@ import threading
 import re
 import os
 import math
+import contextvars
 from contextlib import asynccontextmanager
 from fastapi import HTTPException
 from typing import Any, Optional, Dict, List, Tuple
@@ -1204,6 +1205,66 @@ def _apply_local_reasoning_controls(
             kwargs["enable_thinking"] = bool(enable_thinking)
     if reasoning_budget_tokens is not None:
         payload["reasoning_budget_tokens"] = max(0, int(reasoning_budget_tokens))
+
+
+# Vergilius / modalita' voce (A1): il turno arriva dalla conversazione a voce.
+#
+# Il ritardo principale della voce non e' il TTS: e' il blocco <think>. Il
+# browser scarta il testo dentro <think>, quindi la sintesi non puo' partire
+# prima di </think>, e con LFM che pensa sempre sono secondi di silenzio.
+# `ODYSSEUS_TOOL_ROUND_REASONING_BUDGET` esiste gia' ma vale SOLO sui giri con
+# gli schemi dei tool attaccati: sul giro di risposta finale, cioe' quello che
+# si ascolta, non si applica niente. Qui il budget vale per TUTTI i giri, ma
+# solo quando il turno e' vocale. Vuoto o 0 = comportamento di prima.
+#
+# Un ContextVar e non una variabile globale: le richieste sono concorrenti, e
+# una conversazione a voce non deve accorciare il ragionamento di una scheda
+# che sta scrivendo a tastiera.
+_turno_vocale: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+    "odysseus_turno_vocale", default=False
+)
+
+
+def imposta_turno_vocale(attivo: bool) -> None:
+    """Dichiara che il turno in corso arriva dalla modalita' voce/live."""
+    _turno_vocale.set(bool(attivo))
+
+
+def budget_ragionamento_voce() -> Optional[int]:
+    """Budget di ragionamento da applicare al turno in corso, o None.
+
+    None quando il turno non e' vocale o la leva non e' impostata: in quel
+    caso il comportamento resta identico a prima.
+    """
+    if not _turno_vocale.get():
+        return None
+    grezzo = os.getenv("ODYSSEUS_VOICE_REASONING_BUDGET", "").strip()
+    if not grezzo.isdigit():
+        return None
+    valore = int(grezzo)
+    # 0 = leva spenta esplicitamente, non "ragionamento vietato": spegnerlo del
+    # tutto cambia il comportamento del modello, non solo la sua velocita'.
+    return valore if valore > 0 else None
+
+
+def _budget_col_turno_vocale(richiesto: Optional[int]) -> Optional[int]:
+    """Budget finale del giro, tenuto conto della modalita' voce.
+
+    In modalita' voce il budget vale su TUTTI i giri, anche quelli con gli
+    schemi dei tool attaccati: `ODYSSEUS_TOOL_ROUND_REASONING_BUDGET` (256) e'
+    tarato per la chat scritta, e in agente copriva il giro di risposta
+    lasciando il vocale com'era. Si prende sempre il piu' BASSO dei due: la
+    voce puo' accorciare il pensiero, mai allungarlo.
+    """
+    voce = budget_ragionamento_voce()
+    if voce is None:
+        return richiesto
+    finale = voce if richiesto is None else min(int(richiesto), voce)
+    logger.info(
+        "[voce] turno vocale: reasoning_budget_tokens=%d (chiesto %s) su questo giro",
+        finale, richiesto,
+    )
+    return finale
 
 
 def _reasoning_budget_message() -> str:
@@ -2454,6 +2515,9 @@ async def llm_call_async(
 ) -> str | tuple[str, str]:
     """Asynchronous LLM call using httpx with connection pooling, timeout, retry logic, and performance logging."""
     provider = _detect_provider(url)
+    # Modalita' voce (A1): vedi `budget_ragionamento_voce`. Anche il percorso
+    # non in streaming passa di qui.
+    reasoning_budget_tokens = _budget_col_turno_vocale(reasoning_budget_tokens)
     messages_copy = _sanitize_llm_messages(messages)
 
     # Consolidate multiple system messages into one at the start.
@@ -2889,6 +2953,11 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
       - data: [DONE]                       — end of stream
     """
     provider = _detect_provider(url)
+    # Modalita' voce (A1): vedi `_budget_col_turno_vocale`. Qui e non nei
+    # singoli chiamanti perche' i giri sono tre (agente con strumenti, agente
+    # senza, chat semplice) e ne bastava uno scoperto per riavere i secondi di
+    # <think> in mezzo.
+    reasoning_budget_tokens = _budget_col_turno_vocale(reasoning_budget_tokens)
     messages_copy = _sanitize_llm_messages(messages)
 
     # Consolidate multiple system messages into one at the start.

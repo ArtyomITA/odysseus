@@ -17,6 +17,7 @@ from core.models import ChatMessage
 from src.request_models import ChatRequest
 from src.llm_core import (
     _normalize_http_status,
+    imposta_turno_vocale,
     llm_call_async,
     llm_call_async_with_route_fallback,
     stream_llm,
@@ -792,6 +793,8 @@ def setup_chat_routes(
         use_research = chat_request.use_research
         time_filter = chat_request.time_filter
         preset_id = chat_request.preset_id
+        # Vergilius / modalita' voce (A1): vedi ChatRequest.voice_mode.
+        imposta_turno_vocale(bool(chat_request.voice_mode))
 
         # Verify the caller owns this session before loading it.
         # Without this, any authenticated user can post into another user's chat.
@@ -1041,6 +1044,12 @@ def setup_chat_routes(
         # accendere insieme (tool set = unione).
         vista_mode = str(
             form_data.get("vista_mode") or (body or {}).get("vista_mode") or ""
+        ).lower() == "true"
+        # Vergilius: il turno arriva dalla conversazione a voce (microfono in
+        # diretta acceso). Il browser lo manda SOLO in quel caso; un turno
+        # scritto a tastiera non porta il campo e non cambia comportamento.
+        voice_mode = str(
+            form_data.get("voice_mode") or (body or {}).get("voice_mode") or ""
         ).lower() == "true"
         # Con la vista accesa, Computer e Browser scelgono QUALI tool di azione
         # forzare oltre agli occhi (i soli occhi = descrivere schermo/allegati).
@@ -1746,6 +1755,13 @@ def setup_chat_routes(
             # the outer scope. (Was `nonlocal` but never reassigned.)
             research_sources = None
             web_sources = ctx.web_sources
+
+            # Vergilius / modalita' voce (A1): il turno arriva dal microfono in
+            # diretta, quindi la risposta sara' letta ad alta voce e il blocco
+            # <think> e' silenzio puro. Impostato QUI dentro e non nel corpo
+            # della rotta: il ContextVar va scritto nel contesto in cui gira il
+            # generatore, altrimenti la chiamata al modello non lo vede.
+            imposta_turno_vocale(voice_mode)
 
             # Register active stream for partial-save safety net
             _active_streams[session] = {"status": "streaming", "partial": "", "query": message, "is_research": effective_do_research, "mode": _effective_mode}

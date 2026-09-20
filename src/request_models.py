@@ -13,6 +13,10 @@ class ChatRequest(BaseModel):
     time_filter: Optional[str] = Field(default=None, description="Time filter for search")
     preset_id: Optional[str] = Field(default=None, description="Preset identifier")
     selected_endpoint_id: Optional[str] = Field(default=None, description="Selected model endpoint ID")
+    # Vergilius: turno dettato a voce con il microfono in diretta acceso. La
+    # risposta sara' letta ad alta voce, quindi il ragionamento si accorcia
+    # (ODYSSEUS_VOICE_REASONING_BUDGET). Assente = turno scritto, nessun cambio.
+    voice_mode: Optional[bool] = Field(default=False, description="Turn dictated in live voice mode")
     
     @field_validator('message')
     @classmethod

@@ -31,18 +31,56 @@ const TAG_RE = /\[([a-zA-Zàèéìòù]+)\]/g;
 // Il guadagno fisso non bastava: l'RMS di una frase sintetizzata sta fra 0.02 e
 // 0.10 a seconda della voce e del volume, cioe' fra il 5% e il 24% di apertura.
 // Sullo schermo e' una bocca che non si muove. Qui si normalizza sul picco
-// recente (una specie di controllo di volume automatico) e si tiene un attacco
-// rapido con un rilascio lento: e' quello che fa sembrare un labiale un labiale
-// e non un lampeggio.
+// recente (una specie di controllo di volume automatico).
 const MOUTH_GAIN = 2.4;
 const MOUTH_FLOOR = 0.02;
 const PICCO_MINIMO = 0.035;   // sotto questo non si normalizza: e' rumore
 const PICCO_DECADIMENTO = 0.995;
-const ATTACCO = 0.6;          // quanto in fretta la bocca si apre
-const RILASCIO = 0.18;        // quanto lentamente si richiude
+// A6: UN SOLO livellamento in tutta la catena.
+//
+// Prima erano tre in cascata: attacco/rilascio per fotogramma qui, un altro
+// 0,5 per fotogramma nel renderer e uno `smoothingTimeConstant` che sui dati
+// nel dominio del tempo non fa niente (MDN: media fra i frame di analisi in
+// FREQUENZA). Tre ritardi sommati, tutti dipendenti dai fotogrammi al secondo.
+//
+// Qui resta solo questo, e in millisecondi invece che "per fotogramma": a 30
+// fps un coefficiente tarato a 60 fps raddoppia il ritardo. Attacco corto
+// perche' la bocca umana apre di scatto, rilascio piu' lungo perche' si chiude
+// piano: e' quello che distingue un labiale da un lampeggio.
+const ATTACCO_MS = 35;
+const RILASCIO_MS = 100;
 // Se chi produce l'audio ci alimenta da fuori (postMessage/BroadcastChannel) e
 // poi smette, la bocca deve chiudersi da sola invece di restare spalancata.
 const SCADENZA_LIVELLO_MS = 250;
+
+// --- A7: bocca a vocali ----------------------------------------------------
+//
+// L'RMS ha UNA dimensione: quanto e' forte. La bocca ne ha almeno due
+// (apertura e forma), quindi "AAA", "III" e "UUU" a pari volume davano la
+// stessa immagine. mao_pro espone gia' ParamA/I/U/E/O: si stima la forma dallo
+// spettro e si pilotano tutti e cinque.
+//
+// Le cinque vocali stanno su un arco: dal grave arrotondato (U) all'acuto
+// stirato (I). La posizione sull'arco e' il centroide spettrale delle quattro
+// bande; il peso si spartisce fra le due vocali adiacenti, cosi' la somma dei
+// cinque parametri vale sempre l'apertura e la bocca non si "gonfia".
+const VOCALI = [
+  { id: 'ParamU', posizione: 0.0, guadagno: 0.70 },
+  { id: 'ParamO', posizione: 0.8, guadagno: 0.90 },
+  { id: 'ParamA', posizione: 1.7, guadagno: 1.00 },
+  { id: 'ParamE', posizione: 2.4, guadagno: 0.90 },
+  { id: 'ParamI', posizione: 3.0, guadagno: 0.72 },
+];
+// Estremi delle quattro bande, in Hz. Seguono grosso modo F1 e F2:
+// 0-500 (voce e F1 chiusa), 500-1000 (F1 aperta, A), 1000-2200 (F2, E/O),
+// 2200-4500 (F2 alta e fricative, I).
+const BANDE_HZ = [[80, 500], [500, 1000], [1000, 2200], [2200, 4500]];
+const FFT = 1024;   // 512 bin, ~47 Hz per bin a 48 kHz: basta e costa poco
+// Ritardo di uscita: quanto la bocca deve stare INDIETRO rispetto all'analisi.
+// Leva per tarare a mano (cuffie Bluetooth: ~170 ms).
+const CHIAVE_RITARDO = 'odysseus.avatar.ritardoBocca';
+const RITARDO_MAX_MS = 400;   // oltre, e' quasi certo un valore sbagliato del driver
+const MEMORIA = 48;           // fotogrammi di storia: ~0,8 s a 60 fps
 
 class AvatarCore extends EventTarget {
   constructor() {
@@ -58,6 +96,19 @@ class AvatarCore extends EventTarget {
     this._livello = 0;          // valore fornito da fuori, 0..1
     this._livelloAl = 0;        // quando e' arrivato
     this._levigato = 0;
+    this._forma = 1.7;          // posizione sull'arco delle vocali (A di riposo)
+    this._ultimoTick = 0;
+    this._bufSpettro = null;
+    this._bufOnda = null;
+    // Storia (tempo, apertura, forma) per la compensazione del ritardo: la
+    // bocca legge il campione che si SENTE adesso, non quello appena
+    // analizzato. Preallocata: nessuna allocazione per fotogramma.
+    this._storia = new Float32Array(MEMORIA * 3);
+    this._storiaN = 0;
+    this._vocali = { ParamA: 0, ParamI: 0, ParamU: 0, ParamE: 0, ParamO: 0 };
+    // Diagnostica per le misure in pagina (scarto bocca-suono, costo per
+    // fotogramma). Solo lettura: nessuno la usa per decidere.
+    this.diag = { ritardoMs: 0, costoMs: 0, fps: 0, livelloGrezzo: 0, forma: 0 };
     try {
       this._channel = new BroadcastChannel(CHANNEL);
     } catch {
@@ -71,6 +122,7 @@ class AvatarCore extends EventTarget {
         if (e.data?.command === 'mouth-level') this.pushLivello(e.data.value);
       });
     } catch { /* niente canale: resta il percorso in-pagina */ }
+    this._ascoltaMicrofono();
   }
 
   // --- outbound -----------------------------------------------------------
@@ -99,12 +151,67 @@ class AvatarCore extends EventTarget {
     this._emit('emotion', { emotion: name });
   }
 
-  _setMouth(value) {
-    const v = value < MOUTH_FLOOR ? 0 : Math.min(1, value);
-    if (Math.abs(v - this.mouth) < 0.01) return;
+  /**
+   * Apertura e forma della bocca.
+   *
+   * `apertura` e' quanto e' aperta (0..1), `forma` dove cade sull'arco delle
+   * vocali (0 = U arrotondata, 3 = I stirata). I cinque parametri li calcola
+   * qui una volta sola, cosi' il renderer in pagina e quello nella finestra
+   * staccata ricevono gli stessi numeri.
+   */
+  _setMouth(apertura, forma) {
+    const v = apertura < MOUTH_FLOOR ? 0 : Math.min(1, apertura);
+    const f = typeof forma === 'number' && isFinite(forma) ? forma : this._forma;
+    const vocali = this._vocali;
+    if (v === 0) {
+      // Silenzio e pause fra i pezzi: bocca CHIUSA, tutti e cinque a zero.
+      for (const n of VOCALI) vocali[n.id] = 0;
+    } else {
+      // Peso spartito fra le due vocali adiacenti sull'arco. Somma = apertura.
+      let sotto = 0;
+      while (sotto < VOCALI.length - 2 && VOCALI[sotto + 1].posizione < f) sotto++;
+      const a = VOCALI[sotto];
+      const b = VOCALI[sotto + 1];
+      const t = Math.max(0, Math.min(1, (f - a.posizione) / (b.posizione - a.posizione)));
+      for (const n of VOCALI) vocali[n.id] = 0;
+      vocali[a.id] = v * (1 - t) * a.guadagno;
+      vocali[b.id] = v * t * b.guadagno;
+    }
+    // La soglia vale sull'apertura: la forma puo' cambiare a volume costante
+    // (da "aaa" a "iii") e quel cambio si deve vedere.
+    if (Math.abs(v - this.mouth) < 0.01 && Math.abs(f - this._forma) < 0.05) return;
     this.mouth = v;
+    this._forma = f;
     document.documentElement.style.setProperty('--speak-intensity', v.toFixed(2));
-    this._emit('mouth', { value: v });
+    this._emit('mouth', { value: v, forma: f, vocali: { ...vocali } });
+  }
+
+  /**
+   * Di quanto la bocca deve stare indietro rispetto all'analisi, in secondi.
+   *
+   * `AudioContext.currentTime` e' il tempo del GRAFO, non dell'altoparlante:
+   * l'analizzatore legge in anticipo di `baseLatency + outputLatency`. Se si
+   * disegna subito, la bocca e' avanti al suono. I due valori vanno riletti a
+   * ogni fotogramma: `outputLatency` cambia durante la vita del contesto e
+   * certi driver lo riportano sbagliato, da cui il tetto.
+   *
+   * Leva: localStorage['odysseus.avatar.ritardoBocca'] in millisecondi.
+   * Vuota o 'auto' = automatico. Serve per le cuffie Bluetooth (~170 ms), che
+   * il browser non sempre dichiara.
+   */
+  _ritardoUscita() {
+    try {
+      const manuale = localStorage.getItem(CHIAVE_RITARDO);
+      if (manuale && manuale !== 'auto') {
+        const ms = Number(manuale);
+        if (isFinite(ms) && ms >= 0) return Math.min(ms, 2000) / 1000;
+      }
+    } catch (_) { /* archivio non accessibile: resta l'automatico */ }
+    const ctx = this._audioCtx;
+    if (!ctx) return 0;
+    const base = Number(ctx.baseLatency) || 0;
+    const uscita = Number(ctx.outputLatency) || 0;
+    return Math.min(base + uscita, RITARDO_MAX_MS / 1000);
   }
 
   // --- inbound: chat stream ----------------------------------------------
@@ -117,7 +224,11 @@ class AvatarCore extends EventTarget {
       return;
     }
     if (typeof json.delta === 'string') {
-      this.setState('talking');
+      // Testo che arriva NON vuol dire suono che esce. Con la voce accesa la
+      // sintesi arriva secondi dopo: fino ad allora il personaggio sta ancora
+      // pensando, e "parla" lo dice l'audio in riproduzione (`attachAudio`).
+      // Senza voce, invece, il testo che scorre E' il parlato.
+      this.setState(this._voceAttesa() ? 'thinking' : 'talking');
       this._scanForEmotion(json.delta);
       return;
     }
@@ -138,7 +249,41 @@ class AvatarCore extends EventTarget {
 
   /** Stream is over (DONE or aborted). */
   handleStreamEnd() {
-    this.setState('idle');
+    // Se la voce sta ancora parlando, il turno non e' finito per l'avatar:
+    // chiudere qui spegnerebbe la bocca a meta' frase.
+    if (this._rafId) return;
+    this.setState(this._microfonoAperto ? 'listening' : 'idle');
+  }
+
+  /** La risposta di questo turno verra' letta ad alta voce? */
+  _voceAttesa() {
+    try {
+      const t = window.aiTTSManager;
+      return !!(t && t.available && t.autoPlay);
+    } catch (_) { return false; }
+  }
+
+  /**
+   * Stato di ascolto: il microfono in diretta e' aperto.
+   *
+   * Gli eventi li emette voiceRecorder quando accende e spegne la
+   * trascrizione in diretta. Non e' lo stesso di `tts-start`/`tts-end`, che
+   * dicono solo se il microfono e' zittito mentre l'assistente parla.
+   */
+  _ascoltaMicrofono() {
+    this._microfonoAperto = false;
+    const apri = () => {
+      this._microfonoAperto = true;
+      if (this.state === 'idle') this.setState('listening');
+    };
+    const chiudi = () => {
+      this._microfonoAperto = false;
+      if (this.state === 'listening') this.setState('idle');
+    };
+    try {
+      window.addEventListener('odysseus:mic-start', apri);
+      window.addEventListener('odysseus:mic-end', chiudi);
+    } catch (_) { /* ambiente senza window: resta senza stato di ascolto */ }
   }
 
   // Tags can straddle chunk boundaries, so keep a small tail buffer.
@@ -172,8 +317,12 @@ class AvatarCore extends EventTarget {
         // una bocca ferma.
         const sorgente = ctx.createMediaElementSource(audioEl);
         const analyser = ctx.createAnalyser();
-        analyser.fftSize = 256;
-        analyser.smoothingTimeConstant = 0.35;
+        // FFT piccola: 512 bin bastano per quattro bande, e il costo cresce
+        // con la finestra. `smoothingTimeConstant` resta a 0: il livellamento
+        // e' uno solo ed e' piu' avanti (A6). Lasciato com'era, avrebbe anche
+        // sporcato la forma delle vocali mediando fra fonemi diversi.
+        analyser.fftSize = FFT;
+        analyser.smoothingTimeConstant = 0;
         sorgente.connect(analyser);
         analyser.connect(ctx.destination);
         audioEl._avatarSource = sorgente;
@@ -194,7 +343,7 @@ class AvatarCore extends EventTarget {
       // restava ferma per tutto il resto della risposta.
       if (this._analyser && this._analyser !== audioEl._avatarAnalyser) return;
       this._untrack();
-      this.setState('idle');
+      this.setState(this._microfonoAperto ? 'listening' : 'idle');
       audioEl.removeEventListener('ended', stop);
       audioEl.removeEventListener('pause', stop);
     };
@@ -215,8 +364,8 @@ class AvatarCore extends EventTarget {
     try {
       const contesto = ctx || nodo.context || this._contesto();
       const analyser = contesto.createAnalyser();
-      analyser.fftSize = 256;
-      analyser.smoothingTimeConstant = 0.35;
+      analyser.fftSize = FFT;
+      analyser.smoothingTimeConstant = 0;
       nodo.connect(analyser);   // derivazione: non tocca il percorso di ascolto
       this._analyser = analyser;
     } catch (e) {
@@ -256,22 +405,60 @@ class AvatarCore extends EventTarget {
     return this._audioCtx;
   }
 
+  /**
+   * Posizione sull'arco delle vocali, dallo spettro appena letto.
+   *
+   * Quattro somme di bande e un centroide: qualche microsecondo, nessuna
+   * allocazione. Non riconosce i fonemi, distingue le FORME: grave e
+   * concentrato in basso = arrotondata, F1 alta = aperta, energia in alto =
+   * stirata. E' il compromesso che costa meno e batte l'RMS di netto.
+   */
+  _formaDaSpettro(analyser) {
+    if (!this._bufSpettro || this._bufSpettro.length !== analyser.frequencyBinCount) {
+      this._bufSpettro = new Uint8Array(analyser.frequencyBinCount);
+    }
+    const spettro = this._bufSpettro;
+    analyser.getByteFrequencyData(spettro);
+    const perBin = (analyser.context.sampleRate || 48000) / analyser.fftSize;
+    let totale = 0;
+    let pesato = 0;
+    for (let b = 0; b < BANDE_HZ.length; b++) {
+      const da = Math.max(1, Math.floor(BANDE_HZ[b][0] / perBin));
+      const a = Math.min(spettro.length - 1, Math.ceil(BANDE_HZ[b][1] / perBin));
+      let somma = 0;
+      for (let i = da; i <= a; i++) somma += spettro[i];
+      somma /= (a - da + 1);   // media, non somma: bande di larghezza diversa
+      totale += somma;
+      pesato += somma * b;
+    }
+    if (totale < 1) return this._forma;
+    return pesato / totale;   // 0..3, gia' la scala dell'arco
+  }
+
   _track() {
     if (this._rafId) return;
-    let buf = null;
+    this._ultimoTick = 0;
+    let fotogrammi = 0;
+    let daQuando = performance.now();
     const tick = () => {
+      const t0 = performance.now();
       let grezzo = null;
+      let forma = this._forma;
 
       if (this._analyser) {
-        if (!buf || buf.length !== this._analyser.fftSize) {
-          buf = new Float32Array(this._analyser.fftSize);
-        }
-        this._analyser.getFloatTimeDomainData(buf);
+        const n = this._analyser.fftSize;
+        if (!this._bufOnda || this._bufOnda.length !== n) this._bufOnda = new Float32Array(n);
+        const onda = this._bufOnda;
+        this._analyser.getFloatTimeDomainData(onda);
         let sum = 0;
-        for (const s of buf) sum += s * s;
-        grezzo = Math.sqrt(sum / buf.length);
-      } else if (performance.now() - this._livelloAl < SCADENZA_LIVELLO_MS) {
+        for (let i = 0; i < n; i++) sum += onda[i] * onda[i];
+        grezzo = Math.sqrt(sum / n);
+        if (grezzo > MOUTH_FLOOR) forma = this._formaDaSpettro(this._analyser);
+      } else if (t0 - this._livelloAl < SCADENZA_LIVELLO_MS) {
+        // Livello gia' misurato da fuori (finestra staccata, voce del
+        // browser): c'e' solo l'ampiezza, quindi la forma resta sulla A.
         grezzo = this._livello;
+        forma = VOCALI[2].posizione;
       }
 
       if (grezzo === null) { this._untrack(); return; }
@@ -281,13 +468,59 @@ class AvatarCore extends EventTarget {
       this._picco = Math.max(grezzo, this._picco * PICCO_DECADIMENTO, PICCO_MINIMO);
       const bersaglio = Math.min(1, (grezzo / this._picco) * (MOUTH_GAIN / 2.4));
 
-      const k = bersaglio > this._levigato ? ATTACCO : RILASCIO;
+      // Unico livellamento, in millisecondi reali: a 30 fps il coefficiente si
+      // adatta da solo invece di raddoppiare il ritardo.
+      const dt = this._ultimoTick ? Math.min(100, t0 - this._ultimoTick) : 16;
+      this._ultimoTick = t0;
+      const tau = bersaglio > this._levigato ? ATTACCO_MS : RILASCIO_MS;
+      const k = 1 - Math.exp(-dt / tau);
       this._levigato += (bersaglio - this._levigato) * k;
-      this._setMouth(this._levigato);
+
+      // A5: si scrive nella storia quello che il GRAFO ha appena elaborato, e
+      // si disegna quello che l'ORECCHIO sente adesso, cioe' il campione di
+      // `ritardo` fa. Senza, la bocca e' avanti al suono di 20-50 ms sulle
+      // casse integrate e di ~170 ms sulle cuffie Bluetooth.
+      // Dal ritardo si toglie quello che il livellamento gia' introduce da se'
+      // (la risposta al gradino arriva a meta' in ~un ATTACCO_MS): sommarli
+      // porterebbe la bocca INDIETRO rispetto al suono invece che a filo.
+      // Misurato su questa macchina: 52 ms di uscita meno 35 di attacco = 17.
+      const ritardo = Math.max(0, this._ritardoUscita() * 1000 - ATTACCO_MS);
+      const slot = (this._storiaN % MEMORIA) * 3;
+      this._storia[slot] = t0;
+      this._storia[slot + 1] = this._levigato;
+      this._storia[slot + 2] = forma;
+      this._storiaN++;
+      const [aperturaUdita, formaUdita] = this._leggiStoria(t0 - ritardo);
+      this._setMouth(aperturaUdita, formaUdita);
+
+      fotogrammi++;
+      if (t0 - daQuando >= 1000) {
+        this.diag.fps = Math.round((fotogrammi * 1000) / (t0 - daQuando));
+        fotogrammi = 0;
+        daQuando = t0;
+      }
+      this.diag.ritardoMs = ritardo;
+      this.diag.livelloGrezzo = grezzo;
+      this.diag.forma = formaUdita;
+      this.diag.costoMs = this.diag.costoMs * 0.9 + (performance.now() - t0) * 0.1;
 
       this._rafId = requestAnimationFrame(tick);
     };
     this._rafId = requestAnimationFrame(tick);
+  }
+
+  /** Campione piu' vicino a `quando` nella storia. Ricerca lineare su 48 voci. */
+  _leggiStoria(quando) {
+    const quanti = Math.min(this._storiaN, MEMORIA);
+    if (quanti === 0) return [this._levigato, this._forma];
+    let migliore = -1;
+    let scarto = Infinity;
+    for (let i = 0; i < quanti; i++) {
+      const s = i * 3;
+      const d = Math.abs(this._storia[s] - quando);
+      if (d < scarto) { scarto = d; migliore = s; }
+    }
+    return [this._storia[migliore + 1], this._storia[migliore + 2]];
   }
 
   _untrack() {
@@ -296,6 +529,8 @@ class AvatarCore extends EventTarget {
     this._analyser = null;
     this._levigato = 0;
     this._picco = PICCO_MINIMO;
+    this._storiaN = 0;
+    this._ultimoTick = 0;
     this._setMouth(0);
   }
 

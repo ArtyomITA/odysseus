@@ -12,16 +12,30 @@ class AITTSManager {
     static MAX_STREAM_URL_CHARS = 1600;
     // Characters that must still follow a comma before it counts as a cut point.
     static SUBSENTENCE_LOOKAHEAD = 25;
-    // PocketTTS skips words past ~50 tokens per chunk; ~180 characters of
-    // Italian sits comfortably under that.
-    static MAX_SPEAK_CHARS = 180;
+    // PocketTTS salta parole oltre 50 token per pezzo. Misurato col suo stesso
+    // tokenizer sentencepiece sull'italiano: 0,46 token per carattere, quindi
+    // 50 token sono ~108 caratteri, non 180. Il vecchio 180 era il doppio del
+    // limite vero e nel log di PocketTTS lasciava tre avvisi
+    // "Chunk has N tokens (max 50)". Stesso numero del ponte (LIMITE_PEZZO).
+    static MAX_SPEAK_CHARS = 105;
     // Il PRIMO pezzo di un turno ha regole piu' larghe: e' l'unico la cui
     // attesa l'utente sente come "silenzio dopo la risposta". Misurato: la
     // prima virgola utile arriva ~0,3 s prima della prima frase intera, e la
     // sintesi tiene (fattore tempo reale 0,56), quindi anticipare non crea
     // buchi piu' avanti. Dal secondo pezzo si torna alle soglie normali,
     // altrimenti la voce suona spezzettata per tutta la risposta.
-    static MIN_FIRST_SPEAK_CHARS = 6;
+    // Stessi numeri del ponte: LIMITE_PRIMO_PEZZO 60, MIN_PRIMO_PEZZO 12.
+    static MAX_FIRST_SPEAK_CHARS = 60;
+    static MIN_FIRST_SPEAK_CHARS = 12;
+    // Congiunzioni prima delle quali si puo' respirare senza che il taglio si
+    // senta. Stesso elenco di `_CONGIUNZIONE` in voce/ponte_voce.py. Si taglia
+    // PRIMA della parola, e solo quando non c'e' punteggiatura utile entro il
+    // tetto: tagliare a ogni "e" o "che" spezzetterebbe la voce.
+    static CONGIUNZIONI = new Set([
+        'e', 'ed', 'o', 'oppure', 'ma', "pero'", 'però', 'mentre', 'quindi',
+        "percio'", 'perciò', "perche'", 'perché', 'poi', 'che', 'se', 'con',
+        'per', 'anche', 'dove', 'quando', 'come',
+    ]);
     // Estremi ragionevoli per la velocita' di lettura: sotto 0.5 la voce
     // strascica fino a diventare incomprensibile, sopra 2 e' un cinguettio.
     // Una impostazione scritta a mano (o da un agente) puo' contenere di tutto.
@@ -154,6 +168,12 @@ class AITTSManager {
             // every number out of the reply.
             .replace(/[\p{Extended_Pictographic}\p{Emoji_Modifier}\p{Regional_Indicator}]/gu, '')
             .replace(/[︀-️‍⃣]/g, '')  // variation selectors, ZWJ, keycap
+            // Tag fra quadre: `[joy]`, `[emotion:happy]`, `[1]`. Vanno tolti
+            // CONTENUTO COMPRESO, e prima della regola sotto che trasforma le
+            // parentesi in spazi: quella lascia la parola, quindi l'assistente
+            // diceva "joy" all'inizio di ogni risposta. Solo etichette corte e
+            // senza spazi interni, cosi' un inciso vero fra quadre resta detto.
+            .replace(/\[\s*(?:[a-z][a-z0-9_.\-]{0,20}|[A-Z][A-Z0-9_.\-]{0,20})(?:\s*[:=]\s*[A-Za-z0-9_.\- ]{0,20})?\s*\]/g, ' ')
             // Brackets of every kind, content kept
             .replace(/[()\[\]{}<>«»„“”"']/g, ' ')
             // Leftover markdown and table furniture
@@ -489,6 +509,11 @@ class AITTSManager {
      * finishes before the next starts. Stopping any message clears the queue.
      */
     enqueue(text, button, resetFn) {
+        // Mai in coda un pezzo che non ha nulla da dire: dopo forSpeech() un
+        // pezzo fatto solo di simboli, emoji o barre di tabella resta vuoto e
+        // synthesize() lo respingeva con "No text to synthesize", rompendo la
+        // coda a meta' messaggio.
+        if (!AITTSManager.forSpeech(this.extractPlainText(text || ''))) return;
         this._queue.push({ text, button, resetFn });
         if (!this._processing) {
             this._processQueue();
@@ -519,15 +544,39 @@ class AITTSManager {
         var consumati = pezzi.join('').length;
         var coda = conSpazio.substring(consumati).trim();
 
+        this._accodaConTetto(pezzi, coda, button, resetFn);
+    }
+
+    /**
+     * Riunisce i pezzi corti e accoda, senza mai superare il tetto.
+     *
+     * Due percorsi finivano alla sintesi senza controllo: la riunione dei
+     * pezzi corti (che sommava fino a superare il tetto) e la `coda`, cioe'
+     * l'avanzo dopo l'ultimo taglio di `_spezza`, che non era ripassato da
+     * nessuna parte. Entrambi finiscono qui.
+     */
+    _accodaConTetto(pezzi, coda, button, resetFn) {
+        var MAX = AITTSManager.MAX_SPEAK_CHARS;
         var accumulato = '';
+        var scarica = (testo) => {
+            var pulito = String(testo || '').trim();
+            if (!pulito) return;
+            var fuori = AITTSManager._sottoTetto(pulito);
+            for (var n = 0; n < fuori.length; n++) this.enqueue(fuori[n], button, resetFn);
+        };
         for (var k = 0; k < pezzi.length; k++) {
+            // La riunione si ferma al tetto: meglio un pezzo un po' corto che
+            // uno che PocketTTS ritaglia da solo saltando parole.
+            if (accumulato && (accumulato + pezzi[k]).trim().length > MAX) {
+                scarica(accumulato);
+                accumulato = '';
+            }
             accumulato += pezzi[k];
             if (accumulato.trim().length < AITTSManager.MIN_SPEAK_CHARS) continue;
-            this.enqueue(accumulato.trim(), button, resetFn);
+            scarica(accumulato);
             accumulato = '';
         }
-        var ultimo = (accumulato + ' ' + coda).trim();
-        if (ultimo) this.enqueue(ultimo, button, resetFn);
+        scarica(accumulato + ' ' + (coda || ''));
     }
 
     /**
@@ -585,8 +634,19 @@ class AITTSManager {
         this._processing = true;
         this._segnala('tts-start');
 
+        // Pulsanti toccati durante questa coda: si rimettono a ▶ tutti insieme
+        // alla fine, non pezzo per pezzo.
+        const daRipristinare = new Set();
+        const ripristina = () => {
+            for (const fn of daRipristinare) {
+                try { fn(); } catch (_) {}
+            }
+            daRipristinare.clear();
+        };
+
         while (this._queue.length > 0) {
             const item = this._queue[0];
+            if (item.resetFn) daRipristinare.add(item.resetFn);
             // Warm the NEXT item while this one plays.
             this._prefetch(this._queue[1]);
             try {
@@ -599,6 +659,7 @@ class AITTSManager {
             }
             if (!this._processing) {
                 // stop() got there first and already signalled the end.
+                ripristina();
                 return;
             }
             // A sentence may have been appended while this one was playing.
@@ -607,17 +668,18 @@ class AITTSManager {
         this._segnala('tts-end');
 
         this._processing = false;
+        ripristina();
     }
 
     async _playQueueItem(item) {
-        const { text, button, resetFn } = item;
+        const { text, button } = item;
         const ICON_LOADING = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="9" stroke-dasharray="42" stroke-dashoffset="12" stroke-linecap="round"><animateTransform attributeName="transform" type="rotate" from="0 12 12" to="360 12 12" dur="0.8s" repeatCount="indefinite"/></circle></svg>';
         var ICON_STOP = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>';
 
         button.innerHTML = ICON_LOADING;
         button.classList.add('loading');
         button.style.color = '#ccc';
-        button.title = 'Loading...';
+        button.title = 'Ferma la lettura';
 
         try {
             if (!this._processing) return;
@@ -629,7 +691,7 @@ class AITTSManager {
             button.innerHTML = ICON_STOP;
             button.classList.remove('loading');
             button.classList.add('playing');
-            button.title = 'Stop';
+            button.title = 'Ferma la lettura';
 
             if (this.useBrowserTTS) {
                 const plainText = this.extractPlainText(text);
@@ -676,28 +738,46 @@ class AITTSManager {
                     // deve troncare la frase.
                     var chiuso = false;
                     var vigile = null;
-                    var ultimoTempo = -1;
-                    var fermoDa = 0;
+                    // Quando l'audio suona davvero il lettore emette `timeupdate`
+                    // ~4 volte al secondo, anche a scheda nascosta. E' la prova
+                    // che NON e' piantato, e vale molto piu' del confronto fra
+                    // due letture di `currentTime`: con la scheda in secondo
+                    // piano il browser rallenta i timer, le due letture cadono
+                    // troppo lontane e il tempo sembrava fermo a torto.
+                    var ultimoAvanzamento = Date.now();
+                    const avanza = () => { ultimoAvanzamento = Date.now(); };
+                    audio.addEventListener('timeupdate', avanza);
                     const concludi = (fn, arg) => {
                         if (chiuso) return;
                         chiuso = true;
                         if (vigile) clearInterval(vigile);
+                        audio.removeEventListener('timeupdate', avanza);
+                        // Un solo audio alla volta per costruzione: chi esce di
+                        // scena viene fermato e sganciato PRIMA che parta il
+                        // pezzo seguente. Senza questo, il vigile dello stallo
+                        // faceva partire il pezzo dopo sopra quello in corso e
+                        // le voci si accavallavano.
+                        try { audio.pause(); } catch (_) {}
+                        try { audio.onended = audio.onerror = audio.onpause = null; } catch (_) {}
                         this.isPlaying = false;
                         if (this.currentAudio === audio) this.currentAudio = null;
                         fn(arg);
                     };
                     vigile = setInterval(() => {
                         if (audio.ended) { concludi(resolve); return; }
-                        var fermo = audio.currentTime === ultimoTempo;
-                        ultimoTempo = audio.currentTime;
-                        if (fermo && !audio.paused && audio.networkState === 2) {
-                            fermoDa += 500;
-                            if (fermoDa >= AITTSManager.STALLO_MS) {
-                                console.warn('TTS: nessun `ended`, passo al pezzo seguente');
-                                concludi(resolve);
-                            }
-                        } else {
-                            fermoDa = 0;
+                        // Scheda nascosta o occlusa: i timer non sono attendibili,
+                        // il vigile resta zitto e riparte da zero al ritorno.
+                        if (typeof document !== 'undefined' && document.hidden) {
+                            ultimoAvanzamento = Date.now();
+                            return;
+                        }
+                        if (audio.paused || audio.networkState !== 2) {
+                            ultimoAvanzamento = Date.now();
+                            return;
+                        }
+                        if (Date.now() - ultimoAvanzamento >= AITTSManager.STALLO_MS) {
+                            console.warn('TTS: nessun `ended`, passo al pezzo seguente');
+                            concludi(resolve);
                         }
                     }, 500);
                     audio.onended = () => concludi(resolve);
@@ -710,9 +790,14 @@ class AITTSManager {
                     }).catch(reject);
                 });
             }
-        } finally {
-            if (resetFn) resetFn();
+        } catch (err) {
+            // Rilanciato: chi registra l'errore e' _processQueue().
+            throw err;
         }
+        // Niente ripristino del pulsante qui: la coda e' fatta di molti pezzi
+        // dello stesso messaggio, e rimettere l'icona ▶ alla fine di ognuno
+        // faceva lampeggiare il tasto e lasciava l'utente senza un comando per
+        // fermare. Il ripristino lo fa _processQueue() a coda finita (e stop()).
     }
 
     // ── Streaming TTS (sentence-by-sentence) ──
@@ -757,42 +842,108 @@ class AITTSManager {
      * The count of characters consumed is what the caller adds to its offset, so
      * every branch must push the text it consumed, whitespace included.
      */
+    /**
+     * Ultimo spazio prima di una congiunzione, oltre `minimo`. -1 se non c'e'.
+     *
+     * Il taglio cade PRIMA della parola (lo spazio resta al pezzo seguente),
+     * come `_CONGIUNZIONE` nel ponte.
+     */
+    static _tagliaSuCongiunzione(testo, minimo) {
+        var re = /\s+(?=([A-Za-zÀ-ÿ']+)[\s,.;:!?])/g;
+        var m;
+        var migliore = -1;
+        while ((m = re.exec(testo)) !== null) {
+            if (m.index >= minimo && AITTSManager.CONGIUNZIONI.has(m[1].toLowerCase())) {
+                migliore = m.index;
+            }
+        }
+        return migliore;
+    }
+
+    /** Ultimo spazio bianco oltre `minimo`. -1 se non c'e': mai a meta' parola. */
+    static _tagliaSuSpazio(testo, minimo) {
+        for (var i = testo.length - 1; i >= minimo; i--) {
+            if (/\s/.test(testo[i])) return i;
+        }
+        return -1;
+    }
+
+    /**
+     * Rete di sicurezza: nessun pezzo oltre il tetto, da qualunque strada arrivi.
+     *
+     * `_spezza` lascia sempre un avanzo (la coda dopo l'ultimo taglio) che
+     * nessuno ricontrollava: la frase finale di un turno arrivava intera a
+     * PocketTTS, che oltre ~50 token salta parole senza dirlo.
+     */
+    static _sottoTetto(testo) {
+        var MAX = AITTSManager.MAX_SPEAK_CHARS;
+        var fuori = [];
+        var resto = String(testo || '').trim();
+        while (resto.length > MAX) {
+            var finestra = resto.slice(0, MAX + 1);
+            var taglio = AITTSManager._tagliaSuCongiunzione(finestra, AITTSManager.MIN_SPEAK_CHARS);
+            if (taglio < 0) taglio = AITTSManager._tagliaSuSpazio(finestra, AITTSManager.MIN_SPEAK_CHARS);
+            // Una sola parola piu' lunga del tetto: si sfora invece di
+            // spaccarla a meta'. Spezzare dentro la parola e' sempre peggio.
+            if (taglio < 0) break;
+            fuori.push(resto.slice(0, taglio).trim());
+            resto = resto.slice(taglio).trim();
+        }
+        if (resto) fuori.push(resto);
+        return fuori.filter(Boolean);
+    }
+
     _spezza(regione, primo) {
         var pezzi = [];
         var corrente = '';
-        // Sul primo pezzo del turno si taglia alla prima virgola utile senza
-        // pretendere che la frase continui: l'attesa qui e' quella che si sente.
-        var LOOK = primo ? 0 : AITTSManager.SUBSENTENCE_LOOKAHEAD;
-        var MINIMO = primo ? AITTSManager.MIN_FIRST_SPEAK_CHARS : AITTSManager.MIN_SPEAK_CHARS;
-        var MAX = AITTSManager.MAX_SPEAK_CHARS;
 
         for (var i = 0; i < regione.length; i++) {
             corrente += regione[i];
             var ch = regione[i];
             var next = regione[i + 1];
             var resto = regione.length - (i + 1);
-            if (!next || !/\s/.test(next)) continue;
+            // Le soglie valgono per il pezzo in costruzione, non per la regione:
+            // solo il PRIMO pezzo del turno si chiude presto. Prima restavano
+            // larghe per tutta la regione e la voce suonava spezzettata.
+            var inTesta = primo && pezzi.length === 0;
+            var LOOK = inTesta ? 0 : AITTSManager.SUBSENTENCE_LOOKAHEAD;
+            var MINIMO = inTesta ? AITTSManager.MIN_FIRST_SPEAK_CHARS : AITTSManager.MIN_SPEAK_CHARS;
+            var MAX = inTesta ? AITTSManager.MAX_FIRST_SPEAK_CHARS : AITTSManager.MAX_SPEAK_CHARS;
 
-            if (ch === '.' || ch === '!' || ch === '?') {
-                var ultima = corrente.trim().split(/\s/).pop() || '';
-                if (/^\d+\.$/.test(ultima)) continue;
-                if (/^[A-Z][a-z]?\.$/.test(ultima)) continue;
-                pezzi.push(corrente);
-                corrente = '';
-                continue;
+            // La punteggiatura vale come taglio SOLO se dopo c'e' uno spazio:
+            // e' la guardia che tiene insieme "1.541,19", "3,5%" e "LDO.MI",
+            // dove dopo il punto o la virgola c'e' una cifra.
+            if (next && /\s/.test(next)) {
+                if (ch === '.' || ch === '!' || ch === '?' || ch === '…') {
+                    var ultima = corrente.trim().split(/\s/).pop() || '';
+                    if (!/^\d+\.$/.test(ultima) && !/^[A-Z][a-z]?\.$/.test(ultima)) {
+                        pezzi.push(corrente);
+                        corrente = '';
+                        continue;
+                    }
+                } else if ((ch === ';' || ch === ':' || ch === ',') &&
+                           corrente.trim().length >= MINIMO &&
+                           resto >= LOOK) {
+                    pezzi.push(corrente);
+                    corrente = '';
+                    continue;
+                }
             }
 
-            if ((ch === ',' || ch === ';' || ch === ':') &&
-                corrente.trim().length >= MINIMO &&
-                resto >= LOOK) {
-                pezzi.push(corrente);
-                corrente = '';
-                continue;
-            }
-
+            // Tetto: qui non si puo' aspettare uno spazio nel testo che segue,
+            // altrimenti un elenco senza punteggiatura sfora di molto. Si torna
+            // indietro dentro il pezzo: prima una congiunzione, poi l'ultimo
+            // spazio, mai a meta' parola.
             if (corrente.length >= MAX) {
-                pezzi.push(corrente);
-                corrente = '';
+                var taglio = AITTSManager._tagliaSuCongiunzione(corrente, MINIMO);
+                if (taglio < 0) taglio = AITTSManager._tagliaSuSpazio(corrente, MINIMO);
+                // Nessuno spazio dentro il pezzo: e' una parola sola piu' lunga
+                // del tetto (un URL, un nome di file). Si sfora, non si spacca:
+                // il taglio arrivera' al primo spazio utile.
+                if (taglio > 0) {
+                    pezzi.push(corrente.slice(0, taglio));
+                    corrente = corrente.slice(taglio);
+                }
             }
         }
         return pezzi;
@@ -827,14 +978,23 @@ class AITTSManager {
         var advancedChars = 0;
         var pending = '';
         var pendingRaw = 0;
+        var btn = this._streamButton || this._createPlaceholderButton();
+        var resetFn = this._streamResetFn || function() {};
         for (var j = 0; j < chunks.length; j++) {
+            // La riunione dei pezzi corti si ferma al tetto: sommare un pezzo
+            // da 14 caratteri con uno da 105 mandava 119 caratteri alla
+            // sintesi, cioe' oltre il limite che si voleva rispettare.
+            if (pending && (pending + chunks[j]).trim().length > AITTSManager.MAX_SPEAK_CHARS) {
+                this.enqueue(pending.trim(), btn, resetFn);
+                advancedChars += pendingRaw;
+                pending = '';
+                pendingRaw = 0;
+            }
             pending += chunks[j];
             pendingRaw += chunks[j].length;
             var soglia = (primo && advancedChars === 0)
                 ? AITTSManager.MIN_FIRST_SPEAK_CHARS : AITTSManager.MIN_SPEAK_CHARS;
             if (pending.trim().length < soglia) continue;
-            var btn = this._streamButton || this._createPlaceholderButton();
-            var resetFn = this._streamResetFn || function() {};
             this.enqueue(pending.trim(), btn, resetFn);
             advancedChars += pendingRaw;
             pending = '';
@@ -897,16 +1057,7 @@ class AITTSManager {
             var pezzi = this._spezza(conSpazio);
             var consumati = pezzi.join('').length;
             var coda = conSpazio.substring(consumati).trim();
-
-            var accumulato = '';
-            for (var k = 0; k < pezzi.length; k++) {
-                accumulato += pezzi[k];
-                if (accumulato.trim().length < AITTSManager.MIN_SPEAK_CHARS) continue;
-                this.enqueue(accumulato.trim(), btn, resetFn);
-                accumulato = '';
-            }
-            var ultimo = (accumulato + ' ' + coda).trim();
-            if (ultimo) this.enqueue(ultimo, btn, resetFn);
+            this._accodaConTetto(pezzi, coda, btn, resetFn);
         }
         this._streamSentencesSent = 0;
     }
@@ -943,7 +1094,7 @@ export function addAITTSButton(messageElement, text) {
     const playButton = document.createElement('button');
     playButton.className = 'ai-tts-button';
     playButton.type = 'button';
-    playButton.title = 'Read aloud';
+    playButton.title = 'Leggi ad alta voce';
     playButton.innerHTML = ICON_PLAY;
     playButton.style.cssText = 'background:none;border:none;color:#6b7280;cursor:pointer;padding:2px 6px;border-radius:4px;transition:color .15s;line-height:1;display:inline-flex;align-items:center;';
 
@@ -956,7 +1107,7 @@ export function addAITTSButton(messageElement, text) {
         playButton.innerHTML = ICON_PLAY;
         playButton.classList.remove('playing', 'loading');
         playButton.style.color = '#6b7280';
-        playButton.title = 'Read aloud';
+        playButton.title = 'Leggi ad alta voce';
     }
 
     playButton.addEventListener('click', async (e) => {

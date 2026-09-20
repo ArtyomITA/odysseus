@@ -243,10 +243,28 @@ function startLiveTranscription(showToast, showError) {
   // gated on the TTS state instead.
   window.addEventListener('odysseus:tts-start', _mutoOn);
   window.addEventListener('odysseus:tts-end', _mutoOff);
+  _segnalaMicrofono('mic-start');
 }
 
 function _mutoOn() { _live?.silenzia(true); }
 function _mutoOff() { _live?.silenzia(false); }
+
+/**
+ * Il microfono in diretta e' aperto o chiuso.
+ *
+ * Serve a due cose: l'avatar entra nello stato "ascolta" invece di restare
+ * immobile, e il turno inviato si dichiara vocale (ragionamento corto). Non e'
+ * lo stesso di `tts-start`/`tts-end`, che dicono solo se il microfono e'
+ * zittito mentre l'assistente parla.
+ */
+function _segnalaMicrofono(nome) {
+  try { window.dispatchEvent(new CustomEvent('odysseus:' + nome)); } catch (_) {}
+}
+
+/** La conversazione a voce e' in corso (microfono in diretta acceso). */
+export function conversazioneVocaleAttiva() {
+  return !!_live;
+}
 
 function stopLiveTranscription() {
   window.removeEventListener('odysseus:tts-start', _mutoOn);
@@ -257,6 +275,7 @@ function stopLiveTranscription() {
   }
   _liveBase = '';
   _liveParziale = '';
+  _segnalaMicrofono('mic-end');
   _resetRecordingUI();
 }
 
@@ -406,6 +425,7 @@ const voiceRecorderModule = {
   getIsRecording,
   init,
   refreshSttProvider,
+  conversazioneVocaleAttiva,
   get _sttProvider() { return _sttProvider; },
   set _sttProvider(v) { _sttProvider = v; },
 };
