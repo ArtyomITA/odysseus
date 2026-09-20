@@ -534,17 +534,45 @@ export function autoResize(textarea) {
   let clone = textarea._resizeClone;
   if (!clone) {
     clone = textarea.cloneNode(false);
-    clone.style.cssText = getComputedStyle(textarea).cssText;
+    // Il clone serve SOLO a misurare. Senza queste tre cure faceva danni:
+    // portava con se' l'id dell'originale (due `#message` nella pagina, e la
+    // seconda casella si vedeva davvero, con il suo segnaposto che si
+    // alternava all'altro), stava accanto all'originale e allargava il
+    // contenitore della chat (scrollWidth 2001 contro 1680), e compariva fra
+    // gli elementi a fuoco e nella lettura assistita.
+    clone.removeAttribute('id');
+    clone.removeAttribute('name');
+    clone.setAttribute('aria-hidden', 'true');
+    clone.setAttribute('tabindex', '-1');
+    clone.readOnly = true;
     clone.style.position = 'absolute';
+    clone.style.top = '0';
+    clone.style.left = '-9999px';
     clone.style.visibility = 'hidden';
     clone.style.height = '0';
+    clone.style.minHeight = '0';
+    clone.style.maxHeight = 'none';
     clone.style.transition = 'none';
     clone.style.overflow = 'hidden';
     clone.style.pointerEvents = 'none';
     clone.style.zIndex = '-1';
-    textarea.parentNode.appendChild(clone);
+    // Fuori dal composer: cosi' non puo' toccare la misura di nulla.
+    document.body.appendChild(clone);
     textarea._resizeClone = clone;
   }
+  // Le proprieta' che decidono l'altezza del testo vanno copiate a mano: senza
+  // l'id il clone non riceve piu' le regole CSS dell'originale, e
+  // `getComputedStyle(...).cssText` in Chrome torna vuoto, quindi la riga che
+  // c'era prima non copiava niente.
+  const cs = getComputedStyle(textarea);
+  const daCopiare = [
+    'fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'lineHeight',
+    'letterSpacing', 'wordSpacing', 'textTransform', 'textIndent',
+    'whiteSpace', 'wordBreak', 'overflowWrap', 'boxSizing',
+    'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft',
+    'borderTopWidth', 'borderRightWidth', 'borderBottomWidth', 'borderLeftWidth',
+  ];
+  for (const p of daCopiare) clone.style[p] = cs[p];
   clone.style.width = textarea.offsetWidth + 'px';
   clone.value = textarea.value;
   clone.style.height = '0';
@@ -1219,13 +1247,37 @@ if (!window._odyEscExpandGuard) {
   // cookbook can render compare UNDER it. Bumping the z-index on every
   // open guarantees most-recently-opened wins both visually AND for ESC.
   let _zCounter = 1000;
-  const _isVisible = (m) => !m.classList.contains('hidden') && getComputedStyle(m).display !== 'none';
+  // Il contatore saliva senza limite (1002 → 1017 → … per tutta la sessione)
+  // e prima o poi scavalcava strati che devono restare sopra. Oltre la soglia
+  // si rinumerano le finestre aperte conservandone l'ordine.
+  const _Z_SOGLIA = 1600;
+  const _rinormalizzaZ = () => {
+    const aperte = [...document.querySelectorAll('.modal')]
+      .filter(_isVisible)
+      .map(m => ({ m, z: parseInt(getComputedStyle(m).zIndex, 10) || 0 }))
+      .sort((a, b) => a.z - b.z);
+    let z = 1000;
+    aperte.forEach(v => { v.m.style.setProperty('z-index', String(++z), 'important'); });
+    _zCounter = Math.max(1000, z);
+  };
+  // Prima le prove che NON costano un ricalcolo di stile: l'osservatore qui
+  // sotto scatta a ogni cambio di classe nella pagina, e chiamare
+  // getComputedStyle ogni volta obbligava il browser a rifare il layout
+  // dentro il microtask, cioe' nel momento peggiore (un frame intero prima
+  // di dipingere l'apertura).
+  const _isVisible = (m) => {
+    if (!m.classList || m.classList.contains('hidden')) return false;
+    if (m.style && m.style.display === 'none') return false;
+    return getComputedStyle(m).display !== 'none';
+  };
   const _promote = (m) => {
     if (!m?.classList?.contains('modal') || !_isVisible(m)) return;
+    if (_zCounter > _Z_SOGLIA) _rinormalizzaZ();
     // Re-entry guard: setting style.zIndex itself fires the observer that
     // calls us back. Skip if this element is already pinned to the top
     // (matches the current counter) so we don't spin into an infinite loop.
-    const cur = parseInt(getComputedStyle(m).zIndex, 10) || 0;
+    // La z la scriviamo sempre in linea: leggerla da li' evita il ricalcolo.
+    const cur = parseInt(m.style.zIndex || getComputedStyle(m).zIndex, 10) || 0;
     if (cur === _zCounter && cur > topToolWindowZ({ exclude: m })) return;
     const z = nextToolWindowZ({
       exclude: m,
@@ -1235,10 +1287,47 @@ if (!window._odyEscExpandGuard) {
     _zCounter = Math.max(_zCounter, z);
     if (z !== cur) m.style.setProperty('z-index', String(z), 'important');
   };
+  // ── fuoco nelle finestre modali (B7) ────────────────────────────────────
+  // All'apertura il fuoco entra nella modale; alla chiusura torna a chi l'ha
+  // aperta. Il Tab resta dentro (gestore piu' sotto). Vive qui perche' qui
+  // passa gia' OGNI modale che diventa visibile: un posto solo, una volta.
+  const _FOCUSABILI = 'a[href],button:not([disabled]),input:not([disabled]),'
+    + 'select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
+  const _visibili = (m) => [...m.querySelectorAll(_FOCUSABILI)]
+    .filter(el => el.offsetWidth > 0 || el.offsetHeight > 0);
+  // Una finestra agganciata a un bordo convive con la chat: non deve
+  // intrappolare il Tab, altrimenti non si potrebbe piu' scrivere.
+  const _bloccante = (m) => !!m
+    && !m.classList.contains('modal-right-docked')
+    && !m.classList.contains('modal-left-docked')
+    && !m.classList.contains('email-snap-left')
+    && !!(m.getAttribute('aria-modal') === 'true' || m.querySelector('[aria-modal="true"]'));
+  const _seguiFuoco = (m) => {
+    if (!m?.classList?.contains('modal')) return;
+    const vis = _isVisible(m);
+    if (vis === !!m._odyModaleVisibile) return;
+    m._odyModaleVisibile = vis;
+    if (!_bloccante(m)) return;
+    if (vis) {
+      m._odyFuocoPrec = document.activeElement;
+      setTimeout(() => {
+        if (!_isVisible(m) || m.contains(document.activeElement)) return;
+        const f = _visibili(m)[0];
+        if (f) { try { f.focus(); } catch {} }
+      }, 40);
+    } else {
+      const prec = m._odyFuocoPrec;
+      m._odyFuocoPrec = null;
+      if (prec && prec.isConnected && typeof prec.focus === 'function') {
+        try { prec.focus(); } catch {}
+      }
+    }
+  };
+
   new MutationObserver((muts) => {
     for (const m of muts) {
-      if (m.type === 'childList') m.addedNodes.forEach(n => n.nodeType === 1 && _promote(n));
-      else if (m.type === 'attributes' && m.target?.classList?.contains('modal')) _promote(m.target);
+      if (m.type === 'childList') m.addedNodes.forEach(n => n.nodeType === 1 && (_promote(n), _seguiFuoco(n)));
+      else if (m.type === 'attributes' && m.target?.classList?.contains('modal')) { _promote(m.target); _seguiFuoco(m.target); }
     }
   }).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'style'] });
   document.querySelectorAll('.modal').forEach(_promote);
@@ -1251,6 +1340,26 @@ if (!window._odyEscExpandGuard) {
         ? m : top
     );
   };
+
+  // Tab resta dentro la modale in cima: senza, si arrivava con 19 tabulazioni
+  // agli elementi della pagina dietro al velo.
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Tab' || e.defaultPrevented) return;
+    const m = pickTopModal();
+    if (!_bloccante(m)) return;
+    const lista = _visibili(m);
+    if (!lista.length) return;
+    const primo = lista[0];
+    const ultimo = lista[lista.length - 1];
+    if (!m.contains(document.activeElement)) {
+      e.preventDefault();
+      (e.shiftKey ? ultimo : primo).focus();
+    } else if (!e.shiftKey && document.activeElement === ultimo) {
+      e.preventDefault(); primo.focus();
+    } else if (e.shiftKey && document.activeElement === primo) {
+      e.preventDefault(); ultimo.focus();
+    }
+  }, true);
 
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape' || e.defaultPrevented) return;

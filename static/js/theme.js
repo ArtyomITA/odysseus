@@ -448,7 +448,9 @@ export function applyBgPattern(pattern) {
   // Clean up any canvas backgrounds
   document.querySelectorAll('#synapse-canvas, #rain-canvas, #constellations-canvas, #perlin-flow-canvas, #petals-canvas, #sparkles-canvas, #embers-canvas').forEach(c => c.remove());
   if (p !== 'none') document.body.classList.add('bg-pattern-' + p);
-  if (_CANVAS_PATTERNS[p]) _CANVAS_PATTERNS[p]();
+  // Con "meno animazioni" resta il fondale statico del CSS: il canvas non
+  // viene proprio creato.
+  if (_CANVAS_PATTERNS[p] && !_menoAnimazioni()) _CANVAS_PATTERNS[p]();
   // Hide sliders that do nothing on static patterns.
   const hide = _STATIC_PATTERNS.has(p);
   const ig = document.getElementById('theme-bg-intensity-group');
@@ -1518,6 +1520,65 @@ export function closePopup() {
 // Expose for app.js wiring + AI ui_control
 export function getCustomThemes() { return _loadCustomThemes(); }
 
+// ── regia unica dei fondali animati ──────────────────────────────────────
+// I sette fondali a canvas giravano a tutto schermo e a piena frequenza
+// SEMPRE: anche a scheda nascosta, anche con un pannello a tutta area
+// davanti, anche mentre il modello stava scrivendo. E siccome la barra
+// laterale ha una sfocatura viva sopra, ogni fotogramma costringeva il
+// browser a ri-rasterizzare la sfocatura. Qui si decide una volta per tutti
+// quando disegnare, e non si superano i 30 fotogrammi al secondo.
+const _SEL_FONDALI = '#synapse-canvas,#rain-canvas,#constellations-canvas,'
+  + '#perlin-flow-canvas,#petals-canvas,#sparkles-canvas,#embers-canvas';
+let _fondaleGenerando = false;
+try {
+  window.addEventListener('odysseus:chat-busy-change', (e) => {
+    _fondaleGenerando = !!(e && e.detail && e.detail.active);
+  });
+} catch (_) {}
+
+function _menoAnimazioni() {
+  try { return window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (_) { return false; }
+}
+
+function _fondaleInPausa() {
+  if (document.hidden) return true;
+  if (_fondaleGenerando) return true;
+  if (_menoAnimazioni()) return true;
+  const b = document.body;
+  if (!b) return true;
+  // Un pannello a tutta area copre il fondale: disegnarlo e' lavoro che
+  // nessuno vede.
+  if (b.classList.contains('shadowbroker-active')) return true;
+  if (b.classList.contains('doc-view') || b.classList.contains('notes-view')) return true;
+  return false;
+}
+
+let _fondaleFermo = false;
+function _mostraFondali(on) {
+  if (_fondaleFermo === !on) return;
+  _fondaleFermo = !on;
+  document.querySelectorAll(_SEL_FONDALI).forEach((c) => {
+    c.style.visibility = on ? '' : 'hidden';
+  });
+}
+
+let _ultimoFondale = 0;
+function _rafFondale(draw) {
+  requestAnimationFrame((t) => {
+    if (_fondaleInPausa()) {
+      _mostraFondali(false);
+      // In una scheda nascosta il rAF non scatta: la catena si ferma da sola
+      // e riparte quando la scheda torna davanti.
+      setTimeout(() => _rafFondale(draw), 500);
+      return;
+    }
+    _mostraFondali(true);
+    if (t - _ultimoFondale < 31) { _rafFondale(draw); return; }
+    _ultimoFondale = t;
+    draw(t);
+  });
+}
+
 // ── Synapse background effect ──
 // Uses the CSS grid pattern as base, overlays fast-moving small light pulses on grid lines
 function _initSynapse() {
@@ -1573,7 +1634,7 @@ function _initSynapse() {
       canvas.remove();
       return;
     }
-    requestAnimationFrame(draw);
+    _rafFondale(draw);
     ctx.clearRect(0, 0, W, H);
     const c = getColor();
 
@@ -1657,7 +1718,7 @@ function _initRain() {
       canvas.remove();
       return;
     }
-    requestAnimationFrame(draw);
+    _rafFondale(draw);
     ctx.clearRect(0, 0, W, H);
     const c = getColor();
     // Intensity also controls rain speed + spawn rate (feels slower/lighter when dim)
@@ -1743,7 +1804,7 @@ function _initConstellations() {
       canvas.remove();
       return;
     }
-    requestAnimationFrame(draw);
+    _rafFondale(draw);
     t += 0.01;
     ctx.clearRect(0, 0, W, H);
     const c = getColor();
@@ -1834,7 +1895,7 @@ function _initPerlinFlow() {
   }
   function draw() {
     if (!document.body.classList.contains('bg-pattern-perlin-flow')) { window.removeEventListener('resize', _onResize); canvas.remove(); return; }
-    requestAnimationFrame(draw);
+    _rafFondale(draw);
     ctx.fillStyle = getFade();
     ctx.fillRect(0, 0, W, H);
     const c = getColor();
@@ -1888,7 +1949,7 @@ function _initPetals() {
   function getColor() { const s = getComputedStyle(document.documentElement); return s.getPropertyValue('--bg-effect-color').trim() || s.getPropertyValue('--fg').trim() || '#9cdef2'; }
   function draw() {
     if (!document.body.classList.contains('bg-pattern-petals')) { window.removeEventListener('resize', _onResize); canvas.remove(); return; }
-    requestAnimationFrame(draw);
+    _rafFondale(draw);
     ctx.clearRect(0, 0, W, H);
     const c = getColor();
     const sz = _getEffectSize();
@@ -1950,7 +2011,7 @@ function _initSparkles() {
   }
   function draw() {
     if (!document.body.classList.contains('bg-pattern-sparkles')) { window.removeEventListener('resize', _onResize); canvas.remove(); return; }
-    requestAnimationFrame(draw);
+    _rafFondale(draw);
     ctx.clearRect(0, 0, W, H);
     const c = getColor();
     const sizeMult = _getEffectSize();
@@ -2020,7 +2081,7 @@ function _initEmbers() {
       canvas.remove();
       return;
     }
-    requestAnimationFrame(draw);
+    _rafFondale(draw);
     // Fade previous frame (destination-out keeps canvas transparent where no embers)
     ctx.globalCompositeOperation = 'destination-out';
     ctx.fillStyle = 'rgba(0,0,0,0.18)';

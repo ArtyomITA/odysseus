@@ -63,8 +63,24 @@ function _applyRememberedDock(id) {
 // it BEHIND an already-open tool with a higher static z-index. Start above
 // those statics and bump on every bring-to-front.
 let _modalTopZ = 300;
+// Oltre questa soglia la pila viene rinumerata: in una sessione lunga il
+// contatore saliva senza limite (1002 → 1017 → …) e finiva per scavalcare
+// strati che devono restare sopra (chip del dock a 10030, menu portati sul
+// body). Rinumerare conserva l'ORDINE e riporta i valori in basso.
+const _Z_SOGLIA = 900;
+const _Z_BASE = 300;
+function _rinormalizzaZ() {
+  const aperte = [...document.querySelectorAll('body > .modal, body > .research-overlay, body > .notes-pane-backdrop')]
+    .filter((el) => !el.classList.contains('hidden') && !el.classList.contains('modal-minimized'))
+    .map((el) => ({ el, z: parseInt(getComputedStyle(el).zIndex, 10) || 0 }))
+    .sort((a, b) => a.z - b.z);
+  let z = _Z_BASE;
+  aperte.forEach((v) => { v.el.style.setProperty('z-index', String(++z), 'important'); });
+  _modalTopZ = Math.max(_Z_BASE, z);
+}
 function _bringToFront(modal) {
   if (!modal) return;
+  if (_modalTopZ > _Z_SOGLIA) _rinormalizzaZ();
   const z = nextToolWindowZ({
     exclude: modal,
     current: getComputedStyle(modal).zIndex,
@@ -1162,8 +1178,12 @@ export function register(id, { restoreFn, closeFn, railBtnId, sidebarBtnId, labe
   // transition. Idempotent on re-register.
   const _modalEl = document.getElementById(id);
   if (_modalEl && !_modalEl._mmAutoStackObs) {
-    const _isVisible = () => !_modalEl.classList.contains('hidden')
-        && getComputedStyle(_modalEl).display !== 'none';
+    // Come in ui.js: prima le prove che non costano un ricalcolo di stile.
+    const _isVisible = () => {
+      if (_modalEl.classList.contains('hidden')) return false;
+      if (_modalEl.style.display === 'none') return false;
+      return getComputedStyle(_modalEl).display !== 'none';
+    };
     _modalEl._mmAutoStackLast = _isVisible();
     const obs = new MutationObserver(() => {
       const vis = _isVisible();

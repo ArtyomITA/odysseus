@@ -1915,6 +1915,16 @@ import { loadPanel } from './panels.js';
 	          if (window.OdysseusVista.browser()) fd.append('browser_mode', 'true');
 	        }
 	      } catch (_) { /* pannello non caricato */ }
+	      // Vergilius: turno dettato a voce. Il server accorcia il ragionamento
+	      // (ODYSSEUS_VOICE_REASONING_BUDGET) perche' il blocco <think> non si
+	      // puo' leggere ad alta voce: finche' non si chiude, la sintesi non
+	      // parte e si sente solo silenzio. Mandato SOLO con il microfono in
+	      // diretta acceso: un turno scritto non cambia comportamento.
+	      try {
+	        if (window.voiceRecorderModule?.conversazioneVocaleAttiva?.()) {
+	          fd.append('voice_mode', 'true');
+	        }
+	      } catch (_) { /* microfono non caricato */ }
 	      if (!isPlanMode && _pendingApprovedPlan) {
 	        fd.append('approved_plan', _pendingApprovedPlan.slice(0, 8192));
 	        _pendingApprovedPlan = '';
@@ -2105,6 +2115,12 @@ import { loadPanel } from './panels.js';
         try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ''; }
         catch { return ''; }
       })();
+      // Richiesta partita e nessun suono ancora: l'avatar deve gia' mostrare
+      // che sta pensando. Aspettare il primo evento SSE lo lasciava immobile
+      // proprio nei secondi in cui l'attesa si sente.
+      if (sessionModule.getCurrentSessionId() === streamSessionId) {
+        try { window.OdysseusAvatar?.setState('thinking'); } catch (_) {}
+      }
       _sendPerf.mark('chat_stream_post_begin');
       const res = await fetch(`${API_BASE}/api/chat_stream`, {
         method: 'POST',
@@ -2379,7 +2395,10 @@ import { loadPanel } from './panels.js';
       }
 
       function _formatThinkStats(seconds, tokenCount) {
-        const time = seconds ? seconds + 's' : '';
+        // Un pensiero c'e' stato ma il cronometro non l'ha visto: meglio non
+        // scrivere niente che scrivere "0.0s", che sembra un guasto.
+        const num = Number(seconds);
+        const time = (Number.isFinite(num) && num > 0) ? seconds + 's' : '';
         const tokens = tokenCount ? tokenCount + ' tok' : '';
         return time && tokens ? time + ' · ' + tokens : (time || tokens);
       }
@@ -3551,6 +3570,20 @@ import { loadPanel } from './panels.js';
                   continue;
                 }
                 if (metrics) {
+                  // Il tempo del pensiero misurato dal server vince su quello
+                  // preso nel browser: il cronometro del browser parte al primo
+                  // pezzo di <think>, e quando il giro non e' in streaming quel
+                  // pezzo arriva tutto insieme, percio' segnava sempre 0.0s.
+                  var _pensieroSrv = Number(metrics.thinking_time);
+                  if (Number.isFinite(_pensieroSrv) && _pensieroSrv > 0) {
+                    var _srv = _pensieroSrv.toFixed(1);
+                    var _tag = /<think(?:\s+time="[^"]*")?>/i;
+                    accumulated = accumulated.replace(_tag, '<think time="' + _srv + '">');
+                    roundText = roundText.replace(_tag, '<think time="' + _srv + '">');
+                    if (_liveThinkTimerEl) {
+                      _liveThinkTimerEl.textContent = _formatThinkStats(_srv, _liveThinkTokenCount);
+                    }
+                  }
                   const metricsTarget = _metricsTargetForTurn();
                   if (metricsTarget) displayMetrics(metricsTarget, metrics);
                   refreshChatContextHeader('metrics');
@@ -5639,13 +5672,23 @@ import { loadPanel } from './panels.js';
       const sessionId = sessionModule.getCurrentSessionId();
       if (!sessionId) return;
 
-      const keepCount = msgIndex;
+      // Il punto di taglio va detto con l'id di riga, non con la posizione
+      // della bolla: un turno agente rende piu' bolle per una sola riga e la
+      // storia arriva paginata, quindi i due conteggi non coincidono. Con
+      // l'indice sbagliato il server teneva il messaggio originale e cancellava
+      // la risposta buona del turno prima, e il testo modificato finiva in
+      // fondo: il trascritto salvato non combaciava piu' con quello a schermo.
+      const dbId = userMsgElement.dataset.dbId;
+      const corpo = dbId ? { from_msg_id: dbId } : { keep_count: msgIndex };
       try {
-        await fetch(`${API_BASE}/api/session/${sessionId}/truncate`, {
+        const res = await fetch(`${API_BASE}/api/session/${sessionId}/truncate`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ keep_count: keepCount })
+          body: JSON.stringify(corpo)
         });
+        // Senza questo controllo un errore del server passava inosservato e
+        // l'interfaccia troncava lo stesso, sfasandosi dalla storia salvata.
+        if (!res.ok) throw new Error('troncamento rifiutato (' + res.status + ')');
 
         // Remove DOM elements from msgIndex onward
         for (let i = allMsgs.length - 1; i >= msgIndex; i--) {

@@ -33,6 +33,12 @@
     overflow:hidden;font:14px/1.5 var(--font-family,'Fira Code',ui-monospace,monospace)}
   #cat-panel.aperto{display:flex}
 
+  /* Con un pannello a tutta area davanti (ShadowBroker) il pulsante restava
+     sopra la mappa e ne copriva i controlli in alto a destra: si toglie di
+     mezzo finche' il pannello e' aperto. */
+  body.shadowbroker-active #cat-launch,
+  body.shadowbroker-active #cat-panel{display:none}
+
   #cat-head{flex:0 0 auto;display:flex;align-items:center;gap:10px;
     padding:16px 18px 14px;border-bottom:1px solid var(--border,#355a66)}
   #cat-head .ttl{font-weight:600;font-size:.98rem;letter-spacing:.02em;color:var(--brand-color,var(--red,#c678dd))}

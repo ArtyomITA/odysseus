@@ -244,7 +244,10 @@ export function initKeyboardShortcuts(modules) {
       return;
     }
     if (_matchesCombo(e, kb.cancel)) {
-      if (chatModule) chatModule.abortCurrentRequest();
+      // `true` = ferma anche il giro staccato sul server. Senza, l'interfaccia
+      // si sbloccava ma il modello continuava a generare a vuoto, tenendo la
+      // GPU occupata fino alla fine della risposta.
+      if (chatModule) chatModule.abortCurrentRequest(true);
     }
     if (_matchesCombo(e, kb.incognito)) {
       e.preventDefault();

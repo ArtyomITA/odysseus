@@ -194,6 +194,11 @@ _TIMEOUT_EXEMPT_PREFIXES = (
 class _RequestTimeoutMiddleware(_BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         path = request.url.path or ""
+        # I file statici li serve StaticFiles dal disco: non possono restare
+        # appesi, e avvolgere ~140 richieste a caricamento in un wait_for
+        # costava un task in piu' ciascuna.
+        if path.startswith("/static/"):
+            return await call_next(request)
         if any(path.startswith(p) for p in _TIMEOUT_EXEMPT_PREFIXES):
             return await call_next(request)
         try:
@@ -210,6 +215,12 @@ class _InteractiveActivityMiddleware(_BaseHTTPMiddleware):
         from src.interactive_gate import should_track_interactive_request, track_interactive_request
 
         path = request.url.path or ""
+        # Un file statico non e' un'azione dell'utente: una pagina fresca ne
+        # chiede ~140 e ognuno faceva partire un task che fermava i lavori di
+        # sfondo, piu' l'entrata/uscita dal contesto di tracciamento. La
+        # navigazione e le chiamate API restano tracciate come prima.
+        if path.startswith("/static/"):
+            return await call_next(request)
         if not should_track_interactive_request(path, request.method):
             return await call_next(request)
         async def _stop_background():
@@ -224,6 +235,10 @@ class _InteractiveActivityMiddleware(_BaseHTTPMiddleware):
 
 class _SlowRequestLogMiddleware(_BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
+        # I file statici non finiscono nel log dei lenti: sono ~140 a
+        # caricamento e sarebbero solo rumore (e una lettura di env a testa).
+        if (request.url.path or "").startswith("/static/"):
+            return await call_next(request)
         start = time.perf_counter()
         status = 500
         try:

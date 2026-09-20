@@ -40,10 +40,13 @@
     color:color-mix(in srgb,var(--fg) 70%,transparent);background:transparent;\
     border:1px solid color-mix(in srgb,var(--border,#355a66) 80%,transparent);transition:all .15s}\
   #modo-bar .mchip:hover{border-color:var(--brand-color,var(--red,#c678dd));color:var(--fg)}\
-  #modo-bar .mchip.on{color:var(--brand-color,var(--red,#c678dd));border-color:var(--brand-color,var(--red,#c678dd));\
-    background:color-mix(in srgb,var(--brand-color,var(--red,#c678dd)) 12%,transparent)}\
-  #modo-bar .mchip .dot{width:6px;height:6px;border-radius:50%;background:currentColor;opacity:.35}\
-  #modo-bar .mchip.on .dot{opacity:1;box-shadow:0 0 6px currentColor}\
+  #modo-bar .mchip[aria-pressed="true"]{color:var(--bg,#0b0f14);border-color:var(--brand-color,var(--red,#c678dd));\
+    background:var(--brand-color,var(--red,#c678dd));box-shadow:0 0 0 1px var(--brand-color,var(--red,#c678dd))}\
+  #modo-bar .mchip[aria-pressed="true"]:hover{color:var(--bg,#0b0f14)}\
+  #modo-bar .mchip[aria-pressed="false"]{border-style:dashed}\
+  #modo-bar .mchip .dot{width:6px;height:6px;border-radius:50%;background:currentColor;opacity:.3}\
+  #modo-bar .mchip[aria-pressed="true"] .dot{opacity:1;box-shadow:0 0 6px currentColor}\
+  #modo-bar .mchip:focus-visible{outline:2px solid var(--brand-color,var(--red,#c678dd));outline-offset:2px}\
   #modo-bar .mchip.hid{display:none}\
   #modo-bar .msep{width:1px;height:14px;background:color-mix(in srgb,var(--border,#355a66) 70%,transparent);margin:0 2px}\
   #modo-bar .mmod{font:600 11px/1 var(--font-family,inherit);color:color-mix(in srgb,var(--fg) 55%,transparent);padding:0 4px}';
@@ -54,7 +57,7 @@
       toggle: function () { var sb = window.OdysseusShadowBroker; if (sb) sb.impostaModo(!sb.modoAttivo()); } },
     { id: 'financial', label: 'Financial', needs: 'overflow-financial-btn',
       on: function () { return !!(window.OdysseusShadowBroker && window.OdysseusShadowBroker.financialAttivo()); },
-      toggle: function () { var sb = window.OdysseusShadowBroker; if (sb) sb.impostaFinancial(!sb.financialAttivo()); } },
+      toggle: function () { var sb = window.OdysseusShadowBroker; if (sb) sb.impostaFinancial(!sb.financialAttivo(), true); } },
     { id: 'computer', label: 'Computer', needs: 'overflow-computer-btn', vista: true,
       on: function () { return !!(window.OdysseusVista && window.OdysseusVista.computer()); },
       toggle: function () { var b = document.getElementById('overflow-computer-btn'); if (b) b.click(); } },
@@ -74,8 +77,14 @@
     CHIP.forEach(function (c) {
       var el = bar.querySelector('[data-modo="' + c.id + '"]'); if (!el) return;
       var nascosto = _nascosto(c.needs) || (c.vista && !vista);
+      var acceso = !nascosto && c.on();
       el.classList.toggle('hid', !!nascosto);
-      el.classList.toggle('on', !nascosto && c.on());
+      el.classList.toggle('on', acceso);
+      // Lo stato non si legge piu' solo dall'opacita': riempimento pieno se
+      // acceso, bordo tratteggiato se spento, e aria-pressed per chi legge
+      // con la tastiera o con uno screen reader.
+      el.setAttribute('aria-pressed', acceso ? 'true' : 'false');
+      el.title = (acceso ? 'Acceso' : 'Spento') + ' — ' + c.label + ': clic per cambiare';
     });
     var mod = bar.querySelector('.mmod');
     if (mod) {
@@ -92,10 +101,24 @@
     var bar = document.createElement('span'); bar.id = 'modo-bar';
     CHIP.forEach(function (c) {
       var ch = document.createElement('span'); ch.className = 'mchip hid'; ch.setAttribute('data-modo', c.id);
+      ch.setAttribute('role', 'button');
+      ch.setAttribute('tabindex', '0');
+      ch.setAttribute('aria-pressed', 'false');
       ch.innerHTML = '<span class="dot"></span><span></span>';
       ch.querySelector('span:last-child').textContent = c.label;
       ch.title = 'Attiva/disattiva ' + c.label;
-      ch.addEventListener('click', function (e) { e.preventDefault(); e.stopPropagation(); c.toggle(); setTimeout(aggiornaBarra, 0); });
+      // Ogni clic conta: si aggiorna subito dallo stato reale, senza
+      // aspettare il giro dell'intervallo (i clic ravvicinati si perdevano).
+      var premi = function (e) {
+        e.preventDefault(); e.stopPropagation();
+        c.toggle();
+        aggiornaBarra();
+        setTimeout(aggiornaBarra, 0);
+      };
+      ch.addEventListener('click', premi);
+      ch.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') premi(e);
+      });
       bar.appendChild(ch);
     });
     var sep = document.createElement('span'); sep.className = 'msep'; bar.appendChild(sep);
@@ -159,8 +182,30 @@
     menu.appendChild(note);
     wrap.appendChild(btn); wrap.appendChild(menu);
     meta.insertBefore(wrap, meta.firstChild);
-    btn.addEventListener('click', function (e) { e.stopPropagation(); menu.classList.toggle('on'); });
-    document.addEventListener('click', function () { menu.classList.remove('on'); });
+    btn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      var apri = !menu.classList.contains('on');
+      menu.classList.toggle('on', apri);
+      btn.setAttribute('aria-expanded', apri ? 'true' : 'false');
+    });
+    document.addEventListener('click', function () {
+      menu.classList.remove('on');
+      btn.setAttribute('aria-expanded', 'false');
+    });
+    // Escape chiude PRIMA il menu a tendina: e' lo strato piu' in alto.
+    // In cattura e con stopImmediatePropagation, cosi' non arriva anche
+    // all'arbitro che chiuderebbe una finestra sotto.
+    document.addEventListener('keydown', function (e) {
+      if (e.key !== 'Escape' || !menu.classList.contains('on')) return;
+      e.stopImmediatePropagation();
+      e.preventDefault();
+      menu.classList.remove('on');
+      btn.setAttribute('aria-expanded', 'false');
+      try { btn.focus(); } catch (_) {}
+    }, true);
+    btn.setAttribute('role', 'button');
+    btn.setAttribute('tabindex', '0');
+    btn.setAttribute('aria-expanded', 'false');
   }
 
   function aggiornaProfilo(profilo) {

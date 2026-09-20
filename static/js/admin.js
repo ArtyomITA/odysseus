@@ -1890,7 +1890,67 @@ const TOOL_META = {
   manage_webhooks:   { name: 'Webhooks',         desc: 'Configure webhook events',        cat: 'System',     ctx: '~100' },
   manage_tokens:     { name: 'API Tokens',       desc: 'Manage API access tokens',        cat: 'System',     ctx: '~100' },
   manage_settings:   { name: 'Settings',         desc: 'Change app settings',             cat: 'System',     ctx: '~100' },
+  // Vergilius: i nostri strumenti finivano tutti in "Other" (81 su 81).
+  calcola:           { name: 'Calcola',          desc: 'Arithmetic, in batch',            cat: 'Intelligence', ctx: '~80' },
+  fin_mercati:       { name: 'Markets',          desc: 'Quotes and tickers',              cat: 'Financial',  ctx: '~200' },
+  fin_appalti:       { name: 'Federal Contracts', desc: 'Awards and contractors',         cat: 'Financial',  ctx: '~200' },
+  fin_insider:       { name: 'Insider Trades',   desc: 'Insider transactions',            cat: 'Financial',  ctx: '~200' },
+  fin_archivio:      { name: 'Filings Archive',  desc: 'Stored financial filings',        cat: 'Financial',  ctx: '~200' },
 };
+
+// Categoria di ripiego per gli strumenti senza scheda: si ricava dal prefisso
+// dell'id invece di buttare tutto in "Other". Le schede qui sopra vincono.
+const _CAT_PREFISSI = [
+  ['osint_',   'Intelligence'],
+  ['fin_',     'Financial'],
+  ['vista_',   'Vista'],
+  ['browser_', 'Browser'],
+  ['email',    'Email'],
+  ['draft_email', 'Email'],
+  ['send_email', 'Email'],
+  ['reply_to_email', 'Email'],
+  ['read_email', 'Email'],
+  ['archive_email', 'Email'],
+  ['delete_email', 'Email'],
+  ['list_email', 'Email'],
+  ['search_email', 'Email'],
+  ['mark_email', 'Email'],
+  ['bulk_email', 'Email'],
+  ['ai_draft_email', 'Email'],
+  ['scan_email', 'Email'],
+  ['download_attachment', 'Email'],
+  ['serve_', 'Models'],
+  ['list_serve', 'Models'],
+  ['list_served', 'Models'],
+  ['list_cached_models', 'Models'],
+  ['stop_served_model', 'Models'],
+  ['adopt_served_model', 'Models'],
+  ['download_model', 'Models'],
+  ['cancel_download', 'Models'],
+  ['list_downloads', 'Models'],
+  ['search_hf_models', 'Models'],
+  ['manage_calendar', 'Calendar'],
+  ['manage_contact', 'Calendar'],
+  ['resolve_contact', 'Calendar'],
+  ['manage_notes', 'Knowledge'],
+  ['manage_research', 'Search'],
+  ['trigger_research', 'Search'],
+  ['glob', 'Code'],
+  ['grep', 'Code'],
+  ['ls', 'Code'],
+  ['edit_file', 'Code'],
+  ['apply_patch', 'Code'],
+  ['edit_image', 'Media'],
+];
+function _metaStrumento(id) {
+  const m = TOOL_META[id];
+  if (m) return m;
+  let cat = 'Other';
+  for (const [pre, c] of _CAT_PREFISSI) {
+    if (id === pre || id.startsWith(pre)) { cat = c; break; }
+  }
+  return { name: id, desc: '', cat, ctx: '?' };
+}
 
 async function loadBuiltinTools() {
   const list = el('adm-builtin-tools-list');
@@ -1912,14 +1972,15 @@ async function loadBuiltinTools() {
     // Group by category
     const groups = {};
     for (const t of tools) {
-      const meta = TOOL_META[t.id] || { name: t.id, desc: '', cat: 'Other', ctx: '?' };
+      const meta = _metaStrumento(t.id);
       const cat = meta.cat;
       if (!groups[cat]) groups[cat] = [];
       groups[cat].push({ ...t, ...meta });
     }
 
     // Category order
-    const catOrder = ['Code', 'Search', 'Documents', 'Media', 'Knowledge', 'Multi-Agent', 'Sessions', 'System', 'Other'];
+    const catOrder = ['Intelligence', 'Financial', 'Vista', 'Code', 'Search', 'Documents', 'Media',
+      'Knowledge', 'Email', 'Calendar', 'Browser', 'Models', 'Multi-Agent', 'Sessions', 'System', 'Other'];
     let html = '';
     for (const cat of catOrder) {
       const items = groups[cat];

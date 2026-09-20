@@ -2089,13 +2089,19 @@ export function displayMetrics(messageElement, metrics) {
   // Keep token counts in the Message Stats popup; the footer should stay slim.
   const costStr0 = cost !== null ? `$${cost < 0.01 ? cost.toFixed(4) : cost.toFixed(3)}` : null;
   const hasTps = tps != null && tps !== 'undefined';
+  // Tempo totale del turno accanto ai tok/s: da solo, il ritmo non dice quanto
+  // si e' aspettato, che e' la cosa che si vuole sapere su una macchina lenta.
+  const totNum = Number(metrics.total_time);
+  const totStr = Number.isFinite(totNum) && totNum > 0 ? `${totNum.toFixed(1)}s` : null;
   const metricsLabel = hasTps
-    ? `${tps} tok/s`
-    : costStr0
-      ? costStr0
-      : responseTime != null
-        ? `${responseTime}s`
-        : '';
+    ? (totStr ? `${tps} tok/s · ${totStr}` : `${tps} tok/s`)
+    : totStr
+      ? totStr
+      : costStr0
+        ? costStr0
+        : responseTime != null
+          ? `${responseTime}s`
+          : '';
   if (!metricsLabel) return;
   metricsContainer.textContent = metricsLabel;
   metricsContainer.style.cursor = 'pointer';
@@ -2396,6 +2402,35 @@ document.addEventListener('keydown', _handleAskUserShortcut);
  * same UI can be used both for a live SSE event and for a persisted tool event
  * after a session reload.
  */
+/**
+ * Traduzione della sola PARTE VISIBILE del pannello di approvazione.
+ *
+ * La domanda e le voci arrivano in inglese dal server (`src/tool_approvals.py`).
+ * Qui si traduce solo cio' che si legge: le chiavi che il codice confronta
+ * (`option.value`, la `decision` inviata al server) non vengono toccate, e
+ * nemmeno `detail.label`, che resta l'originale.
+ */
+const APPROVAZIONE_IT = {
+  'Allow this task to continue?': 'Consentire a questa azione di proseguire?',
+  'Allow for this task': 'Consenti per questa richiesta',
+  'Allow for this chat session': 'Consenti per tutta questa chat',
+  'Allow once': 'Consenti una volta',
+  'Allow this exact action once?': 'Consentire questa azione, una volta sola?',
+  'Deny': 'Nega',
+  'Do not execute the proposed action.': "Non eseguire l'azione proposta.",
+  'Untrusted context influenced this run, so continuing with otherwise-gated actions needs your explicit approval.':
+    'Questo giro e\' stato influenzato da contenuti non fidati: per proseguire con azioni normalmente bloccate serve il tuo consenso esplicito.',
+  'Execute the sealed action and allow every otherwise-gated action needed to finish this request. Current tool, account, workspace, and sandbox restrictions still apply.':
+    "Esegue l'azione e consente tutte le azioni normalmente bloccate che servono a finire questa richiesta. Restano validi i limiti di strumenti, conto, cartella di lavoro e recinto.",
+  'Execute the sealed action and stop asking at this gate for later requests in this chat. Current tool, account, workspace, and sandbox restrictions still apply.':
+    "Esegue l'azione e smette di chiedere a questo varco per le richieste seguenti di questa chat. Restano validi i limiti di strumenti, conto, cartella di lavoro e recinto.",
+};
+
+function inItaliano(testo) {
+  const chiave = String(testo == null ? '' : testo).trim();
+  return APPROVAZIONE_IT[chiave] || testo;
+}
+
 export function renderAskUserCard(payload, options) {
   const aq = payload || {};
   if (aq.resolved) return null;
@@ -2435,7 +2470,7 @@ export function renderAskUserCard(payload, options) {
   const question = document.createElement('div');
   question.className = 'ask-user-question';
   question.id = `ask-user-q-${Date.now()}-${Math.floor(Math.random() * 1e4)}`;
-  question.innerHTML = emojiText(aq.question);
+  question.innerHTML = emojiText(inItaliano(aq.question));
   card.appendChild(question);
   card.setAttribute('aria-labelledby', question.id);
 
@@ -2498,12 +2533,12 @@ export function renderAskUserCard(payload, options) {
     }
     const labelText = document.createElement('span');
     labelText.className = 'ask-user-option-label';
-    labelText.innerHTML = emojiText(label);
+    labelText.innerHTML = emojiText(inItaliano(label));
     row.appendChild(labelText);
     if (description) {
       const descriptionText = document.createElement('span');
       descriptionText.className = 'ask-user-option-desc';
-      descriptionText.innerHTML = emojiText(description);
+      descriptionText.innerHTML = emojiText(inItaliano(description));
       row.appendChild(descriptionText);
     }
     if (!multi) {

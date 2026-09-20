@@ -731,7 +731,11 @@
     <!-- Static: core actions -->
     <button class="icon-rail-btn" id="rail-search-btn" title="Search conversations (Ctrl+K)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="10" cy="10" r="7"/><path d="M21 21l-4.35-4.35"/></svg></button>
     <button class="icon-rail-btn rail-new-chat" id="rail-new-session" title="New chat"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></button>
-    <button class="icon-rail-btn" id="rail-delete-session" title="Delete session">&#x2715;</button>
+    <!-- Azione distruttiva: nella barra ripiegata stava due posti sotto
+         "New chat" e senza etichetta. Ora e' staccata dalle altre da un
+         separatore e da un margine, e si tinge di rosso al passaggio. -->
+    <div class="rail-separator"></div>
+    <button class="icon-rail-btn rail-pericolo" id="rail-delete-session" title="Elimina la conversazione (Delete session)" aria-label="Elimina la conversazione">&#x2715;</button>
     <div class="rail-separator"></div>
     <!-- Dynamic contextual indicators (shown only while active) -->
     <button class="icon-rail-btn rail-dynamic" id="rail-chats" title="Chat ready" style="display:none"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></button>
@@ -1360,7 +1364,9 @@
         <span class="sb-panel-sub">Global Threat Intercept</span>
         <span class="sb-panel-status" id="sb-panel-status">connessione…</span>
         <button type="button" class="sb-panel-btn" id="sb-open-external" title="Apri in una finestra separata">&#x2197;</button>
-        <button type="button" class="sb-panel-btn" id="sb-panel-close" title="Torna alla chat">&#x2715;</button>
+        <!-- Stesso glifo di chiusura delle altre finestre (&#x2716;): prima
+             ogni finestra ne usava uno suo. -->
+        <button type="button" class="sb-panel-btn" id="sb-panel-close" title="Torna alla chat">&#x2716;</button>
       </header>
       <div class="sb-panel-body" id="sb-panel-body"></div>
     </section>
@@ -1409,17 +1415,22 @@
 
     bottomBtn.addEventListener('click', () => {
       cancelAutoScroll();
-      const target = container.scrollHeight - container.clientHeight;
+      // Il fondo va ricalcolato a ogni fotogramma. Preso una volta sola al clic
+      // restava indietro: mentre l'animazione scorre il contenuto cresce ancora
+      // (immagini, grafici, resa del markdown, testo che arriva), e la corsa si
+      // fermava sul messaggio precedente.
+      const fondo = () => container.scrollHeight - container.clientHeight;
       _scrollingToBottom = true;
       function step() {
         if (!_scrollingToBottom) return;
+        const target = fondo();
         const diff = target - container.scrollTop;
-        if (diff <= 8) { container.scrollTop = target; _scrollingToBottom = false; return; }
-        container.scrollTop += diff * 0.2;
+        if (diff <= 2) { container.scrollTop = target; _scrollingToBottom = false; return; }
+        container.scrollTop += Math.max(diff * 0.2, 1);
         _scrollRaf = requestAnimationFrame(step);
       }
       step();
-      _scrollTimeout = setTimeout(() => { if (_scrollingToBottom) { container.scrollTop = target; _scrollingToBottom = false; } }, 1500);
+      _scrollTimeout = setTimeout(() => { if (_scrollingToBottom) { container.scrollTop = fondo(); _scrollingToBottom = false; } }, 1500);
     });
     new ResizeObserver(reposition).observe(chatBar);
     new MutationObserver(update).observe(container, {childList:true, subtree:true});
@@ -2669,11 +2680,15 @@
   </div>
 
 <!-- Load modules in this order -->
-<script src="/static/lib/live2dcubismcore.min.js"></script>
-<script src="/static/lib/pixi.min.js"></script>
+<!-- defer: sono 800 KB di Live2D/PixiJS che bloccavano l'analisi della pagina
+     proprio mentre partono i moduli. Con defer l'ordine fra loro e con i
+     moduli qui sotto resta lo stesso (ordine del documento), ma non fermano
+     piu' il parser. -->
+<script defer src="/static/lib/live2dcubismcore.min.js"></script>
+<script defer src="/static/lib/pixi.min.js"></script>
 <!-- Patches PixiJS to run without unsafe-eval, which our CSP forbids -->
-<script src="/static/lib/pixi-unsafe-eval.min.js"></script>
-<script src="/static/lib/live2d-cubism4.min.js"></script>
+<script defer src="/static/lib/pixi-unsafe-eval.min.js"></script>
+<script defer src="/static/lib/live2d-cubism4.min.js"></script>
 <script type="module" src="/static/js/audioDevices.js"></script>
 <script type="module" src="/static/js/avatarCore.js"></script>
 <script type="module" src="/static/js/avatarDock.js"></script>

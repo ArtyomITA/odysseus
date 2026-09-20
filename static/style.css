@@ -463,7 +463,11 @@ body.bg-pattern-sparkles {
       margin: 0;
       padding: 0;
       box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
-      backdrop-filter: blur(10px);
+      /* Niente `backdrop-filter` qui: il fondo della barra e' gia' pieno
+         (--sidebar-bg/--panel sono opachi), quindi la sfocatura non si vedeva
+         mai — ma obbligava il browser a ri-rasterizzare i 240x911 px sotto a
+         OGNI fotogramma del fondale animato. Il vetro smerigliato resta
+         disponibile: lo accende `body.theme-frosted`, che ha le sue regole. */
       border: 1px solid color-mix(in srgb, var(--fg) 11%, transparent);
       position: relative;
     }
@@ -4450,7 +4454,9 @@ body.bg-pattern-sparkles {
                   transform .45s cubic-bezier(0.22, 1, 0.36, 1);
       z-index: 9999; pointer-events: none;
       box-shadow: 0 4px 12px rgba(0,0,0,0.2);
-      backdrop-filter: blur(12px);
+      /* Il toast sta in pagina a opacita' 0 quasi sempre: una sfocatura
+         permanente su un elemento invisibile e' solo lavoro per il
+         compositore. Si accende con il toast e si spegne con lui. */
       max-width: min(360px, calc(100vw - 32px));
       min-width: min(220px, calc(100vw - 32px));
       min-height: 34px;
@@ -4458,7 +4464,7 @@ body.bg-pattern-sparkles {
       align-items: center;
       box-sizing: border-box;
     }
-    .toast.show { opacity:1; transform: translateX(0); }
+    .toast.show { opacity:1; transform: translateX(0); backdrop-filter: blur(12px); }
     .toast .toast-checkmark {
       display: inline-flex;
       align-items: center;
@@ -5649,7 +5655,10 @@ body.bg-pattern-sparkles {
       border-radius:10px;
       box-shadow:0 8px 32px rgba(0,0,0,0.45);
       pointer-events:auto;
-      animation: modal-enter 0.25s ease-out both;
+      /* 0,25 s facevano sembrare lenta ogni apertura. 0,14 s si legge come
+         "istantaneo ma non brusco", e l'animazione tocca solo transform e
+         opacity (vedi @keyframes modal-enter): niente layout. */
+      animation: modal-enter 0.14s ease-out both;
     }
     .memory-modal-content,
     .tasks-modal-content,
@@ -23976,7 +23985,8 @@ body:not(.welcome-ready) #welcome-screen {
   }
 }
 .modal-content.modal-closing {
-  animation: modal-exit 0.18s ease-in both;
+  /* Anche la chiusura sotto i 150 ms: solo transform e opacity. */
+  animation: modal-exit 0.12s ease-in both;
 }
 
 @keyframes cookbook-modal-enter {
@@ -41566,4 +41576,91 @@ body.settings-sidebar-resize-active {
   .settings-sidebar-toggle {
     display: none;
   }
+}
+
+/* ── Ripiego emoji e nota del grafico illeggibile (QA 20 set) ───────────── */
+
+/* Il font della chat e' monospace e non ha i pittogrammi: le emoji uscivano
+   come rettangoli vuoti. Qui il font del TESTO non cambia (resta il primo
+   della pila): si aggiunge solo, in coda, un font a colori per i caratteri
+   che il primo non possiede. */
+.msg .body,
+#message,
+.edit-textarea {
+  font-family: var(--font-family, 'Fira Code', monospace),
+               "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji";
+}
+
+/* Blocco ```chart che non si riesce a leggere: una riga sobria e il JSON
+   ripiegato, mai degli assi vuoti che sembrano un grafico riuscito. */
+.chart-illeggibile { margin: 8px 0; }
+.chart-illeggibile-nota {
+  font-size: 0.85em;
+  color: var(--color-muted-alt, #6b7280);
+  margin-bottom: 4px;
+}
+.chart-illeggibile > details > summary {
+  cursor: pointer;
+  font-size: 0.8em;
+  color: var(--color-muted-alt, #6b7280);
+}
+.chart-illeggibile > details > pre { margin: 6px 0 0; }
+
+/* ── Blocchi di codice: etichetta del linguaggio e tasto copia (QA 20 set) ── */
+
+/* Il linguaggio era gia' scritto nel markup (`<code data-lang="python">`, da
+   markdown.js) ma non si vedeva da nessuna parte. Qui si rende visibile senza
+   toccare il testo del blocco: `::before` non entra nel contenuto copiato. */
+.msg .body pre > code[data-lang]:not([data-lang=""])::before {
+  content: attr(data-lang);
+  display: block;
+  font-size: 0.72em;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  font-style: normal;
+  opacity: 0.6;
+  margin-bottom: 4px;
+}
+
+/* Il tasto copia c'era ma stava a opacita' zero finche' non ci passavi sopra:
+   nessuno sapeva che esistesse. Ora si intravede sempre e si accende al
+   passaggio del puntatore (le regole di :hover piu' sopra restano valide). */
+.msg .body pre .copy-code { opacity: 0.3; }
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Vergilius: animazioni infinite solo quando servono davvero.
+
+   1) "Meno animazioni" di sistema (prefers-reduced-motion): i cicli infiniti
+      si fermano. Restano i colori e i punti, sparisce il battito.
+   2) Un elemento che non si vede non deve animarsi: nella barra laterale
+      ripiegata le etichette e i pallini restano nel DOM ma fuori vista, e i
+      loro cicli continuavano a girare a vuoto.
+   ───────────────────────────────────────────────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  .rail-notes-badge.fired,
+  .tool-notes-dot,
+  .rail-minimized::after,
+  .email-notif-dot,
+  .research-badge,
+  .th-cursor,
+  .memory-synapse-sweep,
+  .research-synapse .rs-pulse,
+  .research-synapse .rs-edge.rs-edge-firing {
+    animation: none !important;
+  }
+}
+.sidebar-collapsed .sidebar .tool-notes-dot,
+.sidebar-collapsed .sidebar .rail-minimized::after,
+.sidebar-collapsed .sidebar .rail-notes-badge.fired {
+  animation: none !important;
+}
+
+/* Azione distruttiva nella barra a icone: staccata dalle altre e riconoscibile
+   al passaggio del puntatore, cosi' non si preme per sbaglio al posto di
+   "New chat". */
+.icon-rail-btn.rail-pericolo { margin-top: 6px; margin-bottom: 6px; opacity: .45; }
+.icon-rail-btn.rail-pericolo:hover {
+  opacity: 1;
+  color: var(--red, #d2544f);
+  background: color-mix(in srgb, var(--red, #d2544f) 14%, transparent);
 }

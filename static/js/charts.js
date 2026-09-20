@@ -62,6 +62,57 @@
   }
 
   /**
+   * Ripulisce il JSON che scrive il modello.
+   *
+   * Il modello commenta i numeri dentro il blocco (`"data": [1,2] // normalizzate`)
+   * e lascia virgole finali: JSON.parse rifiuta entrambi e il grafico spariva,
+   * lasciando a schermo il JSON grezzo. Qui si tolgono commenti `//` e
+   * bloccanti, e le virgole prima di `}` o `]`.
+   *
+   * Scansione carattere per carattere e non espressioni regolari: dentro una
+   * stringa `//` e' un URL, non un commento.
+   */
+  function ripulisci(testo) {
+    var out = '';
+    var dentroStringa = false;
+    var fuga = false;
+    for (var i = 0; i < testo.length; i++) {
+      var c = testo[i];
+      if (dentroStringa) {
+        out += c;
+        if (fuga) fuga = false;
+        else if (c === '\\') fuga = true;
+        else if (c === '"') dentroStringa = false;
+        continue;
+      }
+      if (c === '"') { dentroStringa = true; out += c; continue; }
+      if (c === '/' && testo[i + 1] === '/') {
+        while (i < testo.length && testo[i] !== '\n') i++;
+        out += '\n';
+        continue;
+      }
+      if (c === '/' && testo[i + 1] === '*') {
+        i += 2;
+        while (i < testo.length && !(testo[i] === '*' && testo[i + 1] === '/')) i++;
+        i++;
+        continue;
+      }
+      if (c === '}' || c === ']') {
+        // Virgola finale: si toglie guardando indietro nell'uscita.
+        out = out.replace(/,\s*$/, '');
+      }
+      out += c;
+    }
+    return out;
+  }
+
+  /** JSON.parse tollerante: prima il testo com'e', poi ripulito. */
+  function leggiJson(raw) {
+    try { return JSON.parse(raw); } catch (e) { /* si riprova ripulito */ }
+    try { return JSON.parse(ripulisci(raw)); } catch (e) { return undefined; }
+  }
+
+  /**
    * Validate + normalize a raw ```chart spec (JSON text).
    * Pure function, never throws. Returns
    *   { type, title, labels, series: [{ name, data }] }
@@ -70,11 +121,49 @@
   function validaSpec(raw) {
     try {
       if (typeof raw !== 'string' || !raw.trim()) return null;
-      var spec = JSON.parse(raw);
+      var spec = leggiJson(raw);
       if (!spec || typeof spec !== 'object' || Array.isArray(spec)) return null;
 
+      // Forma Chart.js: `{ "type": …, "data": { "labels": …, "datasets": … } }`.
+      // Il modello la produce spesso perche' e' quella che ha visto in giro.
+      if (spec.data && typeof spec.data === 'object' && !Array.isArray(spec.data) &&
+          (Array.isArray(spec.data.labels) || Array.isArray(spec.data.datasets))) {
+        var interno = spec.data;
+        spec = {
+          type: spec.type,
+          title: spec.title != null ? spec.title : interno.title,
+          labels: interno.labels,
+          datasets: interno.datasets,
+          data: Array.isArray(interno.data) ? interno.data : undefined
+        };
+      }
+
+      // `values` come sinonimo di `data`.
+      if (!Array.isArray(spec.data) && Array.isArray(spec.values)) spec.data = spec.values;
+
+      // `data` come elenco di coppie: `[{ "label": "A", "value": 3 }, …]`.
+      if (Array.isArray(spec.data) && spec.data.length && spec.data[0] &&
+          typeof spec.data[0] === 'object' && !Array.isArray(spec.data[0])) {
+        var etichette = [];
+        var valori = [];
+        for (var q = 0; q < spec.data.length; q++) {
+          var riga = spec.data[q] || {};
+          var et = riga.label != null ? riga.label : (riga.name != null ? riga.name : riga.x);
+          var va = riga.value != null ? riga.value : (riga.y != null ? riga.y : riga.data);
+          if (et == null || va == null) { etichette = null; break; }
+          etichette.push(et);
+          valori.push(va);
+        }
+        if (etichette) {
+          if (!Array.isArray(spec.labels) || !spec.labels.length) spec.labels = etichette;
+          spec.data = valori;
+        }
+      }
+
       var type = TYPE_MAP[String(spec.type || '').trim().toLowerCase()];
-      if (!type) return null;
+      // Senza `type` dichiarato si disegna a barre: e' il caso piu' comune e
+      // meglio di niente.
+      if (!type) type = 'bar';
 
       var title = null;
       if (typeof spec.title === 'string' && spec.title.trim()) title = spec.title;
@@ -91,15 +180,22 @@
 
       var seriesIn;
       if (Array.isArray(spec.series)) seriesIn = spec.series;
-      else if (Array.isArray(spec.data)) seriesIn = [{ name: title || 'Data', data: spec.data }];
+      else if (Array.isArray(spec.datasets)) seriesIn = spec.datasets;
+      else if (Array.isArray(spec.data)) seriesIn = [{ name: title || 'Dati', data: spec.data }];
       else return null;
       if (seriesIn.length === 0 || seriesIn.length > MAX_SERIES) return null;
 
       var series = [];
       for (var s = 0; s < seriesIn.length; s++) {
         var entry = seriesIn[s];
-        if (!entry || typeof entry !== 'object' || Array.isArray(entry) || !Array.isArray(entry.data)) return null;
-        var name = (typeof entry.name === 'string' && entry.name) ? entry.name : ('Serie ' + (s + 1));
+        // Una serie puo' arrivare anche come elenco nudo di numeri.
+        if (Array.isArray(entry)) entry = { data: entry };
+        if (!entry || typeof entry !== 'object') return null;
+        // `values` e `label` sono i sinonimi che usa il modello.
+        if (!Array.isArray(entry.data) && Array.isArray(entry.values)) entry = { name: entry.name || entry.label, data: entry.values };
+        if (!Array.isArray(entry.data)) return null;
+        var etichetta = (typeof entry.name === 'string' && entry.name) ? entry.name : entry.label;
+        var name = (typeof etichetta === 'string' && etichetta) ? etichetta : ('Serie ' + (s + 1));
         // Truncate/pad to labels.length; every value through Number(),
         // non-finite (and explicit null/undefined) -> null gap.
         var data = [];
@@ -108,6 +204,16 @@
         }
         series.push({ name: name, data: data });
       }
+
+      // Nulla da disegnare: meglio la nota sobria del ripiego che degli assi
+      // 0-1 vuoti, che sembrano un grafico riuscito e non lo sono.
+      var qualcosa = false;
+      for (var t = 0; t < series.length && !qualcosa; t++) {
+        for (var u = 0; u < series[t].data.length; u++) {
+          if (series[t].data[u] !== null) { qualcosa = true; break; }
+        }
+      }
+      if (!qualcosa) return null;
 
       return { type: type, title: title, labels: labels, series: series };
     } catch (e) {
@@ -198,17 +304,39 @@
     return { type: spec.type, data: { labels: spec.labels, datasets: datasets }, options: options };
   }
 
-  /** Invalid spec: swap the container for a plain escaped code block. */
+  /**
+   * Spec inservibile: una riga sobria e il JSON ripiegato.
+   *
+   * Prima si mostrava il JSON grezzo a tutta pagina, che e' rumore per chi
+   * legge; e in qualche caso restava anche una tela con gli assi 0-1 e zero
+   * barre, che sembra un grafico riuscito. Qui la tela sparisce sempre.
+   */
   function degrade(box, raw) {
     try {
       var fb = box.querySelector('.chart-fallback code') || box.querySelector('.chart-fallback');
       var original = fb ? fb.textContent : (raw || '');
+
+      var wrap = document.createElement('div');
+      wrap.className = 'chart-illeggibile';
+
+      var nota = document.createElement('div');
+      nota.className = 'chart-illeggibile-nota';
+      nota.textContent = 'grafico non leggibile';
+      wrap.appendChild(nota);
+
+      var det = document.createElement('details');
+      var sum = document.createElement('summary');
+      sum.textContent = 'mostra i dati';
+      det.appendChild(sum);
       var pre = document.createElement('pre');
       var code = document.createElement('code');
       code.setAttribute('data-lang', 'chart');
       code.textContent = original; // textContent escapes on serialization
       pre.appendChild(code);
-      if (box.parentNode) box.parentNode.replaceChild(pre, box);
+      det.appendChild(pre);
+      wrap.appendChild(det);
+
+      if (box.parentNode) box.parentNode.replaceChild(wrap, box);
     } catch (e) {
       /* leave the visible fallback as-is */
     }

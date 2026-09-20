@@ -173,7 +173,15 @@ async function _mount() {
   frame.setAttribute('allow', 'fullscreen; clipboard-read; clipboard-write');
   frame.addEventListener('load', () => {
     if (!health.backend) {
-      _setStatus('mappa attiva, backend giù', 'warn');
+      // La sonda dice "non ancora": il backend puo' essere solo lento ad
+      // alzarsi. Finche' non c'e' una seconda risposta negativa si dice che
+      // si sta verificando, non che e' giu'.
+      _setStatus('verifico il backend…');
+      _probe().then((h2) => {
+        if (!_open) return;
+        if (h2 && h2.backend) _setStatus('carico la mappa…');
+        else _setStatus('mappa attiva, backend giù', 'warn');
+      });
       return;
     }
     // `load` scatta quando arriva il documento, ma MapLibre ci mette altri
@@ -262,7 +270,18 @@ function _aggiornaPulsanteFin() {
     : 'Attiva il profilo Financial: sotto Intelligence, ristretto ai dati economici';
 }
 
-export function impostaFinancial(on) {
+/**
+ * Accende/spegne il profilo Financial.
+ *
+ * `daUtente` distingue il passaggio spento→acceso deciso dall'utente (chip o
+ * voce di menu) da un allineamento interno: solo il primo apre il popup di
+ * configurazione e imposta il preset della mappa. Prima il popup viveva nel
+ * gestore del menu "+", quindi il chip in alto lo accendeva in silenzio e
+ * all'avvio compariva da solo sopra la chat.
+ */
+export function impostaFinancial(on, daUtente) {
+  const prima = financialAttivo();
+  const intelPrima = localStorage.getItem(PREF_MODO) === '1';
   try {
     localStorage.setItem(PREF_FIN, on ? '1' : '0');
     // Financial vive dentro Intelligence: accenderlo da solo lascerebbe il
@@ -274,10 +293,20 @@ export function impostaFinancial(on) {
   _aggiornaPulsanteFin();
   try {
     if (window.uiModule?.showToast) {
+      // L'accoppiamento con Intelligence e' dichiarato, non nascosto: se
+      // accendendo Financial si accende anche Intelligence, lo si dice.
+      const traino = on && !intelPrima;
       window.uiModule.showToast(
-        on ? 'Financial: mercati, appalti, insider' : 'Financial disattivato');
+        on ? ('Financial: mercati, appalti, insider' + (traino ? ' (accende anche Intelligence)' : ''))
+           : 'Financial disattivato');
     }
   } catch (_) {}
+  // Solo il passaggio spento→acceso voluto dall'utente apre il popup e
+  // imposta la mappa: mai all'avvio, mai su un riallineamento interno.
+  if (daUtente && on && !prima) {
+    _presetMappaFinanziario();
+    mostraConfigFinancial();
+  }
 }
 
 export function isOpen() {
@@ -297,11 +326,17 @@ export async function open() {
   // Cheap liveness ticker while the panel is visible; stopped on close so a
   // backgrounded workspace costs nothing.
   if (_probeTimer) clearInterval(_probeTimer);
+  // Uno stato incerto non si annuncia come guasto: serve una seconda sonda
+  // negativa di fila prima di scrivere "giù".
+  let _negativi = 0;
   _probeTimer = setInterval(async () => {
     const h = await _probe();
-    if (!h || !h.frontend) _setStatus('non raggiungibile', 'bad');
-    else if (!h.backend) _setStatus('mappa attiva, backend giù', 'warn');
-    else _setStatus('collegato', 'ok');
+    const giu = !h || !h.frontend;
+    const senzaBackend = !giu && !h.backend;
+    if (!giu && !senzaBackend) { _negativi = 0; _setStatus('collegato', 'ok'); return; }
+    _negativi += 1;
+    if (_negativi < 2) { _setStatus('verifico…'); return; }
+    _setStatus(giu ? 'non raggiungibile' : 'mappa attiva, backend giù', giu ? 'bad' : 'warn');
   }, 15000);
 }
 
@@ -343,14 +378,25 @@ async function _presetMappaFinanziario() {
 }
 
 // ── popup di configurazione Financial ────────────────────────────────────
-// Compare a OGNI attivazione del profilo (e all'avvio se il profilo era già
-// acceso): le scelte riguardano il budget di chiamate Finnhub condiviso, e
-// vanno riviste consapevolmente, non ereditate in silenzio. Riusa le classi
+// Compare quando l'UTENTE accende il profilo (chip in alto o voce del menu
+// "+"), mai da solo al caricamento: le scelte riguardano il budget di chiamate
+// Finnhub condiviso e vanno riviste consapevolmente. Riusa le classi
 // .modal/.confirm-btn come styledConfirm(), zero markup in index.html.
+
+// Col backend ShadowBroker spento queste due chiamate restavano appese per
+// decine di secondi: il popup compariva 20 s dopo il clic, sopra qualunque
+// cosa l'utente stesse facendo. Con un tetto di 2,5 s si apre subito, al
+// massimo con i valori predefiniti.
+function _fetchBreve(url, ms) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => { try { ctrl.abort(); } catch (_) {} }, ms || 2500);
+  return fetch(url, { credentials: 'same-origin', signal: ctrl.signal })
+    .finally(() => clearTimeout(t));
+}
 
 async function _configAttuale() {
   try {
-    const r = await fetch('/api/shadowbroker/financial-config', { credentials: 'same-origin' });
+    const r = await _fetchBreve('/api/shadowbroker/financial-config');
     const j = await r.json();
     const c = j && (j.config || j);
     return {
@@ -365,7 +411,7 @@ async function _configAttuale() {
 
 async function _regoleProfilo() {
   try {
-    const r = await fetch('/api/shadowbroker/rules?profile=financial', { credentials: 'same-origin' });
+    const r = await _fetchBreve('/api/shadowbroker/rules?profile=financial', 4000);
     const j = await r.json();
     return (j && j.rules) || '';
   } catch (_) { return ''; }
@@ -394,7 +440,8 @@ export async function mostraConfigFinancial() {
       '<div class="modal-body" style="max-height:60vh;overflow-y:auto;">' +
         '<div style="opacity:.8;font-size:.9em;margin-bottom:6px;">' +
           'Queste scelte pesano sul budget Finnhub (60 chiamate/min, condiviso ' +
-          'con lo sweep dei prezzi). Si riaprono a ogni attivazione del profilo.</div>' +
+          'con lo sweep dei prezzi). Questa finestra si riapre ogni volta che ' +
+          'accendi il profilo Financial.</div>' +
         riga(`<input type="radio" name="fin-preset" value="core" ${cfg.preset === 'core' ? 'checked' : ''}>`,
              'Titoli: Core (25)',
              'difesa + big tech + cripto, prezzi aggiornati ogni minuto') +
@@ -413,7 +460,10 @@ export async function mostraConfigFinancial() {
         '</details>' +
       '</div>' +
       '<div class="modal-footer">' +
-        '<button id="fin-config-cancel" class="confirm-btn confirm-btn-secondary">Annulla</button>' +
+        // data-action="close": e' l'aggancio con cui l'arbitro di Escape in
+        // ui.js chiude lo strato piu' in alto. Cosi' Escape equivale ad Annulla
+        // senza aggiungere un secondo gestore di tastiera.
+        '<button id="fin-config-cancel" data-action="close" class="confirm-btn confirm-btn-secondary">Annulla</button>' +
         '<button id="fin-config-ok" class="confirm-btn confirm-btn-primary">Applica</button>' +
       '</div>' +
     '</div>';
@@ -456,8 +506,23 @@ export async function mostraConfigFinancial() {
     testata.addEventListener('pointercancel', molla);
   }
 
-  const chiudi = () => overlay.remove();
+  // `.modal` nasce con pointer-events:none (il velo non deve rubare clic):
+  // qui pero' il velo SERVE, perche' il clic fuori equivale ad Annulla. Lo
+  // riattiva solo questo popup, e solo finche' e' aperto.
+  overlay.style.pointerEvents = 'auto';
+
+  const chiamante = document.activeElement;
+  const chiudi = () => {
+    overlay.remove();
+    // Il fuoco torna a chi ha aperto il popup.
+    try { if (chiamante && chiamante.isConnected) chiamante.focus(); } catch (_) {}
+  };
   overlay.addEventListener('click', (e) => { if (e.target === overlay) chiudi(); });
+  // Il fuoco entra nel popup: senza, Tab continuava a girare nella pagina
+  // dietro al velo.
+  setTimeout(() => {
+    try { document.getElementById('fin-config-ok')?.focus(); } catch (_) {}
+  }, 30);
   document.getElementById('fin-config-cancel')?.addEventListener('click', chiudi);
   document.getElementById('fin-config-ok')?.addEventListener('click', async () => {
     const preset = overlay.querySelector('input[name="fin-preset"]:checked')?.value || 'core';
@@ -504,23 +569,16 @@ export function init() {
   if (finBtn) {
     finBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      const acceso = !financialAttivo();
-      impostaFinancial(acceso);
-      // Accendendolo si imposta anche la mappa sul preset finanziario, così
-      // il modello trova già acceso quello che gli serve e da lì in poi può
-      // limitarsi a evidenziare invece di spegnere.
-      if (acceso) {
-        _presetMappaFinanziario();
-        mostraConfigFinancial();
-      }
+      // Accendendolo si imposta anche la mappa sul preset finanziario e si
+      // apre il popup: lo fa impostaFinancial, cosi' chip e voce di menu si
+      // comportano allo stesso modo.
+      impostaFinancial(!financialAttivo(), true);
     });
     _aggiornaPulsanteFin();
   }
-  // Il popup compare anche all'avvio se il profilo era rimasto acceso: la
-  // config del giro precedente non va ereditata in silenzio.
-  if (financialAttivo()) {
-    setTimeout(() => { mostraConfigFinancial(); }, 1200);
-  }
+  // Nessun popup all'avvio: compariva da solo anche sopra una risposta in
+  // corso e, essendo un velo a tutto schermo, si prendeva il primo clic
+  // destinato ad altro (il pannello ShadowBroker ci finiva sotto).
   if (railBtn) railBtn.addEventListener('click', toggle);
   if (toolBtn) toolBtn.addEventListener('click', () => {
     open();
@@ -532,8 +590,19 @@ export function init() {
     const cfg = await _loadConfig();
     window.open(cfg.url, 'shadowbroker', 'width=1600,height=950');
   });
+  // Escape chiude il pannello solo se e' davvero lo strato piu' in alto:
+  //  - il fuoco e' dentro l'iframe → il tasto appartiene a ShadowBroker, e
+  //    chiudere tutto il pannello per un suo popup e' una perdita di lavoro;
+  //  - c'e' una modale aperta sopra → la chiude il suo gestore (ui.js), qui
+  //    non si fa niente.
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && _open) close();
+    if (e.key !== 'Escape' || !_open || e.defaultPrevented) return;
+    const att = document.activeElement;
+    if (att && att.tagName === 'IFRAME') return;
+    const modaleSopra = [...document.querySelectorAll('body > .modal')].some(
+      (m) => !m.classList.contains('hidden') && getComputedStyle(m).display !== 'none');
+    if (modaleSopra) return;
+    close();
   });
 
   // ⏻ nella barra utente: spegne TUTTO lo stack (llama, voce, ShadowBroker,

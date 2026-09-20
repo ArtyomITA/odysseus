@@ -1874,7 +1874,11 @@ let _libraryArchivedView = false;   // Documents tab showing archived docs?
         const ico = document.getElementById('doclib-header-icon');
         const txt = document.getElementById('doclib-header-text');
         if (ico) ico.innerHTML = hdr.svg;
-        if (txt) txt.textContent = hdr.label;
+        // Il nome della finestra resta quello della voce nella barra
+        // laterale ("Library"): la scheda attiva e' un sottotitolo, non un
+        // altro nome. Prima la finestra aperta da "Library" si chiamava
+        // "Documents" e sembrava un'altra cosa.
+        if (txt) txt.textContent = 'Library · ' + hdr.label;
       }
       if (tab === 'chats') _renderLibChats();
       else if (tab === 'archive') _renderLibArchive();
