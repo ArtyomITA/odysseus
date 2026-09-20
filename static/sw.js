@@ -7,7 +7,7 @@
 //   - Other static assets (images/fonts/libs): cache-first with bg refresh.
 //   - API / non-GET: never cached.
 // Bump CACHE_NAME whenever the precache list or SW logic changes.
-const CACHE_NAME = 'odysseus-v380-shared-config-image-editor-lazy-katex-mermaid';
+const CACHE_NAME = 'odysseus-v381-moduli-un-solo-url';
 
 // KaTeX resolves these from its own stylesheet, so caching the CSS without them
 // gives offline math fallback glyphs instead of proper typesetting.
@@ -103,15 +103,15 @@ const PRECACHE = [
 const PANEL_PRECACHE = [
   // Image editor — galleryEditor.js and its js/editor/ graph.
   '/static/js/galleryEditor.js',
-  '/static/js/editor/ai-inpaint.js?v=20260708match1',
+  '/static/js/editor/ai-inpaint.js',
   '/static/js/editor/ai-models.js',
   '/static/js/editor/ai-rembg.js',
   '/static/js/editor/ai-tool-runner.js',
   '/static/js/editor/ai-tools-misc.js',
-  '/static/js/editor/build/controls.js?v=20260708match1',
+  '/static/js/editor/build/controls.js',
   '/static/js/editor/build/popups.js',
   '/static/js/editor/build/right-panel.js',
-  '/static/js/editor/build/toolbar.js?v=20260708sam3',
+  '/static/js/editor/build/toolbar.js',
   '/static/js/editor/build/topbar.js',
   '/static/js/editor/build/transform-popup.js',
   '/static/js/editor/canvas-coords.js',
@@ -150,7 +150,7 @@ const PANEL_PRECACHE = [
   '/static/js/editor/tools/transform-session.js',
   '/static/js/editor/tools/wand.js',
   '/static/js/editor/wire-import.js',
-  '/static/js/editor/wire-inpaint-controls.js?v=20260708match1',
+  '/static/js/editor/wire-inpaint-controls.js',
   '/static/js/editor/wire-merge-buttons.js',
   '/static/js/editor/wire-selection-controls.js',
   '/static/js/editor/wire-topbar-menus.js',

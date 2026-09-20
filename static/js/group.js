@@ -739,7 +739,7 @@ function _createGroupBubble(model, box) {
   chatRenderer.applyModelColor(wrap.querySelector('.role'), model.mid);
 
   // Spinner — identical to chat.js line 3062
-  const spinner = spinnerModule.create('Generating response', 'right');
+  const spinner = spinnerModule.create(spinnerModule.fraseAttesa('scrittura'), 'right');
   const bodyDiv = wrap.querySelector('.body');
   bodyDiv.appendChild(spinner.createElement());
   spinner.start();

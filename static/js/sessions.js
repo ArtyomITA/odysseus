@@ -3,9 +3,9 @@
 
 import Storage from './storage.js';
 import uiModule, { autoResize, styledPrompt } from './ui.js';
-import chatRenderer from './chatRenderer.js?v=20260826emotionname1';
+import chatRenderer from './chatRenderer.js';
 import { providerLogo } from './providers.js';
-import { initModelPicker, updateModelPicker } from './modelPicker.js?v=20260826emotionname1';
+import { initModelPicker, updateModelPicker } from './modelPicker.js';
 import themeModule from './theme.js';
 import spinnerModule from './spinner.js';
 
@@ -286,7 +286,7 @@ function _deselectCurrentSession(sid) {
   if (currentSessionId !== sid) return;
   currentSessionId = null;
   uiModule.el('chat-history').innerHTML = '';
-  uiModule.el('current-meta').textContent = 'Odysseus Chat';
+  uiModule.el('current-meta').textContent = 'Vergilius Chat';
   Storage.remove('lastSessionId');
   history.replaceState(null, '', window.location.pathname);
   if (window.chatModule && window.chatModule.showWelcomeScreen) {
@@ -568,7 +568,7 @@ function createSessionItem(s) {
   if (_isFork) chatTitle = chatTitle.replace(/^Fork:\s*/, '').replace(/^\u2ADD\s*/, '');
   if (_isGroup) chatTitle = chatTitle.replace(/^\[GRP\]\s*/, '');
   let label = chatTitle;
-  if (s.model) label += ' · ' + s.model.split('/').pop();
+  // Il nome del modello non va appeso al titolo della sessione: resta nel tooltip.
   if (s.archived) label += ' [archived]';
   span.textContent = label;
   span.title = (s.model ? s.model.split('/').pop() + ' · ' : '') + chatTitle;
@@ -1933,7 +1933,7 @@ export async function selectSession(id, { keepSidebar = false, showLoading = tru
 
     const currentMetaEl = uiModule.el('current-meta');
     if (currentMetaEl) {
-      currentMetaEl.textContent = meta ? meta.name : 'Odysseus Chat';
+      currentMetaEl.textContent = meta ? meta.name : 'Vergilius Chat';
     }
     // Update model picker visibility
     updateModelPicker();
@@ -2726,7 +2726,7 @@ async function _checkServerStream(sessionId) {
     const bodyDiv = holder.querySelector('.body');
 
     const spinnerMod = await import('./spinner.js');
-    const spinner = spinnerMod.default.create('Generating response...', 'right');
+    const spinner = spinnerMod.default.create(spinnerMod.default.fraseAttesa('scrittura'), 'right');
     bodyDiv.appendChild(spinner.createElement());
     spinner.start();
     box.appendChild(holder);

@@ -447,11 +447,10 @@ function stripExecutedFence(match, tag, inline, body) {
 
 async function loadExecFenceRegex() {
   try {
-    // Shared with admin.js, and — more to the point — with the other copies of
-    // this module: chatRenderer.js is imported under three different ?v= query
-    // strings, so it is instantiated three times per load and used to issue
-    // three identical /api/tools requests. appConfig.js is imported by one
-    // specifier from all of them, so they now share a single fetch.
+    // Shared with admin.js. Storicamente chatRenderer.js veniva importato con
+    // tre ?v= diversi, quindi istanziato tre volte e con tre /api/tools
+    // identiche; ora gli specificatori sono tutti nudi e l'istanza e' una sola,
+    // ma la cache di appConfig.js resta utile perche' condivisa con admin.js.
     const data = await getTools();
     const tags = (data.tools || [])
       .map((t) => t.id)
@@ -652,6 +651,14 @@ export function modelRouteLabel(
     return model + ' (' + from + ' -> ' + to + ')';
   }
   return shortModel(requested) + ' -> ' + shortModel(actual);
+}
+
+// Marchio: l'autore visibile di una risposta e' sempre "Vergilius", oppure il
+// nome della persona quando ce n'e' una attiva. Il nome del modello resta nei
+// metadati e nel tooltip dell'etichetta, non come autore.
+export function authorLabel(characterName) {
+  const name = (characterName || '').trim();
+  return name || 'Vergilius';
 }
 
 export function replyModelPair(modelName, metadata) {
@@ -1392,7 +1399,7 @@ document.addEventListener('click', function(e) {
       } catch {}
     });
   } else if (kind === 'document') {
-    import('./document.js?v=20260815approvalsave1').then(mod => {
+    import('./document.js').then(mod => {
       const open = mod.loadDocument
         || mod.openDocument
         || (mod.default && (mod.default.loadDocument || mod.default.openDocument));
@@ -1414,7 +1421,7 @@ document.addEventListener('click', function(e) {
       if (open) open(id);
     }).catch(() => {});
   } else if (kind === 'email') {
-    import('./emailLibrary.js?v=20260815approvalsave1').then(mod => {
+    import('./emailLibrary.js').then(mod => {
       const open = mod.openEmailLibrary || (mod.default && mod.default.openEmailLibrary);
       if (open) open({ uid: id });
     }).catch(() => {});
@@ -2233,7 +2240,7 @@ export function displayMetrics(messageElement, metrics) {
           compactMsg.className = 'msg msg-ai';
           const compactRole = document.createElement('div');
           compactRole.className = 'role';
-          compactRole.textContent = 'Odysseus';
+          compactRole.textContent = 'Vergilius';
           const compactBody = document.createElement('div');
           compactBody.className = 'body';
           compactBody.innerHTML = 'Compacting context <span class="compact-wave">▁▂▃▅▂▁</span>';
@@ -2416,7 +2423,7 @@ export function renderAskUserCard(payload, options) {
   const closeBtn = document.createElement('button');
   closeBtn.type = 'button';
   closeBtn.className = 'modal-close ask-user-close';
-  closeBtn.setAttribute('aria-label', 'Dismiss question');
+  closeBtn.setAttribute('aria-label', 'Chiudi la domanda');
   closeBtn.addEventListener('click', () => {
     card.remove();
     const input = uiModule.el('message');
@@ -2441,13 +2448,13 @@ export function renderAskUserCard(payload, options) {
     action.textContent = [
       aq.action.tool || 'tool',
       aq.action.content || '',
-      effects ? `Effects: ${effects}` : '',
-      aq.action.workspace ? `Workspace: ${aq.action.workspace}` : '',
-      aq.action.document_id ? `Document: ${aq.action.document_id}` : '',
+      effects ? `Effetti: ${effects}` : '',
+      aq.action.workspace ? `Cartella di lavoro: ${aq.action.workspace}` : '',
+      aq.action.document_id ? `Documento: ${aq.action.document_id}` : '',
       aq.action.document_version != null
-        ? `Document version: ${aq.action.document_version}`
+        ? `Versione del documento: ${aq.action.document_version}`
         : '',
-      aq.action.digest ? `Approval fingerprint: ${aq.action.digest}` : '',
+      aq.action.digest ? `Impronta dell'approvazione: ${aq.action.digest}` : '',
     ].filter(Boolean).join('\n');
     action.style.whiteSpace = 'pre-wrap';
     card.appendChild(action);
@@ -2536,13 +2543,13 @@ export function renderAskUserCard(payload, options) {
   const otherInput = document.createElement('input');
   otherInput.type = 'text';
   otherInput.className = 'styled-prompt-input ask-user-other-input';
-  otherInput.placeholder = multi ? 'Other (added to selection)…' : 'Other… (type your own answer)';
-  otherInput.setAttribute('aria-label', multi ? 'Add a custom option' : 'Type a custom answer');
+  otherInput.placeholder = multi ? 'Altro (si aggiunge alla scelta)…' : 'Altro… (scrivi la tua risposta)';
+  otherInput.setAttribute('aria-label', multi ? 'Aggiungi una voce tua' : 'Scrivi una risposta tua');
   const otherSend = document.createElement('button');
   otherSend.type = 'button';
   otherSend.className = 'confirm-btn confirm-btn-primary ask-user-other-send';
-  otherSend.setAttribute('aria-label', 'Send answer');
-  otherSend.textContent = multi ? 'Send selection' : 'Send';
+  otherSend.setAttribute('aria-label', 'Invia la risposta');
+  otherSend.textContent = multi ? 'Invia la scelta' : 'Invia';
   const submit = () => {
     const freeText = otherInput.value.trim();
     if (multi) {
@@ -2640,7 +2647,8 @@ export function addMessage(role, content, modelName, metadata) {
           const contEndpointLabel = r < roundEndpointLabels.length
             ? roundEndpointLabels[r]
             : pair.actualEndpointLabel;
-          roleEl.textContent = modelRouteLabel(
+          roleEl.textContent = authorLabel(metadata?.character_name);
+          roleEl.title = modelRouteLabel(
             pair.requestedModel,
             contModel,
             pair.requestedEndpointLabel,
@@ -2813,7 +2821,8 @@ export function addMessage(role, content, modelName, metadata) {
     const isCompacted = metadata?.compacted;
     const replyModels = replyModelPair(modelName, metadata);
     const resolvedModel = replyModels.actualModel || replyModels.requestedModel;
-    var _roleText = role === 'user' ? 'You' : (isSlash || isCompacted) ? 'Odysseus' : modelRouteLabel(
+    // Etichetta del modello: serve ancora come tooltip, non piu' come autore.
+    var _modelLabel = modelRouteLabel(
       replyModels.requestedModel,
       resolvedModel,
       replyModels.requestedEndpointLabel,
@@ -2821,6 +2830,9 @@ export function addMessage(role, content, modelName, metadata) {
       replyModels.requestedEndpointId,
       replyModels.actualEndpointId,
     );
+    var _roleText = role === 'user' ? 'You'
+      : (isSlash || isCompacted) ? 'Vergilius'
+      : authorLabel(metadata?.character_name);
     if (role === 'assistant' && (metadata?.research || metadata?.research_clarification)) {
       _roleText += ' (Research)';
     }
@@ -2839,6 +2851,9 @@ export function addMessage(role, content, modelName, metadata) {
       if (!isSlash && !isCompacted && replyModels.requestedModel && resolvedModel && (!sameModelName(replyModels.requestedModel, resolvedModel) || endpointChanged)) {
         r.title = replyModels.requestedModel + ' -> ' + resolvedModel
           + ' (' + replyModels.requestedEndpointLabel + ' -> ' + replyModels.actualEndpointLabel + ')';
+      } else if (!isSlash && !isCompacted && _modelLabel) {
+        // Il nome del modello non e' piu' l'autore: resta visibile qui.
+        r.title = _modelLabel;
       }
       if (!isSlash && !isCompacted) applyModelColor(r, resolvedModel);
       r.appendChild(roleTimestamp(metadata?.timestamp));
@@ -3113,6 +3128,7 @@ const chatRenderer = {
   shortModel,
   sameModelName,
   modelRouteLabel,
+  authorLabel,
   replyModelPair,
   modelColor,
   applyModelColor,

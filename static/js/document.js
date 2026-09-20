@@ -3298,7 +3298,7 @@ import { bindMenuDismiss, dismissOrRemove } from './escMenuStack.js';
       if (!opts.keepOpen) _closeOdysseusAttachMenu();
     } catch (err) {
       console.error('Failed to attach Odysseus item:', err);
-      if (uiModule) uiModule.showError('Failed to attach from Odysseus');
+      if (uiModule) uiModule.showError('Failed to attach from Vergilius');
     }
   }
 
@@ -3347,7 +3347,7 @@ import { bindMenuDismiss, dismissOrRemove } from './escMenuStack.js';
       _closeOdysseusAttachMenu();
     } catch (err) {
       console.error('Failed to attach selected Odysseus items:', err);
-      if (uiModule) uiModule.showError(added ? `Attached ${added}, then failed` : 'Failed to attach from Odysseus');
+      if (uiModule) uiModule.showError(added ? `Attached ${added}, then failed` : 'Failed to attach from Vergilius');
       _renderComposeAttachments();
     } finally {
       if (btn) {
@@ -3934,7 +3934,7 @@ import { bindMenuDismiss, dismissOrRemove } from './escMenuStack.js';
             leadingIcon: 'check',
             action: 'View Message',
             onAction: () => {
-              import('./emailLibrary.js?v=20260815approvalsave1').then(mod => {
+              import('./emailLibrary.js').then(mod => {
                 const open = mod.openEmailLibrary || (mod.default && mod.default.openEmailLibrary);
                 if (open) open({
                   account_id: data.account_id || activeAccountId || null,

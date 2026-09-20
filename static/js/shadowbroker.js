@@ -84,16 +84,16 @@ function _renderOffline(cfg) {
 
   const desc = document.createElement('div');
   desc.className = 'sb-offline-desc';
-  desc.textContent = `Nessuna risposta da ${cfg.url}. I due servizi vanno avviati a parte:`;
+  desc.textContent = `Nessuna risposta da ${cfg.url}. ShadowBroker fa parte dei profili di avvio del sistema:`;
   box.appendChild(desc);
 
   const pre = document.createElement('pre');
   pre.className = 'sb-offline-cmd';
+  // Il sistema si avvia dal batch di regia, che accende anche ShadowBroker nei
+  // profili che lo prevedono: niente comandi a mano per backend e frontend.
   pre.textContent =
-    'cd shadowbroker\\backend\n'
-    + 'venv\\Scripts\\python.exe main.py\n\n'
-    + 'cd shadowbroker\\frontend\n'
-    + 'npm run dev:frontend';
+    'AVVIA-VERGILIUS.bat\n'
+    + 'scegli un profilo che comprende ShadowBroker (shadowbroker oppure full)';
   box.appendChild(pre);
 
   // ▶ lancia i due comandi qui sopra al posto dell'operatore. L'avvio è

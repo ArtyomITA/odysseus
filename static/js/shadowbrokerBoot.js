@@ -5,7 +5,7 @@
 // (open/close/toggle) that other code — and eventually the agent — can call
 // without the side effect of binding DOM handlers on import.
 
-import shadowbroker from './shadowbroker.js?v=20260826sbpicker1';
+import shadowbroker from './shadowbroker.js';
 
 function boot() {
   try {

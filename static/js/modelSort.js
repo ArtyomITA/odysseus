@@ -18,8 +18,32 @@ function _arrayOrEmpty(models) {
   return Array.isArray(models) ? models : [];
 }
 
+// Modelli che il server puo' annunciare ma che NON vanno offerti all'utente
+// perche' i pesi non sono sul disco: sceglierli darebbe solo un errore.
+// Punto unico: ogni elenco visibile (picker, AI Defaults, Compare, Deep
+// Research, Tasks, Group, Admin, editor) passa di qui per ordinare.
+// Togliere una voce da qui appena i pesi ci sono.
+// (llama-swap annuncia anche l'alias "-vista" dello stesso modello)
+export const MODELLI_NASCOSTI = ['lfm-uncensored', 'lfm-uncensored-vista'];
+
+function _modelLabelOf(model) {
+  if (model && typeof model === 'object') {
+    return model.mid || model.id || model.model || model.name || model.display || model.displayName || '';
+  }
+  return model || '';
+}
+
+export function isHiddenModel(model) {
+  const nome = String(_modelLabelOf(model)).split('/').pop().trim().toLowerCase();
+  return MODELLI_NASCOSTI.indexOf(nome) !== -1;
+}
+
+export function filterHiddenModels(models) {
+  return _arrayOrEmpty(models).filter((m) => !isHiddenModel(m));
+}
+
 export function sortModelIds(models) {
-  return _arrayOrEmpty(models).slice().sort(_compareText);
+  return filterHiddenModels(models).slice().sort(_compareText);
 }
 
 export function compareModelObjects(a, b) {
@@ -29,5 +53,5 @@ export function compareModelObjects(a, b) {
 }
 
 export function sortModelObjects(models) {
-  return _arrayOrEmpty(models).slice().sort(compareModelObjects);
+  return filterHiddenModels(models).slice().sort(compareModelObjects);
 }

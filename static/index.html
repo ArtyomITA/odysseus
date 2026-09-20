@@ -251,10 +251,10 @@
   <link rel="preload" as="font" type="font/woff2" crossorigin href="/static/fonts/FiraCode-Regular.woff2">
   <link rel="preload" as="font" type="font/woff2" crossorigin href="/static/fonts/FiraCode-SemiBold.woff2">
   <link rel="stylesheet" href="/static/style.css?v=20260808startupshell1">
-  <link rel="modulepreload" href="/static/app.js?v=20260815toolapproval4">
-  <link rel="modulepreload" href="/static/js/chat.js?v=20260815toolapproval4">
+  <link rel="modulepreload" href="/static/app.js">
+  <link rel="modulepreload" href="/static/js/chat.js">
   <link rel="modulepreload" href="/static/js/ui.js">
-  <link rel="modulepreload" href="/static/js/sessions.js?v=20260722ctxheader4">
+  <link rel="modulepreload" href="/static/js/sessions.js">
   <link rel="modulepreload" href="/static/js/markdown.js">
 </head>
 <body>
@@ -995,7 +995,7 @@
       <div class="chat-meta-overlay"><span id="current-meta">Vergilius</span><span id="current-meta-count" class="chat-meta-count" aria-hidden="true"></span><span id="session-cost-display" class="session-cost-display" style="display:none;"></span><button type="button" class="chat-context-pill" id="chat-context-pill" title="Chat context" hidden><span class="chat-context-dot"></span><span id="chat-context-pill-label">0%</span></button><span class="export-dropdown-wrap" id="export-dropdown-wrap"><button type="button" class="export-dl-btn" id="export-dl-btn" title="More"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg></button><div class="export-dropdown-menu" id="export-dropdown-menu"><div class="export-dropdown-item" id="export-rename-btn"><span class="dropdown-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg></span><span>Rename</span></div><div class="export-dropdown-item" id="export-compact-btn"><span class="dropdown-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16"/><path d="M7 12h10"/><path d="M10 17h4"/></svg></span><span class="export-compact-pill">Compact</span></div><div class="export-dropdown-item" id="export-copy-btn"><span class="dropdown-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></span><span>Copy Chat</span></div><div class="export-dropdown-item" id="export-pdf-btn"><span class="dropdown-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><path d="M9 15v-2h2a1.5 1.5 0 0 1 0 3H9z"/></svg></span><span>PDF</span></div><div class="export-dropdown-item" id="export-doc-btn"><span class="dropdown-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg></span><span>Save to Documents</span></div><div class="export-dropdown-item dropdown-item-danger" id="export-delete-btn"><span class="dropdown-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg></span><span>Delete Chat</span></div></div></span></div>    </div>
     <div id="welcome-screen">
       <div class="welcome-name"><svg class="welcome-boat" viewBox="0 0 32 32"><path d="M16 4L16 22L6 22Z" fill="currentColor"/><path d="M16 8L16 22L24 22Z" fill="currentColor" opacity="0.6"/><path d="M4 24Q10 20 16 24Q22 28 28 24" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round"/></svg>Vergilius</div>
-      <div class="welcome-sub" id="welcome-sub">New chat ready.</div>
+      <div class="welcome-sub" id="welcome-sub">Nuova chat pronta.</div>
       <div class="welcome-tip" id="welcome-tip"></div>
       <button type="button" class="incognito-btn" id="incognito-btn" title="Enable Nobody mode — no memory, no history saved">
         <svg class="eye-open" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -1012,18 +1012,18 @@
     (function(){
       var mobile = window.matchMedia('(max-width: 768px)').matches;
       var desktop = [
-        'Tip: Press Ctrl+K to search across all your conversations.',
-        'Tip: Press Ctrl+B to quickly toggle the sidebar.',
-        'Tip: Shift-click the sidebar toggle to swap it to the other side.',
-        'Tip: Drag and drop files onto the chat to attach them.',
-        'Tip: Right-click a session for rename, delete, and memory options.',
+        'Suggerimento: premi Ctrl+K per cercare in tutte le conversazioni.',
+        'Suggerimento: premi Ctrl+B per aprire e chiudere la barra laterale.',
+        'Suggerimento: Shift e clic sul pulsante della barra laterale la spostano sul lato opposto.',
+        'Suggerimento: trascina i file sulla chat per allegarli.',
+        'Suggerimento: clic destro su una sessione per rinominare, eliminare e gestire la memoria.',
       ];
       var phone = [
-        'Tip: Long-press a session for rename, delete, and memory options.',
-        'Tip: Tap the eye icon for Nobody mode — no history saved.',
-        'Tip: Switch to Agent mode for web search and code execution.',
-        'Tip: Use Compare mode to test different models side by side.',
-        'Tip: Attach images or files using the + button next to the input.',
+        'Suggerimento: tieni premuta una sessione per rinominare, eliminare e gestire la memoria.',
+        'Suggerimento: tocca il simbolo a forma di occhio per la modalita Nobody: nessuna cronologia salvata.',
+        'Suggerimento: passa alla modalita Agent per la ricerca web e per eseguire codice.',
+        'Suggerimento: usa Compare per provare due modelli fianco a fianco.',
+        'Suggerimento: allega immagini o file con il pulsante + accanto al campo di scrittura.',
       ];
       var tips = mobile ? phone : desktop;
       var el = document.getElementById('welcome-tip');
@@ -1077,9 +1077,15 @@
         </div>
         <script nonce="{{CSP_NONCE}}">
         (function(){
-          function applyDefault(dc) {
+          // Il nome del modello si scrive SOLO quando /api/default-chat lo
+          // conferma: la cache locale sopravvive ai cambi di modello e ha gia'
+          // mostrato per giorni un modello morto ("ling"). La cache resta buona
+          // per gli altri moduli, quindi la rileggiamo in window ma non la
+          // dipingiamo, e la riscriviamo appena l'API risponde.
+          function applyDefault(dc, confirmed) {
             if (!dc || !dc.model) return false;
             window.__odysseusDefaultChat = dc;
+            if (!confirmed) return true;
             var label = document.getElementById('model-picker-label');
             if (!label) return false;
             label.textContent = String(dc.model).split('/').pop();
@@ -1087,13 +1093,18 @@
             return true;
           }
           try {
-            var dc = JSON.parse(localStorage.getItem('odysseus-default-chat-cache') || 'null');
-            if (applyDefault(dc)) return;
+            applyDefault(JSON.parse(localStorage.getItem('odysseus-default-chat-cache') || 'null'), false);
           } catch (_) {}
           fetch('/api/default-chat', { credentials: 'same-origin' })
-            .then(function(r){ return r.ok ? r.json() : null; })
+            .then(function(r){ if (!r.ok) throw new Error('default-chat ' + r.status); return r.json(); })
             .then(function(dc){
-              if (!applyDefault(dc)) return;
+              if (!dc || !dc.model) {
+                // Risposta valida senza default: la cache e' morta, via.
+                // (un errore di rete finisce nel catch e NON tocca la cache)
+                try { localStorage.removeItem('odysseus-default-chat-cache'); } catch (_) {}
+                return;
+              }
+              if (!applyDefault(dc, true)) return;
               try { localStorage.setItem('odysseus-default-chat-cache', JSON.stringify(dc)); } catch (_) {}
             })
             .catch(function(){});
@@ -1105,7 +1116,7 @@
         <div class="chat-input-left">
           <!-- Overflow menu (+) — always first/left -->
           <div class="overflow-wrapper">
-            <button type="button" class="input-icon-btn overflow-plus-btn" id="overflow-plus-btn" title="More tools" aria-label="More tools" aria-haspopup="true">
+            <button type="button" class="input-icon-btn overflow-plus-btn" id="overflow-plus-btn" title="Altri strumenti" aria-label="Altri strumenti" aria-haspopup="true">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
                 <polyline points="6 15 12 9 18 15"/>
               </svg>
@@ -1114,13 +1125,13 @@
             <div id="overflow-menu" class="overflow-menu hidden">
               <button type="button" class="overflow-menu-item" id="overflow-attach-btn">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
-                <span>Attach files</span>
+                <span>Allega file</span>
               </button>
               <button type="button" class="overflow-menu-item" id="overflow-doc-btn">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/>
                 </svg>
-                <span>Documents</span>
+                <span>Documenti</span>
               </button>
               <button type="button" class="overflow-menu-item" id="overflow-rag-btn">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1133,7 +1144,7 @@
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
                 </svg>
-                <span>Workspace</span>
+                <span>Spazio di lavoro</span>
                 <span class="overflow-active-dot"></span>
               </button>
               <!-- Inline "deep research mode" toggle removed (superseded by the
@@ -2075,16 +2086,16 @@
 
           <div class="admin-card">
             <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:32px">
-              <h2 style="margin:0;display:inline-flex;align-items:center;gap:6px"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="opacity:0.6"><circle cx="12" cy="8" r="4"/><path d="M6 21v-2a6 6 0 0 1 12 0v2"/></svg>Live2D avatar</h2>
+              <h2 style="margin:0;display:inline-flex;align-items:center;gap:6px"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="opacity:0.6"><circle cx="12" cy="8" r="4"/><path d="M6 21v-2a6 6 0 0 1 12 0v2"/></svg>Avatar Live2D</h2>
               <label class="admin-switch" style="flex-shrink:0"><input type="checkbox" id="avatar-enabled-toggle" /><span class="admin-slider"></span></label>
             </div>
-            <span class="admin-toggle-sub" style="display:block;margin-top:6px;opacity:0.6">Animated character that reacts to the agent: thinking, using tools, speaking. Hover it to detach into its own window.</span>
+            <span class="admin-toggle-sub" style="display:block;margin-top:6px;opacity:0.6">Personaggio animato che reagisce all'assistente: pensiero, uso degli strumenti, parlato. Passaci sopra il puntatore per staccarlo in una finestra a parte.</span>
             <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:8px">
-              <span class="admin-toggle-sub" style="margin:0">Model</span>
+              <span class="admin-toggle-sub" style="margin:0">Modello</span>
               <select id="avatar-model-select" class="admin-input" style="flex:0 1 200px"></select>
             </div>
             <div style="margin-top:10px">
-              <span class="admin-toggle-sub" style="display:block;margin-bottom:4px">Personality</span>
+              <span class="admin-toggle-sub" style="display:block;margin-bottom:4px">Personalita</span>
               <textarea id="avatar-persona-prompt" class="admin-input" rows="4" style="width:100%;resize:vertical"
                 placeholder="Es: Sei Mao, assistente curiosa e diretta. Parli italiano, sei concisa e un po' ironica."></textarea>
               <div style="display:flex;align-items:center;gap:8px;margin-top:6px">
@@ -2494,7 +2505,7 @@
               </svg>
               Terminal Logs
             </h2>
-            <div class="admin-toggle-sub settings-system-logs-toggle-sub">Live diagnostic logs and system output from the Odysseus process.</div>
+            <div class="admin-toggle-sub settings-system-logs-toggle-sub">Live diagnostic logs and system output from the Vergilius process.</div>
 
             <div class="settings-col settings-system-logs-col">
               <!-- Controls row -->
@@ -2667,7 +2678,7 @@
 <script type="module" src="/static/js/avatarCore.js"></script>
 <script type="module" src="/static/js/avatarDock.js"></script>
 <script type="module" src="/static/js/avatarPersona.js"></script>
-<script type="module" src="/static/js/shadowbrokerBoot.js?v=20260826sbpicker1"></script>
+<script type="module" src="/static/js/shadowbrokerBoot.js"></script>
 <script defer src="/static/js/catalogoStrumenti.js"></script>
 <script defer src="/static/js/profilo.js"></script>
 <script defer src="/static/js/vista.js"></script>
@@ -2676,33 +2687,33 @@
 <script type="module" src="/static/js/markdown.js"></script>
 <script type="module" src="/static/js/dragSort.js"></script>
 <script type="module" src="/static/js/sessions.js"></script>
-<script type="module" src="/static/js/memory.js?v=20260722memoryloading1"></script>
+<script type="module" src="/static/js/memory.js"></script>
 <script type="module" src="/static/js/skills.js"></script>
 <script type="module" src="/static/js/tourHints.js"></script>
 <script type="module" src="/static/js/tourAutoplay.js"></script>
 <script type="module" src="/static/js/fileHandler.js"></script>
 <script type="module" src="/static/js/voiceRecorder.js"></script>
-<script type="module" src="/static/js/models.js?v=20260715startupcalm2"></script>  <!-- This must come BEFORE app.js -->
+<script type="module" src="/static/js/models.js"></script>  <!-- This must come BEFORE app.js -->
 <script type="module" src="/static/js/rag.js"></script>
 <script type="module" src="/static/js/presets.js"></script>
 <script type="module" src="/static/js/search.js"></script>
 <script type="module" src="/static/js/spinner.js"></script>
 <script type="module" src="/static/js/tts-ai.js"></script>
-<script type="module" src="/static/js/document.js?v=20260815approvalsave1"></script>
-<script type="module" src="/static/js/gallery.js?v=20260708match1"></script>
-<script type="module" src="/static/js/chatRenderer.js?v=20260826emotionname1"></script>
+<script type="module" src="/static/js/document.js"></script>
+<script type="module" src="/static/js/gallery.js"></script>
+<script type="module" src="/static/js/chatRenderer.js"></script>
 <script type="module" src="/static/js/codeRunner.js"></script>
-<script type="module" src="/static/js/chatStream.js?v=20260819approvalcontrol1"></script>
-  <script type="module" src="/static/js/chat.js?v=20260819approvalcontrol1"></script>
+<script type="module" src="/static/js/chatStream.js"></script>
+  <script type="module" src="/static/js/chat.js"></script>
 <script type="module" src="/static/js/cookbook.js"></script>
 <script src="/static/js/cookbookSchedule.js"></script>
 <script type="module" src="/static/js/search-chat.js"></script>
 <script type="module" src="/static/js/theme.js"></script>
 <script type="module" src="/static/js/censor.js"></script>
-<script type="module" src="/static/js/settings.js?v=20260815approvalsave1"></script>
+<script type="module" src="/static/js/settings.js"></script>
 <script type="module" src="/static/js/assistant.js"></script>
-<script type="module" src="/static/app.js?v=20260815toolapproval4"></script>  <!-- app.js must be LAST -->
-  <script type="module" src="/static/js/init.js?v=20260715freshroot3"></script>
+<script type="module" src="/static/app.js"></script>  <!-- app.js must be LAST -->
+  <script type="module" src="/static/js/init.js"></script>
 <script type="module" src="/static/js/a11y.js"></script>
 <script nonce="{{CSP_NONCE}}">if('serviceWorker' in navigator){navigator.serviceWorker.register('/static/sw.js').catch(()=>{});}</script>
 </body>

@@ -6,13 +6,13 @@ import Storage from './js/storage.js';
 import uiModule from './js/ui.js';
 import workspaceModule from './js/workspace.js';
 import fileHandlerModule from './js/fileHandler.js';
-import modelsModule from './js/models.js?v=20260715startupcalm2';
+import modelsModule from './js/models.js';
 import ragModule from './js/rag.js';
 import presetsModule from './js/presets.js';
 import searchModule from './js/search.js';
-import chatModule from './js/chat.js?v=20260819approvalcontrol1';
-import compareModule from './js/compare/index.js?v=20260819approvalcontrol1';
-import documentModule from './js/document.js?v=20260815approvalsave1';
+import chatModule from './js/chat.js';
+import compareModule from './js/compare/index.js';
+import documentModule from './js/document.js';
 import searchChatModule from './js/search-chat.js';
 import { makeWindowDraggable } from './js/windowDrag.js';
 import {
@@ -22,20 +22,20 @@ import {
   settleSessionHydration
 } from './js/startupShell.js';
 import markdownModule from './js/markdown.js';
-import chatRenderer from './js/chatRenderer.js?v=20260826emotionname1';
+import chatRenderer from './js/chatRenderer.js';
 import sessionModule from './js/sessions.js';
-import memoryModule from './js/memory.js?v=20260722memoryloading1';
+import memoryModule from './js/memory.js';
 import voiceRecorderModule from './js/voiceRecorder.js';
 import censorModule from './js/censor.js';
 import galleryModule from './js/gallery.js';
 import { UI_VIS_DEFAULT_OFF, resolveVisibility } from './js/ui_visibility.js';
-import tasksModule from './js/tasks.js?v=20260723tasksbulkfeedback1';
+import tasksModule from './js/tasks.js';
 import calendarModule from './js/calendar.js';
 import notesModule from './js/notes.js';
-import adminModule from './js/admin.js?v=20260716openrouter3';
-import settingsModule from './js/settings.js?v=20260815approvalsave1';
+import adminModule from './js/admin.js';
+import settingsModule from './js/settings.js';
 // Eagerly bind unified minimize/restore behavior across all tool modals.
-import './js/modalManager.js?v=20260723compareicon2';
+import './js/modalManager.js';
 // Desktop window tiling — drag a modal near an edge/corner to snap.
 import './js/tileManager.js';
 import themeModule from './js/theme.js';
@@ -46,12 +46,12 @@ import themeModule from './js/theme.js';
 // unversioned so this can't recur.
 import cookbookModule from './js/cookbook.js';
 import groupModule from './js/group.js';
-import * as researchPanelModule from './js/research/panel.js?v=20260630researchthumb';
+import * as researchPanelModule from './js/research/panel.js';
 import ttsModule from './js/tts-ai.js';
 import spinnerModule from './js/spinner.js';
 import { initKeyboardShortcuts } from './js/keyboard-shortcuts.js';
 import { getSettings } from './js/appConfig.js';
-import { initSidebarLayout, syncRailSide } from './js/sidebar-layout.js?v=20260715startupclean';
+import { initSidebarLayout, syncRailSide } from './js/sidebar-layout.js';
 import { initSectionCollapse, initSectionDrag } from './js/section-management.js';
 
 const API_BASE = window.location.origin;

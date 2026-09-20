@@ -8,21 +8,21 @@
 import Storage from './storage.js';
 import uiModule from './ui.js';
 import sessionModule from './sessions.js';
-import chatRenderer from './chatRenderer.js?v=20260826emotionname1';
-import chatStream from './chatStream.js?v=20260819approvalcontrol1';
+import chatRenderer from './chatRenderer.js';
+import chatStream from './chatStream.js';
 import { addAITTSButton } from './tts-ai.js';
 import markdownModule from './markdown.js';
 import spinnerModule from './spinner.js';
 import presetsModule from './presets.js';
 import fileHandlerModule from './fileHandler.js';
 import searchModule from './search.js';
-import documentModule from './document.js?v=20260815approvalsave1';
-import * as emailInbox from './emailInbox.js?v=20260815approvalsave1';
+import documentModule from './document.js';
+import * as emailInbox from './emailInbox.js';
 import codeRunnerModule from './codeRunner.js';
-import slashCommands, { initSlashCommands, isCommand, handleSlashCommand, handleSetupInput, handleSetupWizard, typewriterInto } from './slashCommands.js?v=20260815approvalsave1';
+import slashCommands, { initSlashCommands, isCommand, handleSlashCommand, handleSetupInput, handleSetupWizard, typewriterInto } from './slashCommands.js';
 import createResearchSynapse from './researchSynapse.js';
 import { createStreamRenderer } from './streamingRenderer.js';
-import { wireArrowUpRecall, getUserMessagesFromChatHistory } from './composerArrowUpRecall.js?v=20260714promptrecall';
+import { wireArrowUpRecall, getUserMessagesFromChatHistory } from './composerArrowUpRecall.js';
 import {
   createIncrementalDisplayProjector,
   createLiveThinkingThrottle,
@@ -424,6 +424,7 @@ import { loadPanel } from './panels.js';
   // shortModel and modelColor are now in chatRenderer.js
   var _shortModel = chatRenderer.shortModel;
   var _modelRouteLabel = chatRenderer.modelRouteLabel;
+  var _authorLabel = chatRenderer.authorLabel;
   var _sameModelName = chatRenderer.sameModelName;
   var _applyModelColor = chatRenderer.applyModelColor;
   function _setRoleModelLabel(roleEl, requestedModel, actualModel, opts) {
@@ -432,7 +433,7 @@ import { loadPanel } from './panels.js';
     const tsSpan = roleEl.querySelector('.role-timestamp');
     const req = requestedModel || actualModel || '';
     const actual = actualModel || requestedModel || '';
-    let label = _modelRouteLabel(
+    const modelLabel = _modelRouteLabel(
       req,
       actual,
       opts.requestedEndpointLabel,
@@ -440,8 +441,10 @@ import { loadPanel } from './panels.js';
       opts.requestedEndpointId,
       opts.actualEndpointId,
     );
+    // Marchio: autore visibile "Vergilius" o la persona attiva; il nome del
+    // modello resta nel tooltip qui sotto.
+    let label = _authorLabel(opts.characterName);
     if (opts.suffix) label += ' (' + opts.suffix + ')';
-    if (opts.characterName) label = opts.characterName;
     roleEl.textContent = label + ' ';
     _applyModelColor(roleEl, actual || req);
     const endpointChanged = Boolean(
@@ -454,7 +457,8 @@ import { loadPanel } from './panels.js';
         + (endpointChanged ? ' (' + opts.requestedEndpointLabel + ' -> ' + opts.actualEndpointLabel + ')' : '')
         + (opts.reason ? ': ' + opts.reason : '');
     } else if (!opts.reason) {
-      roleEl.removeAttribute('title');
+      if (modelLabel) roleEl.title = modelLabel;
+      else roleEl.removeAttribute('title');
     }
     if (tsSpan) roleEl.appendChild(tsSpan);
   }
@@ -1537,9 +1541,9 @@ import { loadPanel } from './panels.js';
     const scheduleFirstTokenWaitMessages = () => {
       clearFirstTokenWaitTimers();
       const steps = [
-        [20000, 'Still waiting for first token'],
-        [60000, 'Large local model is pre-filling context'],
-        [120000, 'Still working - no tokens yet from the model'],
+        [20000, 'Aspetto ancora il primo pezzo di risposta'],
+        [60000, 'Il modello locale sta riempiendo il contesto'],
+        [120000, 'Ancora al lavoro, il modello non ha ancora prodotto nulla'],
       ];
       firstTokenWaitTimers = steps.map(([ms, text]) => setTimeout(() => {
         if (!accumulated && spinner && spinner.element && !(abortCtrl && abortCtrl.signal.aborted)) {
@@ -2044,18 +2048,18 @@ import { loadPanel } from './panels.js';
         loadingText = 'Processing request...';
       }
 
-      var roleLabel = _modelRouteLabel(modelName, modelName);
       var _charNameInit = presetsModule.getCharacterName ? presetsModule.getCharacterName() : '';
-      if (_charNameInit) roleLabel = _charNameInit;
+      var roleLabel = _authorLabel(_charNameInit);
+      var _roleTitleInit = _modelRouteLabel(modelName, modelName);
       const roleTs = new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
-      holder.innerHTML = `<div class="role">${uiModule.esc(roleLabel)} <span class="role-timestamp">${roleTs}</span></div><div class="body"></div>`;
+      holder.innerHTML = `<div class="role" title="${uiModule.esc(_roleTitleInit)}">${uiModule.esc(roleLabel)} <span class="role-timestamp">${roleTs}</span></div><div class="body"></div>`;
       holder._requestedModel = modelName;
       holder._actualModel = modelName;
       _applyModelColor(holder.querySelector('.role'), modelName);
       holder.style.position = 'relative';
       
       // Create spinner
-      spinner = spinnerModule.create('Initializing', 'right', 'wave');
+      spinner = spinnerModule.create(spinnerModule.fraseAttesa('pensiero'), 'right', 'wave');
       currentSpinner = spinner;
       const bodyDiv = holder.querySelector('.body');
       bodyDiv.appendChild(spinner.createElement());
@@ -2063,13 +2067,13 @@ import { loadPanel } from './panels.js';
       
       // Update spinner message based on mode
       if (el('web-toggle').checked && !_isAgent) {
-        spinner.updateMessage('Searching web with ' + (searchModule ? searchModule.getProviderLabel() : 'SearXNG'));
-        setTimeout(() => spinner.updateMessage('Processing results'), 1500);
+        spinner.updateMessage('Cerco sul web con ' + (searchModule ? searchModule.getProviderLabel() : 'SearXNG'));
+        setTimeout(() => spinner.updateMessage(spinnerModule.fraseAttesa('strumento')), 1500);
       } else if (el('research-toggle').checked) {
-        spinner.updateMessage('Researching');
-        setTimeout(() => spinner.updateMessage('Analyzing sources'), 1500);
+        spinner.updateMessage('Sto facendo ricerca');
+        setTimeout(() => spinner.updateMessage('Esamino le fonti'), 1500);
       } else {
-        spinner.updateMessage('Processing request');
+        spinner.updateMessage(spinnerModule.fraseAttesa('pensiero'));
         scheduleFirstTokenWaitMessages();
       }
       
@@ -2227,7 +2231,10 @@ import { loadPanel } from './panels.js';
         inheritModelRouteState(holder, roundHolder, newWrap, metaS?.model || modelName);
         const requested = newWrap._requestedModel;
         const actual = newWrap._actualModel;
-        newRole.textContent = _modelRouteLabel(
+        newRole.textContent = _authorLabel(
+          presetsModule.getCharacterName ? presetsModule.getCharacterName() : ''
+        );
+        newRole.title = _modelRouteLabel(
           requested,
           actual,
           newWrap._requestedEndpointLabel,
@@ -2269,34 +2276,34 @@ import { loadPanel } from './panels.js';
       let _lastToolName = '';
       const _searchIcon = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" style="vertical-align:-2px;margin-right:4px"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>';
       const _toolLabels = {
-        'web_search': 'Searching',
-        'bash': 'Running',
-        'python': 'Running',
-        'read_document': 'Reading',
-        'edit_file': 'Editing',
-        'read_file': 'Reading',
-        'write_file': 'Writing',
-        'create_document': 'Writing',
-        'edit_document': 'Editing',
-        'update_document': 'Rewriting',
-        'suggest_document': 'Reviewing',
-        'list_files': 'Browsing',
-        'image_gen': 'Generating',
-        'generate_image': 'Generating',
-        'manage_memory': 'Remembering',
-        'save_memory': 'Remembering',
-        'search_memory': 'Recalling',
-        'manage_session': 'Organizing',
-        'deep_research': 'Researching',
-        'list_models': 'Browsing',
-        'ui_control': 'Adjusting',
+        'web_search': 'Cerco',
+        'bash': 'Eseguo',
+        'python': 'Eseguo',
+        'read_document': 'Leggo',
+        'edit_file': 'Modifico',
+        'read_file': 'Leggo',
+        'write_file': 'Scrivo',
+        'create_document': 'Scrivo',
+        'edit_document': 'Modifico',
+        'update_document': 'Riscrivo',
+        'suggest_document': 'Rileggo',
+        'list_files': 'Sfoglio',
+        'image_gen': 'Genero',
+        'generate_image': 'Genero',
+        'manage_memory': 'Memorizzo',
+        'save_memory': 'Memorizzo',
+        'search_memory': 'Ricordo',
+        'manage_session': 'Riordino',
+        'deep_research': 'Approfondisco',
+        'list_models': 'Sfoglio',
+        'ui_control': 'Sistemo',
       };
       const _toolIcons = {
         'web_search': _searchIcon,
       };
       function _thinkingLabel() {
         if (!_lastToolName) {
-          return 'Thinking';
+          return spinnerModule.fraseAttesa('pensiero');
         }
         // Check exact match first, then prefix match
         const lower = _lastToolName.toLowerCase();
@@ -2304,7 +2311,7 @@ import { loadPanel } from './panels.js';
         for (const [key, label] of Object.entries(_toolLabels)) {
           if (lower.includes(key) || key.includes(lower)) return label;
         }
-        return 'Thinking';
+        return spinnerModule.fraseAttesa('strumento');
       }
 
       function _showThinkingSpinner(label) {
@@ -2313,7 +2320,7 @@ import { loadPanel } from './panels.js';
         _thinkMsg.className = 'msg msg-ai agent-thinking-dots';
         const _thinkBody = document.createElement('div');
         _thinkBody.className = 'body';
-        const _ts = spinnerModule.create(label || 'Thinking', 'right', 'wave');
+        const _ts = spinnerModule.create(label || spinnerModule.fraseAttesa('pensiero'), 'right', 'wave');
         _thinkBody.appendChild(_ts.createElement());
         _ts.start(120);
         _thinkMsg._spinner = _ts;
@@ -2512,7 +2519,7 @@ import { loadPanel } from './panels.js';
         _thinkingRecheckAt = 0;
         _finalizeLiveThinking(_closedThinkingText(roundText), rich);
         const elapsed = thinkingStartTime ? ((Date.now() - thinkingStartTime) / 1000).toFixed(1) : null;
-        if (_liveThinkHeader) _liveThinkHeader.textContent = 'View thinking process';
+        if (_liveThinkHeader) _liveThinkHeader.textContent = 'Vedi il ragionamento';
         if (_liveThinkTimerEl) _liveThinkTimerEl.textContent = elapsed ? _formatThinkStats(elapsed, _liveThinkTokenCount) : '';
         if (_liveThinkSpinnerSlot) _liveThinkSpinnerSlot.remove();
       }
@@ -2555,7 +2562,7 @@ import { loadPanel } from './panels.js';
           accumulated = accumulated.replace(/<think>/i, '<think time="' + elapsed + '">');
           roundText = roundText.replace(/<think>/i, '<think time="' + elapsed + '">');
         }
-        if (_liveThinkHeader) _liveThinkHeader.textContent = 'View thinking process';
+        if (_liveThinkHeader) _liveThinkHeader.textContent = 'Vedi il ragionamento';
         if (_liveThinkSpinnerSlot) _liveThinkSpinnerSlot.remove();
         if (_liveThinkTimerEl && elapsed) {
           _liveThinkTimerEl.textContent = _formatThinkStats(elapsed, _liveThinkTokenCount);
@@ -2730,7 +2737,7 @@ import { loadPanel } from './panels.js';
             .replace(/<channel\|>/gi, '')
             .trim();
           const lines = thinkText.split('\n').length;
-          const thinkLabel = 'Thinking' + (lines > 1 ? ` (${lines} lines)` : '');
+          const thinkLabel = 'Ragionamento' + (lines > 1 ? ` (${lines} righe)` : '');
           // Don't show beforeThink text during streaming — it'll appear in the final render
           // This prevents the "split into two" duplication
           let thinkSec = contentEl.querySelector(':scope > .thinking-section');
@@ -2883,7 +2890,7 @@ import { loadPanel } from './panels.js';
                   accumulated = accumulated.replace(/<think>/i, '<think time="' + _elapsedDone + '">');
                   roundText = roundText.replace(/<think>/i, '<think time="' + _elapsedDone + '">');
                 }
-                if (_liveThinkHeader) _liveThinkHeader.textContent = 'View thinking process';
+                if (_liveThinkHeader) _liveThinkHeader.textContent = 'Vedi il ragionamento';
                 if (_liveThinkSpinnerSlot) _liveThinkSpinnerSlot.remove();
                 if (_liveThinkTimerEl && _elapsedDone) {
                   _liveThinkTimerEl.textContent = _formatThinkStats(_elapsedDone, _liveThinkTokenCount);
@@ -3921,7 +3928,10 @@ import { loadPanel } from './panels.js';
                 inheritModelRouteState(holder, roundHolder, newWrap, metaS?.model || modelName);
                 const _roundRequested = newWrap._requestedModel;
                 const _roundActual = newWrap._actualModel;
-                newRole.textContent = _modelRouteLabel(
+                newRole.textContent = _authorLabel(
+                  presetsModule.getCharacterName ? presetsModule.getCharacterName() : ''
+                );
+                newRole.title = _modelRouteLabel(
                   _roundRequested,
                   _roundActual,
                   newWrap._requestedEndpointLabel,
@@ -3941,7 +3951,7 @@ import { loadPanel } from './panels.js';
                 if (spinner && spinner.element) spinner.destroy();
                 // Show spinner while waiting for text (skip for research — has its own progress)
                 if (!_researchingStreamIds.has(streamSessionId)) {
-                  spinner = spinnerModule.create('Generating response', 'right', 'wave');
+                  spinner = spinnerModule.create(spinnerModule.fraseAttesa('scrittura'), 'right', 'wave');
                   newBody.appendChild(spinner.createElement());
                   spinner.start();
                 }
@@ -4711,7 +4721,7 @@ import { loadPanel } from './panels.js';
             if (_box && sessionModule.getCurrentSessionId() === _timeoutSessionId) {
               var _timeoutMsg = document.createElement('div');
               _timeoutMsg.className = 'msg msg-ai';
-              _timeoutMsg.innerHTML = '<div class="role">Odysseus</div><div class="body" style="opacity:0.6;font-style:italic;">Research clarification timed out. Toggle research again to start over.</div>';
+              _timeoutMsg.innerHTML = '<div class="role">Vergilius</div><div class="body" style="opacity:0.6;font-style:italic;">Research clarification timed out. Toggle research again to start over.</div>';
               _box.appendChild(_timeoutMsg);
               uiModule.scrollHistory();
             }
@@ -5039,9 +5049,9 @@ import { loadPanel } from './panels.js';
     const holder = document.createElement('div');
     holder.className = 'msg msg-ai';
     const meta = sessionModule.getSessions().find(s => s.id === sessionId);
-    const roleLabel = _shortModel(meta && meta.model);
+    const roleLabel = _authorLabel(presetsModule.getCharacterName ? presetsModule.getCharacterName() : '');
     const roleTs = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    holder.innerHTML = '<div class="role">' + uiModule.esc(roleLabel) +
+    holder.innerHTML = '<div class="role" title="' + uiModule.esc(_shortModel(meta && meta.model) || '') + '">' + uiModule.esc(roleLabel) +
       ' <span class="role-timestamp">' + roleTs + '</span></div>' +
       '<div class="body"><div class="stream-content"></div></div>';
     holder._requestedModel = meta && meta.model;
@@ -5050,7 +5060,7 @@ import { loadPanel } from './panels.js';
     const contentDiv = holder.querySelector('.stream-content');
     box.appendChild(holder);
 
-    const spinner = spinnerModule.create('Generating response...', 'right');
+    const spinner = spinnerModule.create(spinnerModule.fraseAttesa('scrittura'), 'right');
     holder.querySelector('.body').appendChild(spinner.createElement());
     spinner.start();
     uiModule.scrollHistory();
@@ -5288,13 +5298,13 @@ import { loadPanel } from './panels.js';
       var holder = document.createElement('div');
       holder.className = 'msg msg-ai';
       var meta = sessionModule.getSessions().find(function(s) { return s.id === sessionId; });
-      var roleLabel = _shortModel(meta && meta.model);
+      var roleLabel = _authorLabel(presetsModule.getCharacterName ? presetsModule.getCharacterName() : '');
       var roleTs = new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
-      holder.innerHTML = '<div class="role">' + uiModule.esc(roleLabel) + ' <span class="role-timestamp">' + roleTs + '</span></div><div class="body"></div>';
+      holder.innerHTML = '<div class="role" title="' + uiModule.esc(_shortModel(meta && meta.model) || '') + '">' + uiModule.esc(roleLabel) + ' <span class="role-timestamp">' + roleTs + '</span></div><div class="body"></div>';
       _applyModelColor(holder.querySelector('.role'), meta && meta.model);
 
       var bodyDiv = holder.querySelector('.body');
-      var spinner = spinnerModule.create('Response streaming in background', 'right');
+      var spinner = spinnerModule.create('Risposta in arrivo in secondo piano', 'right');
       bodyDiv.appendChild(spinner.createElement());
       spinner.start();
 
@@ -5603,10 +5613,10 @@ import { loadPanel } from './panels.js';
 
     const saveBtn = document.createElement('button');
     saveBtn.className = 'edit-save-btn';
-    saveBtn.textContent = 'Send';
+    saveBtn.textContent = 'Invia';
     const cancelBtn = document.createElement('button');
     cancelBtn.className = 'edit-cancel-btn';
-    cancelBtn.textContent = 'Cancel';
+    cancelBtn.textContent = 'Annulla';
     btnRow.appendChild(saveBtn);
     btnRow.appendChild(cancelBtn);
 
@@ -6109,7 +6119,7 @@ import { loadPanel } from './panels.js';
       const roleTs = new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
       const agentMeta = sessionModule.getSessions().find(s => s.id === sessionModule.getCurrentSessionId());
       const agentModelLabel = _shortModel(agentMeta?.model);
-      holder.innerHTML = `<div class="role">${uiModule.esc(agentModelLabel)} <span class="role-timestamp">${roleTs}</span></div><div class="body"></div>`;
+      holder.innerHTML = `<div class="role" title="${uiModule.esc(agentModelLabel || '')}">${uiModule.esc(_authorLabel(presetsModule.getCharacterName ? presetsModule.getCharacterName() : ''))} <span class="role-timestamp">${roleTs}</span></div><div class="body"></div>`;
       _applyModelColor(holder.querySelector('.role'), agentMeta?.model);
       box.appendChild(holder);
 
@@ -6419,10 +6429,10 @@ import { loadPanel } from './panels.js';
     bar.className = 'msg-edit-bar';
     const saveBtn = document.createElement('button');
     saveBtn.className = 'msg-edit-save';
-    saveBtn.textContent = 'Save';
+    saveBtn.textContent = 'Salva';
     const cancelBtn = document.createElement('button');
     cancelBtn.className = 'msg-edit-cancel';
-    cancelBtn.textContent = 'Cancel';
+    cancelBtn.textContent = 'Annulla';
     bar.appendChild(saveBtn);
     bar.appendChild(cancelBtn);
     textarea.parentNode.insertBefore(bar, textarea.nextSibling);

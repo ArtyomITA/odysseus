@@ -6,10 +6,13 @@
 // Before this, /api/auth/settings was fetched independently by six modules and
 // /api/tools by three, none of them aware of the others — 4 and 3 requests on a
 // single cold load. Worse than the requests: each caller could observe a
-// different snapshot of the same object, and chatRenderer.js is imported under
-// three different ?v= query strings, so it is three separate module instances
-// each issuing its own /api/tools fetch. Caching here fixes both, because the
-// cache lives in one module every instance imports by the same specifier.
+// different snapshot of the same object, and chatRenderer.js used to be
+// imported under three different ?v= query strings, so it was three separate
+// module instances each issuing its own /api/tools fetch. Caching here fixes
+// both, because the cache lives in one module every caller imports by the same
+// specifier.
+// Nota: i suffissi ?v= sono stati tolti da TUTTI gli specificatori dei moduli
+// in static/, cosi' ogni modulo ha un solo URL e una sola istanza.
 //
 // URLs are bare paths on purpose. The callers that used `${API_BASE}/api/...`
 // resolved to the identical URL — API_BASE is `window.location.origin`

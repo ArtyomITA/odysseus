@@ -459,5 +459,36 @@ export function createLoadingRow(text = 'Loading…', size = 16) {
 
 export { Spinner };
 
-const spinnerModule = { create, createWhirlpool, createLoadingRow, Spinner };
+// Frasi di attesa: al posto del secco "Processing request" una piccola rosa di
+// frasi sobrie, scelte a caso a ogni turno, diverse per fase. Tono discreto:
+// niente emoji, niente battute.
+const FRASI_ATTESA = {
+  pensiero: [
+    'Ci penso un attimo',
+    'Sto ragionando',
+    'Metto in ordine le idee',
+    'Valuto la richiesta',
+    'Un momento',
+  ],
+  strumento: [
+    'Raccolgo i dati',
+    'Sto guardando',
+    'Controllo le fonti',
+    'Recupero le informazioni',
+    'Verifico',
+  ],
+  scrittura: [
+    'Preparo la risposta',
+    'Sto scrivendo',
+    'Compongo la risposta',
+    'Ci siamo',
+  ],
+};
+
+export function fraseAttesa(fase = 'pensiero') {
+  const rosa = FRASI_ATTESA[fase] || FRASI_ATTESA.pensiero;
+  return rosa[Math.floor(Math.random() * rosa.length)];
+}
+
+const spinnerModule = { create, createWhirlpool, createLoadingRow, fraseAttesa, Spinner };
 export default spinnerModule;
