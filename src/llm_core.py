@@ -1206,6 +1206,22 @@ def _apply_local_reasoning_controls(
         payload["reasoning_budget_tokens"] = max(0, int(reasoning_budget_tokens))
 
 
+def _reasoning_budget_message() -> str:
+    """Frase con cui llama.cpp chiude il pensiero quando il budget finisce.
+
+    b10549 la incolla ESATTAMENTE dov'e' arrivato il modello, senza
+    separatore: `...I need to search for` + la frase = `search forBasta
+    ragionare, agisco.` (difetto 22, 4 turni su 15). Qui si garantisce
+    l'a-capo davanti, cosi' la frase resta una frase e la parola tronca
+    resta di la'. `\\n` scritto nel file .env viene interpretato.
+    """
+    raw = os.getenv("ODYSSEUS_TOOL_ROUND_REASONING_MESSAGE", "")
+    if not raw.strip():
+        return ""
+    testo = raw.replace("\\n", "\n").strip()
+    return "\n\n" + testo
+
+
 def _is_local_minimax_mlx_request(url: str, model: str) -> bool:
     """Local MLX MiniMax-family endpoints need conservative sampling defaults.
 
@@ -2836,6 +2852,23 @@ async def _nonstream_tools_call(target_url: str, payload: Dict, headers, timeout
     if usage:
         counts = _normalize_usage_counts(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
         if counts:
+            # Come nel ramo in streaming: llama.cpp mette accanto a `usage` un
+            # blocco `timings` con la velocita' VERA di generazione. Senza, il
+            # chiamante ricadeva su token/tempo-totale, che conta anche prefill
+            # e attese (difetto 2: 7,23 tok/s per 89 token in 7,5 s).
+            # `think_ms`: in non-stream il pensiero arriva in un colpo solo e il
+            # browser misurava 0.0s; qui il tempo di generazione si ripartisce
+            # fra pensiero e risposta in proporzione ai caratteri.
+            _tm = d.get("timings")
+            if isinstance(_tm, dict):
+                if _tm.get("predicted_per_second"):
+                    counts["gen_tps"] = round(_tm["predicted_per_second"], 2)
+                if _tm.get("prompt_per_second"):
+                    counts["prefill_tps"] = round(_tm["prompt_per_second"], 2)
+                _pred_ms = _tm.get("predicted_ms")
+                _tot_chars = len(ragio) + len(cont)
+                if _pred_ms and ragio and _tot_chars:
+                    counts["think_ms"] = round(float(_pred_ms) * len(ragio) / _tot_chars, 1)
             yield f'data: {json.dumps({"type": "usage", "data": counts})}\n\n'
     yield "data: [DONE]\n\n"
 
@@ -2919,7 +2952,7 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
             # Messaggio iniettato prima del tag di chiusura quando il budget
             # finisce (server-common.cpp:1364): chiude il pensiero con una
             # frase invece che a meta' ragionamento. Vuoto = solo il tag.
-            _rbm = os.getenv("ODYSSEUS_TOOL_ROUND_REASONING_MESSAGE", "").strip()
+            _rbm = _reasoning_budget_message()
             if _rbm:
                 payload["reasoning_budget_message"] = _rbm
         elif tool_choice_none:

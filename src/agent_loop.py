@@ -1006,12 +1006,58 @@ _WORKSPACE_TERMINUS_TOOLS = (
     | {"manage_skills", "ask_teacher", "web_search", "web_fetch", "ask_user", "update_plan"}
 )
 
+_TUTTI_NOMI_STRUMENTO: Optional[frozenset] = None
+
+
+def _nomi_strumento_noti() -> frozenset:
+    """Tutti i nomi di strumento che il prompt puo' nominare.
+
+    Pigro: TOOL_SECTIONS e' definito piu' sotto in questo stesso file.
+    """
+    global _TUTTI_NOMI_STRUMENTO
+    if _TUTTI_NOMI_STRUMENTO is None:
+        nomi = set()
+        for gruppo in _DOMAIN_TOOL_MAP.values():
+            nomi |= set(gruppo)
+        nomi |= set(TOOL_SECTIONS.keys())
+        _TUTTI_NOMI_STRUMENTO = frozenset(nomi)
+    return _TUTTI_NOMI_STRUMENTO
+
+
+def _pota_regole_dominio(testo: str, attaccati: set) -> str:
+    """Toglie dalle regole di dominio le frasi che nominano uno strumento NON
+    attaccato in questo giro.
+
+    Con il tool calling nativo il modello deve vedere solo i nomi che puo'
+    davvero chiamare: nel pensiero citava `list_downloads`, `tail_serve_output`
+    e simili, letti qui e non fra gli schemi (difetto 26). Il blocco entrava
+    tutto intero non appena UNO strumento del dominio era attaccato.
+    """
+    assenti = _nomi_strumento_noti() - set(attaccati)
+    if not assenti:
+        return testo
+    righe = []
+    for riga in testo.splitlines():
+        if not riga.startswith("- "):
+            righe.append(riga)
+            continue
+        frasi = re.split(r"(?<=[.:])\s+", riga)
+        tenute = [f for f in frasi if not any(f"`{n}`" in f for n in assenti)]
+        if not tenute:
+            continue
+        nuova = " ".join(tenute)
+        righe.append(nuova if nuova.startswith("- ") else "- " + nuova)
+    return "\n".join(righe)
+
+
 def _domain_rules_for_tools(tool_names: set) -> list[str]:
     names = set(tool_names or set())
     rules = []
     for domain, domain_tools in _DOMAIN_TOOL_MAP.items():
         if names & domain_tools:
-            rules.append(_DOMAIN_RULES[domain])
+            potate = _pota_regole_dominio(_DOMAIN_RULES[domain], names)
+            if potate.strip():
+                rules.append(potate)
     if names & {"create_session", "list_sessions", "manage_session", "manage_documents", "manage_notes", "manage_calendar", "manage_tasks", "manage_skills", "manage_research"}:
         rules.append(_LINK_RULES)
     return rules
@@ -5200,6 +5246,10 @@ async def stream_agent_loop(
     has_real_usage = False
     backend_gen_tps = 0      # backend-reported true gen speed (llama.cpp timings)
     backend_prefill_tps = 0  # backend-reported prefill speed
+    backend_think_ms = 0.0   # ms di pensiero riferiti dal backend (giri non in streaming)
+    thinking_wall_s = 0.0    # secondi di pensiero misurati sui delta (giri in streaming)
+    _think_first_ts = None   # primo delta di pensiero del giro in corso
+    _think_last_ts = None    # ultimo delta di pensiero del giro in corso
     requested_model = model
     actual_model = model
     actual_endpoint_id = requested_endpoint_id
@@ -6000,6 +6050,11 @@ async def stream_agent_loop(
                             backend_gen_tps = u["gen_tps"]
                         if u.get("prefill_tps"):
                             backend_prefill_tps = u["prefill_tps"]
+                        # Tempo di pensiero riferito dal backend (giri NON in
+                        # streaming: li' il browser non puo' misurarlo e
+                        # scriveva sempre 0.0s). Si somma sui giri del turno.
+                        if u.get("think_ms"):
+                            backend_think_ms += float(u["think_ms"])
                     elif data.get("type") == "fallback":
                         # The selected model failed and another answered; surface
                         # the notice so a misconfigured provider isn't masked.
@@ -6107,6 +6162,14 @@ async def stream_agent_loop(
                         # other vendors). Regular content still flows into
                         # round_response unchanged.
                         if data.get("thinking"):
+                            # Durata reale del pensiero: primo e ultimo delta di
+                            # pensiero del giro. In streaming e' esatta; in
+                            # non-stream collassa a zero e vince `think_ms` del
+                            # backend (difetto 2: pensiero sempre 0.0s).
+                            _ora_think = time.time()
+                            if _think_first_ts is None:
+                                _think_first_ts = _ora_think
+                            _think_last_ts = _ora_think
                             round_reasoning += data["delta"]
                         else:
                             _delta_text = (
@@ -6143,6 +6206,11 @@ async def stream_agent_loop(
             _round_first_token_logged,
         )
         _finalize_round_usage()
+        # Chiusura della misura del pensiero di QUESTO giro (vedi i delta sopra).
+        if _think_first_ts is not None and _think_last_ts is not None:
+            thinking_wall_s += max(_think_last_ts - _think_first_ts, 0.0)
+        _think_first_ts = None
+        _think_last_ts = None
         _normalized_doc_round = (
             _normalize_stream_document_fences(
                 round_response,
@@ -7602,6 +7670,16 @@ async def stream_agent_loop(
             )
     metrics["requested_endpoint_id"] = requested_endpoint_id
     metrics["requested_endpoint_label"] = requested_endpoint_label
+    # Tempo di pensiero del turno. In streaming vale la misura sui delta; nei
+    # giri non in streaming i delta arrivano tutti insieme e vale la stima del
+    # backend (`think_ms`, da timings.predicted_ms). Prima il browser scriveva
+    # sempre 0.0s perche' era l'unico a misurarlo (difetto 2).
+    _think_s = max(thinking_wall_s, backend_think_ms / 1000.0)
+    if _think_s > 0:
+        metrics["thinking_time"] = round(_think_s, 1)
+    # Tempo totale del turno, esplicito accanto a `response_time` (che e' lo
+    # stesso numero ma il nome non lo dice).
+    metrics["total_time"] = round(total_duration, 2)
     yield f"data: {json.dumps({'type': 'metrics', 'data': metrics})}\n\n"
 
     # Teacher-escalation: inline takeover visible in the chat stream.

@@ -303,6 +303,18 @@ class ChatProcessor:
                 "role": "system",
                 "content": preset_system_prompt
             })
+        # Vergilius: il marchio del sistema. Senza questa riga il modello si
+        # presentava come "LFM di Liquid AI", o col nome della persona attiva
+        # ("Mao"), mai come Vergilius (difetto 21). Testo STATICO e corto: sta
+        # nel prefisso in cache e non lo rompe.
+        preface.append({
+            "role": "system",
+            "content": (
+                "You are Vergilius, a local AI assistant running on the user's own PC. "
+                "A persona only sets your tone; the system name you give is always Vergilius. "
+                "Do not name the model you run on, or its vendor, unless the user asks."
+            ),
+        })
         preface.append({
             "role": "system",
             "content": UNTRUSTED_CONTEXT_POLICY,
@@ -544,7 +556,10 @@ class ChatProcessor:
                 by_cat: Dict[str, list] = {}
                 for s in _subset:
                     by_cat.setdefault(s.get("category") or "general", []).append(s)
-                lines = ["[Available skills — call manage_skills(action='view', name='...') to load one when relevant]"]
+                # La riga finale dice che l'indice e' un riferimento INTERNO:
+                # finiva elencato nella risposta a "chi sei" (difetto 27).
+                lines = ["[Available skills — call manage_skills(action='view', name='...') to load one when relevant. "
+                         "Internal reference: do not list these skills to the user unless asked about them.]"]
                 for cat in sorted(by_cat):
                     lines.append(f"  {cat}:")
                     for s in sorted(by_cat[cat], key=lambda x: x["name"]):

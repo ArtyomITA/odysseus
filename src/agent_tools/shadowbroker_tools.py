@@ -78,6 +78,17 @@ def _errore(messaggio: str) -> Dict[str, Any]:
     return {"error": messaggio, "exit_code": 1}
 
 
+# Testo per il MODELLO (inglese) quando `osint_mappa evidenzia` riceve
+# identificativi che non sono nostri: dice cosa accetta e dove sta il grafico.
+_AIUTO_EVIDENZIA = (
+    "osint_mappa evidenzia takes ids that came from a previous tool result in this "
+    "conversation (for example `gdelt:32e4e3`, or the `id` of a contract from "
+    "fin_appalti), or a place name with azione='centra'. Stock tickers and company "
+    "names are not map ids. To draw a chart, do not call a tool: answer with a "
+    "```chart fenced block."
+)
+
+
 def _errore_scrittura(etichetta: str, e: Exception) -> Dict[str, Any]:
     """Errore di una SCRITTURA sul canale OpenClaw.
 
@@ -435,7 +446,26 @@ class MappaTool(_Base):
                 }, timeout=15)
             except Exception as e:
                 return _errore(f"osint_mappa centra: {str(e)[:180]}")
-            return _consegna({"azione": "centra", "lat": lat, "lng": lng, "esito": r})
+            # Difetto 25: centrava e basta, e il modello riempiva il vuoto con
+            # geografia a memoria (Odessa "capitale della regione di
+            # Zaporizhzhia"). Il geocodificatore inverso e' gia' in casa
+            # (reverse_geocoder, nessuna chiamata di rete in piu'): quel poco
+            # che sa lo diciamo, e diciamo che oltre non c'e' altro.
+            fuori = {"azione": "centra", "lat": lat, "lng": lng, "esito": r}
+            nome = geo.nome_del_posto(float(lat), float(lng))
+            if nome:
+                pezzi = [p.strip() for p in nome.split(",") if p.strip()]
+                if len(pezzi) >= 3:
+                    fuori["regione"], fuori["paese"] = pezzi[-2], pezzi[-1]
+                elif len(pezzi) == 2:
+                    fuori["paese"] = pezzi[-1]
+                fuori["luogo_verificato"] = nome
+            fuori["leggi_cosi"] = (
+                "Only these facts are verified; do not add geography from memory. "
+                "Any clock or time zone inside `esito` belongs to the dashboard "
+                "that is watching, not to this place."
+            )
+            return _consegna(fuori)
 
         if azione in ("livelli", "layers", "mostra_solo"):
             accesi = a.get("accendi") or a.get("livelli") or a.get("solo") or []
@@ -482,7 +512,7 @@ class MappaTool(_Base):
             if isinstance(ids, str):
                 ids = [p.strip() for p in ids.split(",") if p.strip()]
             if not ids:
-                return _errore("osint_mappa evidenzia: serve almeno un identificativo")
+                return _errore(_AIUTO_EVIDENZIA)
             # Gli identificativi sono nostri (`gdelt:32e4e3`): il cruscotto
             # ragiona per posizione, quindi si traducono in punti.
             store = get_store()
@@ -494,7 +524,14 @@ class MappaTool(_Base):
                     punti.append({"id": str(i), "lat": c[0], "lng": c[1],
                                   "etichetta": geo.etichetta(e)})
             if not punti:
-                return _errore("nessuno degli identificativi ha una posizione da evidenziare")
+                # Difetti 24 e 31: il modello ci passava ticker di borsa
+                # (`AAPL`) per farsi disegnare un grafico. L'errore dice cosa
+                # accetta questo strumento e dove sta il grafico, altrimenti
+                # ritenta con gli stessi identificativi.
+                return _errore(
+                    f"{_AIUTO_EVIDENZIA} None of these resolved: "
+                    f"{', '.join(str(i) for i in ids[:6])}."
+                )
             try:
                 r = client.comando("highlight", {"punti": punti}, timeout=15)
             except Exception as e:

@@ -209,6 +209,8 @@ OSINT_TOOL_SCHEMAS: List[Dict[str, Any]] = [
                 "azione='nota' pins your written note on the map at a point "
                 "(testo, optional colore); azione='note' lists the notes; "
                 "azione='cancella_nota' removes one by id.\n"
+                "Not for charts, tables or any drawing: a chart is a ```chart "
+                "block in your reply, not a tool call.\n"
                 "Layer names: military_flights, commercial_flights, private_jets, "
                 "ships, gdelt, news, telegram_osint, satellites, earthquakes, "
                 "firms_fires, weather_alerts, internet_outages, military_bases, "
@@ -228,7 +230,8 @@ OSINT_TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "accendi": {"type": "array", "items": {"type": "string"},
                                 "description": "For 'livelli': the only layers to keep on"},
                     "ids": {"type": "array", "items": {"type": "string"},
-                            "description": "For 'evidenzia': identifiers taken from briefings"},
+                            "description": "For 'evidenzia': ids returned by an earlier tool result "
+                                           "(e.g. `gdelt:32e4e3`). Never stock tickers or company names."},
                     "testo": {"type": "string", "description": "For 'nota': the note text left on the map"},
                     "colore": {"type": "string", "description": "For 'nota': rosso, ambra, blu, viola, ciano (default)"},
                     "id": {"type": "string", "description": "For 'cancella_nota': the note id from 'note'"},
@@ -643,7 +646,8 @@ REGOLE_FINANCE = (
     "  Types: bar, line, pie. Multi-series: \"series\":[{\"name\":\"X\","
     "\"data\":[...]}] instead of \"data\". Draw when asked or when a "
     "comparison clearly reads better drawn; numbers from tools, never "
-    "invented.\n"
+    "invented. Strict JSON inside the block: no comments, no trailing "
+    "text. A chart is never a tool call.\n"
     "- Missing datum → DECLARE it. Empty feed is not calm.\n"
     "- Arithmetic is YOUR job: totals, differences, percentages, currency "
     "conversion with a rate the user gave. Take the numbers from the tool "
@@ -751,7 +755,9 @@ REGOLE_FINANCE_LIBERE = (
     "  {\"type\":\"bar\",\"title\":\"Titolo\",\"labels\":[\"A\",\"B\"],\"data\":[1,2]}\n"
     "  ```\n"
     "  Types: bar, line, pie. Multi-series: \"series\":[{\"name\":\"X\","
-    "\"data\":[...]}] instead of \"data\". Numbers from tools."
+    "\"data\":[...]}] instead of \"data\". Numbers from tools.\n"
+    "  Strict JSON inside the block: no comments, no trailing text. A chart is "
+    "never a tool call."
 )
 
 REGOLE_OSINT_LIBERE = (

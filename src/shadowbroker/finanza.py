@@ -431,7 +431,11 @@ def mercati(quante_notizie: int = 8, titolo: Optional[str] = None) -> Dict[str, 
             or "nessuna notizia collegata a questo titolo nel feed: dillo; per cercarne usa osint_notizie con soggetto")
         generali = fuori.pop("notizie", [])
         fuori["notizie_generali_di_mercato_NON_sul_titolo_richiesto"] = generali[:4]
-        fuori = {"titolo_richiesto": quota, **fuori}
+        # `quotazione_titolo` porta gia' dentro la chiave `titolo_richiesto` (il
+        # nome chiesto): avvolgendola qui diventava `titolo_richiesto.
+        # titolo_richiesto` (difetto 32). Il nome chiesto sale di un livello.
+        _chiesto = quota.pop("titolo_richiesto", None) or str(titolo)
+        fuori = {"titolo_richiesto": quota, "nome_chiesto": _chiesto, **fuori}
     # Archivio storico: i picchi di oggi diventano eventi consultabili domani.
     # Lavora in un thread, un errore li' non tocca questa risposta.
     from src.shadowbroker import archivio
