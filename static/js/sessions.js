@@ -2109,7 +2109,7 @@ export async function selectSession(id, { keepSidebar = false, showLoading = tru
     if (_rChk) _rChk.checked = false;
 
     // Check for pending/completed research that survived a page refresh
-    if (window.chatModule && window.chatModule.checkPendingResearch) {
+    if (id && window.chatModule && window.chatModule.checkPendingResearch) {
       window.chatModule.checkPendingResearch(id);
     }
     // Restore group chat state if this is a group session
@@ -2616,6 +2616,8 @@ function _startResearchPolling() {
       return;
     }
     for (var sid of _researchingSessions) {
+      // Stessa ragione di `_checkServerStream`: senza id la rotta non esiste.
+      if (!sid) { _researchingSessions.delete(sid); continue; }
       try {
         var res = await fetch(`${API_BASE}/api/research/status/${sid}`);
         if (!res.ok) { _researchingSessions.delete(sid); continue; }
@@ -2733,6 +2735,9 @@ function _updateRailNotifs() {
  * and poll until done, then reload the session.
  */
 async function _checkServerStream(sessionId) {
+  // Senza id la rotta diventa `/api/chat/stream_status/` e risponde 404 a
+  // ogni apertura: una richiesta fallita per nulla, in rete e in console.
+  if (!sessionId) return;
   try {
     // Skip if research is running — it has its own progress UI
     if (_researchingSessions.has(sessionId)) return;

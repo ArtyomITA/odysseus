@@ -455,7 +455,15 @@ export function extractThinkingBlocks(text) {
  */
 function createThinkingSection(thinkingContent, index = 0, thinkingTime = null) {
   const id = `thinking-${Date.now()}-${index}`;
-  const timeHtml = thinkingTime ? `<span style="font-size:11px;opacity:0.4;font-variant-numeric:tabular-nums;">${thinkingTime}s</span>` : '';
+  // Il conteggio dei token del pensiero spariva dopo una ricarica: dal vivo
+  // lo scrive chat.js (`_formatThinkStats`), qui non c'era. E' la stessa stima
+  // (un token ogni 4 caratteri) sullo stesso testo, quindi il numero coincide
+  // con quello visto durante la risposta e non serve persistere altro.
+  const tokStimati = Math.max(1, Math.ceil(String(thinkingContent || '').trim().length / 4));
+  const statsTxt = thinkingTime
+    ? `${thinkingTime}s · ${tokStimati} tok`
+    : '';
+  const timeHtml = statsTxt ? `<span style="font-size:11px;opacity:0.4;font-variant-numeric:tabular-nums;">${statsTxt}</span>` : '';
   return `
     <div class="thinking-section">
       <div class="thinking-header" data-thinking-id="${id}">

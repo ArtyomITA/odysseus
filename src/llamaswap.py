@@ -286,3 +286,96 @@ def status(endpoint_url: str, model: str) -> Dict[str, Any]:
         except Exception:
             out["occhi_pronti"] = False
     return out
+
+
+# ── Vergilius: profili annunciati senza i pesi sul disco ────────────────────
+#
+# `config.yaml` descrive anche modelli FACOLTATIVI (es. `lfm-uncensored`, che
+# si scarica a parte). llama-swap li annuncia comunque in `/v1/models`, quindi
+# finivano nel menu dei modelli: sceglierli dava solo un errore. Il filtro
+# lato interfaccia non bastava, `/api/models` li restituiva lo stesso.
+#
+# Qui si legge il file di configurazione e, per ogni profilo, si guarda il
+# percorso dei pesi principali (`-m` / `--model`, macro espanse). Se il file
+# non esiste, il profilo e i suoi alias non vanno annunciati. Se il percorso
+# non e' ricavabile, il profilo resta (meglio annunciarlo che perderlo).
+_CONFIG_TTL = 30.0
+_config_cache: Dict[str, Tuple[frozenset, float]] = {}
+
+
+def _percorso_config() -> Optional[str]:
+    """Il config.yaml di llama-swap: leva d'ambiente, poi la radice del repo."""
+    import os
+
+    env = (os.environ.get("VERGILIUS_LLAMASWAP_CONFIG") or "").strip()
+    if env:
+        return env
+    # src/llamaswap.py -> odysseus/ -> radice del repo -> llama-swap/
+    radice = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    return os.path.join(radice, "llama-swap", "config.yaml")
+
+
+def _pesi_dal_comando(cmd: str) -> Optional[str]:
+    """Il percorso dopo `-m` / `--model` (non `-md`, che e' il drafter)."""
+    pezzi = str(cmd or "").split()
+    for i, pezzo in enumerate(pezzi):
+        if pezzo in ("-m", "--model") and i + 1 < len(pezzi):
+            return pezzi[i + 1]
+    return None
+
+
+def _profili_senza_pesi(percorso: str) -> frozenset:
+    import os
+    import re
+
+    import yaml
+
+    with open(percorso, "r", encoding="utf-8-sig") as fh:
+        dati = yaml.safe_load(fh) or {}
+    macro = dati.get("macros") or {}
+    modelli = dati.get("models") or {}
+    if not isinstance(modelli, dict):
+        return frozenset()
+
+    def _espandi(testo: str) -> str:
+        # Due giri bastano: una macro puo' citarne un'altra, non di piu'.
+        for _ in range(2):
+            testo = re.sub(
+                r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}",
+                lambda m: str(macro.get(m.group(1), m.group(0))),
+                testo,
+            )
+        return testo
+
+    mancanti = set()
+    for nome, voce in modelli.items():
+        if not isinstance(voce, dict):
+            continue
+        pesi = _pesi_dal_comando(_espandi(str(voce.get("cmd") or "")))
+        if not pesi or os.path.exists(pesi):
+            continue
+        mancanti.add(str(nome))
+        for alias in (voce.get("aliases") or []):
+            mancanti.add(str(alias))
+    return frozenset(mancanti)
+
+
+def profili_senza_pesi() -> frozenset:
+    """Nomi (alias compresi) dei profili llama-swap senza file di pesi.
+
+    Vuoto se il file di configurazione manca o non si legge: in dubbio non si
+    nasconde niente.
+    """
+    percorso = _percorso_config()
+    if not percorso:
+        return frozenset()
+    hit = _cached(_config_cache, percorso, _CONFIG_TTL)
+    if hit is not None:
+        return hit
+    try:
+        esito = _profili_senza_pesi(percorso)
+    except Exception as exc:  # file assente, YAML rotto, permessi…
+        logger.debug("[llama-swap] config non leggibile (%s): %s", percorso, exc)
+        esito = frozenset()
+    _store(_config_cache, percorso, esito)
+    return esito

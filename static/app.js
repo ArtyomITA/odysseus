@@ -3939,7 +3939,7 @@ function startOdysseusApp() {
       sendBtn.title = 'Queue message';
     } else {
       sendBtn.innerHTML = _stopIcon;
-      sendBtn.title = 'Stop generation';
+      sendBtn.title = 'Ferma la generazione';
     }
     return true;
   }

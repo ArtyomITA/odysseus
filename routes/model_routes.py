@@ -1551,6 +1551,11 @@ def setup_model_routes(model_discovery):
         scoped filter was making the picker disappear for them).
         """
         items = []
+        try:
+            from src import llamaswap as _llamaswap
+            _senza_pesi = _llamaswap.profili_senza_pesi()
+        except Exception:
+            _senza_pesi = frozenset()
 
         db = SessionLocal()
         try:
@@ -1574,6 +1579,14 @@ def setup_model_routes(model_discovery):
             kind = _effective_endpoint_kind(ep, base)
             category = _classify_endpoint(base, kind)
             model_ids, pinned = _picker_models_for_endpoint(ep, base, kind)
+            # Vergilius: un profilo llama-swap senza il file di pesi sul disco
+            # (es. `lfm-uncensored`, facoltativo) non si annuncia: sceglierlo
+            # darebbe solo un errore. I nomi arrivano dal NOSTRO config.yaml,
+            # quindi nessun altro fornitore puo' esserne toccato, e gli alias
+            # `-vista` seguono il profilo a cui appartengono.
+            if model_ids and _senza_pesi:
+                model_ids = [m for m in model_ids if m not in _senza_pesi]
+                pinned = [m for m in pinned if m not in _senza_pesi]
 
             if model_ids:
                 curated_key = _match_provider_curated(base, None)

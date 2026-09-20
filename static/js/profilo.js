@@ -90,8 +90,13 @@
       // Lo stato non si legge piu' solo dall'opacita': riempimento pieno se
       // acceso, bordo tratteggiato se spento, e aria-pressed per chi legge
       // con la tastiera o con uno screen reader.
-      el.setAttribute('aria-pressed', acceso ? 'true' : 'false');
-      el.title = (acceso ? 'Acceso' : 'Spento') + ' — ' + c.label + ': clic per cambiare';
+      // Si scrive SOLO se il valore cambia: questa funzione gira anche a
+      // riposo ogni 1,5 s e riscriveva gli attributi ogni giro (rumore per
+      // chi osserva il DOM, e un clic poteva restare sotto una risincronia).
+      var premuto = acceso ? 'true' : 'false';
+      if (el.getAttribute('aria-pressed') !== premuto) el.setAttribute('aria-pressed', premuto);
+      var titolo = (acceso ? 'Acceso' : 'Spento') + ', ' + c.label + ': clic per cambiare';
+      if (el.title !== titolo) el.title = titolo;
       if (acceso && !inPrimoPiano) inPrimoPiano = ORDINE_MODO[c.id] || '';
     });
     // Vista non ha un chip suo (e' un interruttore del modello): se nessuna
@@ -99,14 +104,18 @@
     if (!inPrimoPiano && vista) inPrimoPiano = 'vista';
     try {
       var de = document.documentElement;
-      if (inPrimoPiano) de.setAttribute('data-modo-attivo', inPrimoPiano);
-      else de.removeAttribute('data-modo-attivo');
+      if (inPrimoPiano) {
+        if (de.getAttribute('data-modo-attivo') !== inPrimoPiano) de.setAttribute('data-modo-attivo', inPrimoPiano);
+      } else if (de.hasAttribute('data-modo-attivo')) {
+        de.removeAttribute('data-modo-attivo');
+      }
     } catch (_) {}
     var mod = bar.querySelector('.mmod');
     if (mod) {
       var l = document.getElementById('model-picker-label');
       var nome = (l && (l.title || l.textContent) || '').trim().split('/').pop();
-      mod.textContent = nome ? nome + (vista ? ' 👁' : '') : '';
+      var etichetta = nome ? nome + (vista ? ' 👁' : '') : '';
+      if (mod.textContent !== etichetta) mod.textContent = etichetta;
     }
   }
 

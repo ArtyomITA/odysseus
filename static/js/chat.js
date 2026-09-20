@@ -905,13 +905,13 @@ import { loadPanel } from './panels.js';
         const hasQueuedText = !!(msgInput && msgInput.value && msgInput.value.trim());
         submitBtn.innerHTML = hasQueuedText && icons ? icons.send : _stopSvg;
         submitBtn.dataset.phase = hasQueuedText ? 'queue' : 'processing';
-        submitBtn.title = hasQueuedText ? 'Queue message' : 'Stop generation';
+        submitBtn.title = hasQueuedText ? 'Queue message' : 'Ferma la generazione';
         submitBtn.classList.remove('anim-launch');
         void submitBtn.offsetWidth;
         submitBtn.classList.add('anim-land');
         submitBtn.addEventListener('animationend', () => submitBtn.classList.remove('anim-land'), { once: true });
       }, 300);
-      submitBtn.title = 'Stop generation';
+      submitBtn.title = 'Ferma la generazione';
       submitBtn.dataset.mode = 'streaming';
       submitBtn.dataset.phase = 'processing';
       isStreaming = true;
@@ -5020,7 +5020,9 @@ import { loadPanel } from './panels.js';
       const label = document.createElement('span');
       label.style.fontStyle = 'italic';
       label.style.opacity = '0.7';
-      label.textContent = '[Cancelled by user]';
+      // Il marcatore che il codice confronta resta `metadata.cancelled`: qui
+      // si traduce solo la riga che si legge a schermo.
+      label.textContent = "[Annullato dall'utente]";
       indicator.appendChild(label);
       body.appendChild(indicator);
     }

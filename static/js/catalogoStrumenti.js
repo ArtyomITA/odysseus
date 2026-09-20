@@ -140,7 +140,7 @@
     var body = el("div", { class: "face-body" });
     if (f.come) body.appendChild(el("div", { class: "face-come", text: f.come }));
     if (f.esempi && f.esempi.length) {
-      body.appendChild(el("div", { class: "face-subttl", text: "esempi — coi tool che usano" }));
+      body.appendChild(el("div", { class: "face-subttl", text: "esempi, coi tool che usano" }));
       f.esempi.forEach(function (ex) {
         var chips = el("div", { class: "chips" });
         (ex.tool || []).forEach(function (t) { chips.appendChild(el("span", { class: "chip", text: t })); });
@@ -151,7 +151,7 @@
       });
     }
     if (f.sub && f.sub.length) {
-      body.appendChild(el("div", { class: "face-subttl", text: "chiama sotto — " + f.sub.length }));
+      body.appendChild(el("div", { class: "face-subttl", text: "chiama sotto: " + f.sub.length }));
       var grid = el("div", { class: "cat-sub" });
       f.sub.forEach(function (s) {
         grid.appendChild(el("span", { class: "sn", text: s.nome }));

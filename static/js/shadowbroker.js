@@ -266,7 +266,7 @@ function _aggiornaPulsanteFin() {
   const on = financialAttivo();
   b.classList.toggle('active', on);
   b.title = on
-    ? 'Profilo Financial attivo: mercati, appalti federali, insider — più mappa e notizie'
+    ? 'Profilo Financial attivo: mercati, appalti federali, insider, piu\' mappa e notizie'
     : 'Attiva il profilo Financial: sotto Intelligence, ristretto ai dati economici';
 }
 
@@ -435,8 +435,11 @@ export async function mostraConfigFinancial() {
      </label>`);
 
   overlay.innerHTML =
-    '<div class="modal-content" role="dialog" aria-modal="true" style="max-width:480px;">' +
-      '<div class="modal-header"><h4>Profilo Financial</h4></div>' +
+    // `aria-labelledby` lega la finestra al suo titolo: senza, chi legge con
+    // uno screen reader entra in un dialogo senza nome. La trappola del fuoco
+    // di ui.js si attiva gia' con `aria-modal="true"`.
+    '<div class="modal-content" role="dialog" aria-modal="true" aria-labelledby="fin-config-titolo" style="max-width:480px;">' +
+      '<div class="modal-header"><h4 id="fin-config-titolo">Profilo Financial</h4></div>' +
       '<div class="modal-body" style="max-height:60vh;overflow-y:auto;">' +
         '<div style="opacity:.8;font-size:.9em;margin-bottom:6px;">' +
           'Queste scelte pesano sul budget Finnhub (60 chiamate/min, condiviso ' +
@@ -447,10 +450,10 @@ export async function mostraConfigFinancial() {
              'difesa + big tech + cripto, prezzi aggiornati ogni minuto') +
         riga(`<input type="radio" name="fin-preset" value="broad" ${cfg.preset === 'broad' ? 'checked' : ''}>`,
              'Titoli: Broad (60)',
-             'aggiunge banche, energia, industriali, farmaceutici — prezzi ogni 2 minuti') +
+             'aggiunge banche, energia, industriali, farmaceutici; prezzi ogni 2 minuti') +
         riga(`<input type="checkbox" id="fin-deep" ${cfg.deep_news ? 'checked' : ''}>`,
              'Deep news',
-             'notizie su 30 titoli con finestra di 7 giorni invece di 13 titoli su 3 — più contesto, stesso giro da 10 minuti') +
+             "notizie su 30 titoli con finestra di 7 giorni invece di 13 titoli su 3: piu' contesto, stesso giro da 10 minuti") +
         riga(`<input type="checkbox" id="fin-rt" ${cfg.realtime ? 'checked' : ''}>`,
              'Sottoinsieme in tempo quasi reale',
              '10 titoli chiave riquotati ogni 30 secondi (monitoraggio serrato, non esecuzione ordini)') +

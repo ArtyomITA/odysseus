@@ -1386,20 +1386,9 @@ if (!window._odyEscExpandGuard) {
     const t = e.target;
     if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
     const expanded = document.querySelector('.doclib-card-expanded');
-    const think = document.querySelector('.thinking-content.expanded');
     if (expanded) {
       e.stopImmediatePropagation(); e.preventDefault();
       try { expanded.click(); } catch {}
-      return;
-    }
-    if (think) {
-      e.stopImmediatePropagation(); e.preventDefault();
-      const thinkHeader = think.closest('.thinking-section')?.querySelector('.thinking-header[data-thinking-id]');
-      if (thinkHeader) { try { thinkHeader.click(); } catch {} }
-      else {
-        // No header found — collapse the content directly.
-        try { think.classList.remove('expanded'); } catch {}
-      }
       return;
     }
     const galleryEditor = document.getElementById('gallery-editor-container');
@@ -1428,11 +1417,33 @@ if (!window._odyEscExpandGuard) {
       }
     }
     const topModal = pickTopModal();
-    if (!topModal) return;
-    const closeBtn = topModal.querySelector('.close-btn, .modal-close-btn, [data-action="close"]');
-    e.stopImmediatePropagation();
-    e.preventDefault();
-    if (closeBtn) { try { closeBtn.click(); } catch {} }
-    else { try { topModal.classList.add('hidden'); } catch {} }
+    if (topModal) {
+      const closeBtn = topModal.querySelector('.close-btn, .modal-close-btn, [data-action="close"]');
+      e.stopImmediatePropagation();
+      e.preventDefault();
+      if (closeBtn) { try { closeBtn.click(); } catch {} }
+      else { try { topModal.classList.add('hidden'); } catch {} }
+      return;
+    }
+    // Il pannello a tutta area (ShadowBroker) e' uno strato sopra la chat: un
+    // blocco di pensiero collassabile non lo e'. Qui non si fa niente e non si
+    // chiama preventDefault, cosi' il gestore del pannello
+    // (static/js/shadowbroker.js) lo chiude al PRIMO Escape. Servivano quattro
+    // pressioni: le prime le mangiava il ramo dei pensieri, uno per volta.
+    if (document.body.classList.contains('shadowbroker-active')) return;
+    // Ultimo strato: i blocchi di ragionamento aperti. Si chiudono TUTTI in un
+    // colpo solo, altrimenti con tre pensieri aperti servivano tre Escape.
+    const pensieri = [...document.querySelectorAll('.thinking-content.expanded')];
+    if (pensieri.length) {
+      e.stopImmediatePropagation(); e.preventDefault();
+      for (const think of pensieri) {
+        const thinkHeader = think.closest('.thinking-section')?.querySelector('.thinking-header[data-thinking-id]');
+        if (thinkHeader) { try { thinkHeader.click(); } catch {} }
+        else {
+          // Nessuna intestazione: si chiude il contenuto direttamente.
+          try { think.classList.remove('expanded'); } catch {}
+        }
+      }
+    }
   }, true);
 }

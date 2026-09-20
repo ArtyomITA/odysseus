@@ -3003,7 +3003,7 @@ export function addMessage(role, content, modelName, metadata) {
       // Differentiate between "stopped mid-stream" (had content, can continue)
       // and "cancelled before any content" — the latter has no Continue affordance.
       stoppedLabel.textContent = metadata.cancelled
-        ? '[Cancelled by user]'
+        ? "[Annullato dall'utente]"
         : '[Message interrupted]';
       stoppedIndicator.appendChild(stoppedLabel);
       // Continue button only makes sense when there's partial content to
