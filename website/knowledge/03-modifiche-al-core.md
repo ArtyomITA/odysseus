@@ -172,8 +172,8 @@ Secondo blocco: `.model-loading-*` (overlay caricamento modello) e
 
 ## C-bis. Caricamento dei modelli e rilevamento della vista
 
-Dettaglio completo e misure in
-[12-caricamento-modelli-e-vista.md](12-caricamento-modelli-e-vista.md).
+Il documento di dettaglio (profili QwenPaw del 1 agosto) è stato rimosso il 24 settembre 2026
+perché descriveva modelli non più in uso; profili attuali in [09](09-configurazione.md).
 
 ### `src/chat_helpers.py` — `model_supports_vision()`
 

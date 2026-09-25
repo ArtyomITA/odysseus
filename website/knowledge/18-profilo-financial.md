@@ -71,8 +71,8 @@ fin_insider    1.072
 ---
 
 > **Aggiornamento 2 ago, sera:** multistep in chat era rotto per quattro
-> cause di LOOP, non di profilo — storia intera sta in
-> [19-loop-agente.md](19-loop-agente.md). Regole sono ora compresse in
+> cause di LOOP, non di profilo (il documento di dettaglio sul loop del 2 agosto è stato
+> rimosso il 24 settembre 2026; l'harness attuale è in [21](21-harness-lfm.md)). Regole sono ora compresse in
 > stile caveman-full (misurato: nessuna degradazione; description invece
 > restano piene, comprimerle fa regredire keyword all'italiano).
 

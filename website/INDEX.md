@@ -4,13 +4,12 @@ Vergilius è un fork personale di [Odysseus](https://github.com/pewdiepie-archda
 adattato per girare **interamente in locale su Windows 11 nativo**, senza Docker,
 su una GTX 1080 da 8GB.
 
-Ultimo aggiornamento: 1 agosto 2026 (voce interamente in streaming: vedi
-[05](knowledge/05-voce-tts-stt.md) e
-[ricerche/voce-streaming-misure.md](../../ricerche/voce-streaming-misure.md)).
+Ultimo aggiornamento: 24 settembre 2026. Modello predefinito LFM2.5-2.6B: per capire come
+lo guida l'harness parti da [21](knowledge/21-harness-lfm.md).
 
 ---
 
-## Base di conoscenza (`docs/knowledge/`)
+## Base di conoscenza (`website/knowledge/`)
 
 Le decisioni, le scoperte e lo stato del progetto. **Da leggere in quest'ordine**
 se si arriva nuovi.
@@ -27,16 +26,14 @@ se si arriva nuovi.
 | 08 | [Trappole e scoperte](knowledge/08-trappole-e-scoperte.md) | **i bug che ci sono costati tempo**, le scoperte che ce l'hanno risparmiato, e i miti da sfatare |
 | 09 | [Configurazione](knowledge/09-configurazione.md) | dove sta ogni impostazione, come cambiarla, la nostra configurazione attuale, riavvio completo |
 | 10 | [Decisioni e alternative scartate](knowledge/10-decisioni-e-alternative-scartate.md) | ogni bivio con il motivo della scelta |
-| 11 | [Stato e da fare](knowledge/11-stato-e-da-fare.md) | cosa funziona, cosa va testato, la coda dei lavori |
-| 12 | [Caricamento modelli e vista](knowledge/12-caricamento-modelli-e-vista.md) | le API di llama-swap, l'overlay di caricamento, come si rileva davvero la vista, gli strumenti tolti ai profili ciechi |
 | 13 | [ShadowBroker: il collegamento](knowledge/13-shadowbroker-dentro-odysseus.md) | il pannello incorporato, le due intestazioni di sicurezza da sbloccare, `local`/`remote` spiegato |
 | 14 | [ShadowBroker: orchestrazione verso il modello](knowledge/14-agente-osint.md) | **i dieci strumenti OSINT**, i briefing precalcolati, il controllo mappa, la modalità dedicata, le prove |
 | 15 | [ShadowBroker: come funziona dentro](knowledge/15-shadowbroker-come-funziona.md) | **mappa dei dati**, le quattro forme, dove finiscono i token, le classifiche già pronte, tutte le trappole |
 | 16 | [Finnhub: cosa dà il piano gratuito](knowledge/16-finnhub.md) | **22 endpoint provati uno per uno**, i 15 negati, i tre giacimenti inutilizzati, il tetto vero letto dall'API |
 | 17 | [Catalogo dei dati](knowledge/17-catalogo-dati.md) | **cosa l'assistente può sapere e cosa no**: 33 layer pieni, 14 vuoti e perché, cosa arriva al modello e cosa si ferma prima |
 | 18 | [Il profilo Financial](knowledge/18-profilo-financial.md) | mercati, appalti federali sulla mappa, insider con MSPR; **da 6/10 a 10/10** di scelte corrette, e le cinque trappole nei dati |
-| 19 | [Il loop agente](knowledge/19-loop-agente.md) | **dove muore una tool call** (quattro colpevoli, tutti nostri), le difese nel loop, il doppio banco di prova obbligatorio, la politica caveman sui prompt |
 | 20 | [Reti e ricevitori pubblici](knowledge/20-reti-e-ricevitori-pubblici.md) | cosa sono i puntini SIGINT: **Meshtastic, KiwiSDR, PSK Reporter**; perché Infonet è vuota e non rotta; Shodan; e la lista congelata da un circuit breaker |
+| 21 | [L'harness attorno a LFM2.5-2.6B](knowledge/21-harness-lfm.md) | **come Vergilius guida il modello predefinito oggi**: leve accese, allentate e spente con i valori effettivi, le prove del 19 settembre (calcoli rovinati dal rilancio), cosa non è ancora verificato |
 
 ### I cinque documenti ShadowBroker, in ordine
 
