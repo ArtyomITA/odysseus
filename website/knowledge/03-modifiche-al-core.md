@@ -284,6 +284,7 @@ Dettaglio in [13](13-shadowbroker-dentro-odysseus.md) (collegamento),
 | `frontend/src/components/MaplibreViewer.tsx` | livello evidenziazioni; `flyTo` ora rispetta zoom (era fisso a 8) |
 | `frontend/src/types/dashboard.ts` | tipo della prop `agentHighlights` |
 | `frontend/next.config.ts` + `src/proxy.ts` | `frame-ancestors` da variabile d'ambiente, `X-Frame-Options` tolto quando serve |
+| `backend/main.py` + `backend/services/uvicorn_loop.py` | su Windows `uvicorn.run` resta sul SelectorEventLoop con qualunque uvicorn: policy fino alla 0.35, `loop="asyncio:SelectorEventLoop"` dalla 0.36 (lì la policy viene ignorata). Col Proactor la 8000 muore al primo `WinError 64` |
 
 ### Pagine e stili
 
@@ -314,6 +315,27 @@ Dettaglio in [13](13-shadowbroker-dentro-odysseus.md) (collegamento),
 - `data/app.db` — endpoint dei modelli e server MCP registrati
 
 Vedi [09-configurazione.md](09-configurazione.md) per dettaglio delle chiavi.
+
+---
+
+## Aggiornamenti da monte
+
+**Attenzione agli SHA.** Il 20 settembre 2026 le email dei commit sono state riscritte in tutti
+e tre i repo, e anche i commit presi da upstream hanno cambiato SHA. `git merge-base` e un
+`git merge upstream/...` diretto partono quindi da una base sbagliata (per Odysseus il 23 luglio,
+con centinaia di conflitti che non esistono). Confrontare sempre per albero o per numero di PR.
+Basi con albero identico: Odysseus `de1e05c` = upstream `934d23c`; ShadowBroker `808111f` =
+upstream `347623f`. Prova di merge corretta:
+`git merge-tree --write-tree --merge-base=de1e05c vergilius upstream/dev`.
+
+| data | da monte | come | adattamenti |
+|---|---|---|---|
+| 19 set 2026 | Odysseus `main` 934d23c; ShadowBroker 0.9.84 (347623f) | merge `9fd8371` / `d087ea7` | vedi i messaggi dei due merge |
+| 25 set 2026 | Odysseus `dev` 3b6c169: #6215 (args MCP validati, 400 invece di `[]` in silenzio) e #6280 (cache dei token API scambiata in modo atomico) | cherry-pick | nessuno: toccano `app.py`, `admin.js`, `settings.js` lontano dalle nostre righe |
+| 25 set 2026 | ShadowBroker `main` 46fb6c8: cachetools 7.2.0, vite 8.3.0, uvicorn 0.53.0, playwright 1.63.0 | cherry-pick | `uvicorn_loop.py` (vedi tabella ShadowBroker sopra). Dopo il bump: reinstallare il venv del backend con `pip install .` (`uv sync --frozen` resta su `uv.lock`, fermo a uvicorn 0.34) e, se si usa liveuamap, `python -m playwright install chromium` |
+
+Si segue `dev` di Odysseus, non `main`: le correzioni arrivano lì per prime e `main` viene
+riallineato solo a ogni release.
 
 ---
 
